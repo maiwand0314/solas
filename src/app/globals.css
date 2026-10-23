@@ -1,26 +1,151 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/*
+ * Theme and sidebar state live as attributes on <html>, set before first paint
+ * by the inline script in layout.tsx. These variants let utilities react to
+ * them, e.g. `dark:` or `sidebar-collapsed:w-14`.
+ */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+@custom-variant sidebar-collapsed (&:where([data-sidebar="collapsed"] [data-desktop-sidebar], [data-sidebar="collapsed"] [data-desktop-sidebar] *));
+
+/*
+ * Semantic color tokens. Components use these (bg-surface, text-muted, ...)
+ * and never raw colors, so each theme only has to redefine this list.
+ * `[data-theme="light"]` is listed explicitly so a subtree can opt back into
+ * light tokens (used by the theme previews in Settings).
+ */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+  --background: oklch(0.985 0.002 260);
+  --surface: oklch(1 0 0);
+  --surface-raised: oklch(1 0 0);
+  --surface-hover: oklch(0.962 0.003 260);
+  --border: oklch(0.912 0.004 260);
+  --border-strong: oklch(0.855 0.005 260);
+  --foreground: oklch(0.2 0.01 260);
+  --muted: oklch(0.47 0.012 260);
+  --subtle: oklch(0.54 0.01 260);
+  --accent: oklch(0.5 0.13 255);
+  --accent-foreground: oklch(0.99 0 0);
+  --accent-subtle: oklch(0.95 0.02 255);
+  --danger: oklch(0.55 0.19 25);
+  --warning: oklch(0.7 0.14 75);
+  --success: oklch(0.55 0.12 150);
+  --focus-ring: var(--accent);
+  --popover-shadow: 0 4px 16px -4px oklch(0 0 0 / 0.12), 0 1px 2px oklch(0 0 0 / 0.04);
+  --control-shadow: 0 1px 2px oklch(0 0 0 / 0.06);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --background: oklch(0.165 0.005 260);
+  --surface: oklch(0.195 0.006 260);
+  --surface-raised: oklch(0.225 0.007 260);
+  --surface-hover: oklch(0.245 0.007 260);
+  --border: oklch(0.28 0.008 260);
+  --border-strong: oklch(0.35 0.01 260);
+  --foreground: oklch(0.95 0.003 260);
+  --muted: oklch(0.72 0.01 260);
+  --subtle: oklch(0.62 0.01 260);
+  --accent: oklch(0.68 0.12 255);
+  --accent-foreground: oklch(0.16 0.01 260);
+  --accent-subtle: oklch(0.27 0.04 255);
+  --danger: oklch(0.68 0.16 25);
+  --warning: oklch(0.78 0.13 75);
+  --success: oklch(0.7 0.12 150);
+  --focus-ring: var(--accent);
+  /* Dark surfaces show elevation by getting lighter; shadows only add depth. */
+  --popover-shadow: 0 8px 24px -6px oklch(0 0 0 / 0.5);
+  --control-shadow: 0 1px 2px oklch(0 0 0 / 0.3);
 }
 
 @theme inline {
   --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-hover: var(--surface-hover);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent-subtle: var(--accent-subtle);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+  --color-focus-ring: var(--focus-ring);
+
+  --shadow-popover: var(--popover-shadow);
+  --shadow-control: var(--control-shadow);
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+/* Type scale and shape tokens. 14px base suits a dense working tool. */
+@theme {
+  --text-xs: 0.75rem;
+  --text-xs--line-height: 1rem;
+  --text-sm: 0.8125rem;
+  --text-sm--line-height: 1.125rem;
+  --text-base: 0.875rem;
+  --text-base--line-height: 1.25rem;
+  --text-reading: 0.9375rem;
+  --text-reading--line-height: 1.5rem;
+  --text-lg: 1rem;
+  --text-lg--line-height: 1.5rem;
+  --text-xl: 1.25rem;
+  --text-xl--line-height: 1.75rem;
+  --text-2xl: 1.5rem;
+  --text-2xl--line-height: 2rem;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --animate-drawer-in: drawer-in 200ms var(--ease-standard);
+  --animate-dialog-in: dialog-in 150ms var(--ease-standard);
+
+  @keyframes drawer-in {
+    from {
+      transform: translateX(-100%);
+    }
+  }
+
+  @keyframes dialog-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px) scale(0.98);
+    }
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--accent-subtle);
+  }
+
+  /* An open modal dialog should not let the page scroll behind it. */
+  html:has(dialog[open]) {
+    overflow: hidden;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
 }
