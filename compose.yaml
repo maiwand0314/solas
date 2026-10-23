@@ -1,0 +1,30 @@
+# Local PostgreSQL for Solas development.
+#
+#   npm run db:up      start (first run downloads the image and creates the database)
+#   npm run db:down    stop; data is kept in the named volume
+#   npm run db:reset   stop and DELETE all local data
+#
+# The password comes from .env.local (never committed). The port is bound to
+# 127.0.0.1 so the database is not reachable from other machines.
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: solas-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: solas
+      POSTGRES_DB: solas
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.local}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # PostgreSQL 18+ images keep data under /var/lib/postgresql/<major>/.
+      - solas-postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U solas -d solas"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  solas-postgres:
