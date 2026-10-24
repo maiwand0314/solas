@@ -65,8 +65,8 @@ Four ideas to hold on to:
 | **Agent execution layer** | `AgentRuntime` interface + adapters. Turns "agent + input" into a Solas `RunResult` (events and streaming in M3B) | `src/server/runtime/`, `src/server/runs/` | M3A |
 | **Background worker** | Separate Node process: claims pending runs, supervises them, recovers after crashes (schedules in M8) | `src/worker/` | M3A |
 | **Conversations** | Per-agent threads. Each user message creates a run; the agent's reply is stored as a message | `src/server/conversations/` | M3A |
-| **Tools and permissions** | Tool profiles, workspace directories, a policy hook that enforces them | `src/server/tools/`, `src/server/policy/` | M6 |
-| **Approvals** | Sensitive tool calls pause a run until the owner decides | `src/server/approvals/` | M7 |
+| **Tools and permissions** | Tool registry, per-agent permissions, workspaces, and the enforcement layer every call goes through | `src/server/tools/` | M4A |
+| **Approvals** | Tool calls that need approval wait for the owner's decision in the conversation | `src/server/tools/invoker.ts`, `src/server/conversations/` | M4A |
 | **Tasks and schedules** | One-off assignments and recurring triggers that create runs | `src/server/tasks/` | M8 |
 | **Authentication** | Single owner. Login page, database sessions, checks in every data-access function | `src/server/auth/`, `src/proxy.ts` | M9 |
 | **Deployment** | One VPS: web, worker, PostgreSQL, reverse proxy; private network access | `deploy/` (later) | M10 |
@@ -134,10 +134,16 @@ runs (M3A, built)
 run_events (planned, when tool calls need a timeline)
   id (sequential), run_id → runs, type, payload (jsonb), created_at
 
-approvals (M7)
-  id, run_id, tool_name, tool_input (jsonb), reason,
-  status ('pending' | 'approved' | 'denied' | 'expired'),
-  decided_at, decision_note
+agent_tool_permissions (M4A, built)
+  agent_id → agents (cascade), tool_id, mode ('allow' | 'ask'), created_at
+  primary key (agent_id, tool_id); no row = tool off
+
+tool_calls (M4A, built; also the approval record)
+  id, run_id → runs (cascade), tool_id, input (jsonb, validated),
+  input_summary, status ('awaiting_approval' | 'approved' | 'rejected' |
+  'expired' | 'running' | 'succeeded' | 'failed' | 'denied' | 'cancelled'),
+  requires_approval, approval_expires_at, decided_at,
+  result_summary, error_message, created_at, finished_at
 
 tasks (M8)        id, agent_id, title, instructions, status, result_run_id, …
 schedules (M8)    id, agent_id, task template, cron, timezone, enabled, next_run_at, …
@@ -337,10 +343,11 @@ Hard rules, enforced in code review:
 ```ts
 interface AgentRuntime {
   readonly providerId: string;                 // "claude-agent-sdk"
-  run(input: RunInput, signal: AbortSignal): Promise<RunResult>;  // never throws
+  run(input: RunInput, signal: AbortSignal, onProgress?): Promise<RunResult>;  // never throws
 }
 
-type RunInput = { systemPrompt: string; prompt: string; model: string };
+type RunInput = { systemPrompt: string; prompt: string; model: string; tools: RuntimeTool[] };
+type RuntimeTool = { name; description; inputShape /* Zod */; invoke(input): Promise<{ text; isError }> };
 
 type RunResult =
   | { status: "completed"; text: string; usage: { inputTokens; outputTokens } }
@@ -369,15 +376,16 @@ Claude Code binary bundled with it; that binary uses the owner's own sign-in.
 | Control | Setting (as built) | Why |
 | --- | --- | --- |
 | System prompt | `systemPrompt: <agent.instructions>` (a plain string) | Replaces Claude Code's own prompt entirely: the agent is exactly its stored instructions |
-| Built-in tools | `tools: []`, `allowedTools: []` | No tool exists in the session at all |
+| Built-in tools | `tools: []`; `allowedTools` lists only the agent's Solas tools (M4A) | No built-in tool (shell, files, web) exists in the session |
 | Permission mode | `dontAsk`, set explicitly | Anything not pre-approved is denied. If omitted, Claude Code may start in `auto`. **Never** `bypassPermissions` |
-| Policy hook | `PreToolUse` hook that denies every call | Hooks run first and hold in every mode: defense in depth |
+| Policy hook | `PreToolUse` hook that denies every call except the agent's Solas tools | Hooks run first and hold in every mode: defense in depth |
 | Settings isolation | `settingSources: []`, `strictMcpConfig: true`, `mcpServers: {}` | Ignores the owner's `~/.claude` settings, CLAUDE.md, skills, plugins, and MCP servers |
 | Environment | Allowlist only: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TMPDIR`; plus `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `ENABLE_CLAUDEAI_MCP_SERVERS=false`, `CLAUDE_AGENT_SDK_CLIENT_APP=solas/0.1.0` | No `DATABASE_URL`, no passwords, and no `ANTHROPIC_*` / `CLAUDE_CODE_USE_*` that could switch to a paid API key or another provider |
 | Working directory | `$TMPDIR/solas-runtime`, created empty, refused if inside the repo | Nothing for the agent to find |
 | Sessions | `persistSession: false` | No transcripts written to `~/.claude/projects`; Solas keeps history in PostgreSQL |
 | Budgets | `maxTurns: 1`, `maxBudgetUsd: 1`, 3-minute timeout, one run at a time | Protects plan limits and the machine |
 | Streaming | `includePartialMessages: true`; only `text_delta` events are passed on (thinking is skipped) | Real text as it is written, for the live view |
+| Solas tools (M4A) | Permitted tools served by an in-process MCP server (`createSdkMcpServer`); `allowedTools` and the hook admit exactly those; `maxTurns: 10` when tools exist | The official mechanism; handlers are Solas's own enforcement code (§5.7) |
 | **Verified at start** | The session's `init` message must report `apiKeySource: "none"`, zero tools, zero MCP servers, `dontAsk`, and the requested model, or the run stops | Settings can also come from places Solas doesn't control (managed policy, a Console login). Solas checks the result instead of trusting its options |
 | Usage limits | A `rate_limit_event` that is `rejected`, or that shows paid extra usage (`isUsingOverage`), stops the run as `usage_limit` | No silent fall-through to paid usage |
 
@@ -483,24 +491,79 @@ and very old turns of a long conversation are forgotten.
   Claude may already have done (and counted) the work, and Solas can't verify
   a result it never received. The owner decides with Retry.
 
-### 5.7 Tools and permissions model (planned, M6)
+### 5.7 Tools and permissions (built in M4A)
 
-Every agent has a **tool profile**:
+**The tool registry** (`src/server/tools/registry.ts`) is the complete list
+of tools Solas can run. Each tool is a `ToolDefinition` in backend code:
 
-| Profile | Allows | Approval |
-| --- | --- | --- |
-| `none` (default, MVP) | Conversation only | — |
-| `read-workspace` | Read / search files in the agent's workspace | No |
-| `write-workspace` | Plus create and edit files in the workspace | Configurable; default yes |
-| Custom Solas tools | Specific tools such as "save note" or "fetch allowed URL" | Per tool, by risk level |
+| Field | Purpose |
+| --- | --- |
+| `id` | Unique, stable; also the name the model calls it by |
+| `name`, `description` | For the owner and the model |
+| `input`, `output` | Zod schemas: arguments are validated, and the result must match its contract before the model sees it |
+| `risk`, `capability` | Shown to the owner (low/medium/high; what it may touch) |
+| `approval`, `defaultMode` | `optional` (owner picks "Run automatically" or "Ask me first") or `required` (always asks) |
+| `timeoutMs`, `maxOutputChars` | Limits per call |
+| `summarizeInput/Output` | One-line summaries for the activity log |
+| `execute` | The handler; gets only the validated input, the agent's workspace, and an abort signal |
 
-Never offered to agents: unrestricted shell, arbitrary code execution,
-arbitrary filesystem paths, arbitrary network access. If code execution is
-ever added, it runs in an isolated sandbox with its own threat model.
+The tools in M4A:
 
-Tool output is **untrusted**. It can contain text that tries to steer the
-agent (prompt injection). Safety comes from least privilege and approvals,
-not from trusting the model to ignore it.
+| Tool | Does | Risk | Default |
+| --- | --- | --- | --- |
+| `current_time` | Date and time in a validated IANA time zone | Low | Runs automatically |
+| `list_workspace_files` | Lists one folder of the agent's workspace | Low | Runs automatically |
+| `read_workspace_file` | Reads one UTF-8 text file (≤ 256 KB) from the workspace | Medium | Runs automatically (owner's choice; "Ask me first" per agent) |
+
+**Workspaces.** One folder per agent: `~/Solas/workspaces/<agent-id>`
+(`SOLAS_WORKSPACES_DIR` overrides the root). The root must be a dedicated
+folder: not `/`, not the home folder, not inside or around the Solas app.
+`resolveWorkspacePath` refuses:
+- absolute paths and `..`;
+- hidden files (`.env`, `.git`, `.ssh`, …) and key files;
+- symbolic links anywhere on the path.
+
+It then re-checks the real path; reads use `O_NOFOLLOW`. Nothing writes.
+
+**Permissions** live in `agent_tool_permissions` (one row per enabled tool,
+with mode `allow` or `ask`). No row means off, so every agent starts with no
+tools. The agent service checks every ID against the registry. A permission
+change applies at once: the worker reads permissions per run, and again per
+call.
+
+**How a tool call is enforced** (`src/server/tools/invoker.ts`, in the worker):
+
+```
+Claude: "call mcp__solas__read_workspace_file { path: 'notes/plan.md' }"
+  │  only tools Solas registered for this agent exist in the session
+  ▼
+Solas MCP server (in-process, SDK createSdkMcpServer) → invoke()
+  1. permission   read fresh from agent_tool_permissions → else "denied"
+  2. validation   input against the tool's Zod schema   → else "failed"
+  3. approval     if required or mode "ask": tool_calls row "awaiting_approval",
+                  wait (run clock paused) for approve / reject / expiry (5 min)
+  4. execution    tool's time limit, agent's workspace only
+  5. contract     output against the tool's schema
+  6. record       tool_calls: status, summaries, error
+  ▼
+text result (or an error the model can read) → back to Claude → next turn
+```
+
+**Defense in depth around Claude Code.**
+- `tools: []`: no built-in tools at all.
+- `allowedTools`: exactly `mcp__solas__<id>` for the permitted tools.
+- `permissionMode: "dontAsk"`: anything else is denied.
+- A `PreToolUse` hook allows only those names.
+- `strictMcpConfig`: no other MCP server.
+- At session start, the session's tool list must equal the expected list
+  exactly, or the run stops.
+
+The model's only power is to *ask*; every decision is Solas code.
+
+Never offered to agents: shell, code execution, writing files, arbitrary
+paths, network access. Tool output is **untrusted** (a file can contain text
+that tries to steer the agent); safety comes from least privilege and
+approvals, not from trusting the model.
 
 ## 6. Request flows
 
@@ -508,20 +571,24 @@ not from trusting the model to ignore it.
 
 Built in M3A, streaming since M3B; see §5.4 to §5.6.
 
-### 6.2 Approval (M7)
+### 6.2 Approval (built in M4A)
 
 ```
-Worker: agent requests a sensitive tool
-  → canUseTool → requestApproval() → insert approvals(pending), run → awaiting_approval
-Browser: owner sees the approval card (SSE / page load) → Approve or Deny (Server Action)
-  → approvals row updated
-Worker: notices the decision (polling or LISTEN/NOTIFY) → resolves the promise
-  → the SDK continues or receives a denial → run resumes → status running
-Timeouts: an approval that is not decided in time expires and is treated as denied.
+Worker: a tool needs approval
+  → tool_calls row: status "awaiting_approval", approval_expires_at = now() + 5 min
+  → the run's timeout pauses; the worker polls the row every 0.5 s
+Browser: the conversation polls the run → approval card with the exact input
+  → Approve / Reject → decideToolCall (Server Action, owner guard)
+  → UPDATE … WHERE status = 'awaiting_approval' AND approval_expires_at > now()
+Worker: sees "approved" → flips it to "running" (once) → runs the stored input
+        sees "rejected" → the tool never runs; Claude is told not to retry
+        expiry passes (database clock) → "expired"; never runs
+        Stop pressed → "cancelled"; never runs
 ```
 
-The first version keeps the run process waiting while it asks. Making
-approvals survive a worker restart (resuming the session afterwards) is a
+Limitation: the worker keeps the run (and the Claude session) open while it
+waits. If the worker stops during a wait, the run fails as usual and the
+request can't be approved any more; resuming a session after a restart is a
 later refinement.
 
 ### 6.3 Scheduled task (M8)
@@ -582,8 +649,8 @@ src/
 │  ├─ runs/                   executor, prompt, config (limits)             (M3A)
 │  ├─ runtime/                AgentRuntime types, claude-agent-sdk adapter  (M3A)
 │  ├─ logger.ts               JSON-line logs, scalar fields only            (M3A)
-│  ├─ approvals/  tasks/
-│  └─ policy/  tools/
+│  ├─ tools/                  registry, builtin/ tools, workspace, invoker  (M4A)
+│  ├─ tasks/
 ├─ test/                      Vitest global setup (test database)           (M2A)
 ├─ worker/index.mts          worker entry point and job loop               (M3A)
 └─ proxy.ts                   (M9)

@@ -196,6 +196,35 @@ genuine Claude reply. It pulled forward the minimum of the old M3–M5:
 - Dependencies added (approved): `react-markdown`, `remark-gfm`, and
   `@playwright/test` (dev).
 
+**M4A — Tools & permissions** *(done 2026-10-24)*
+Pulled forward from the old M6 and M7, as the smallest secure slice:
+- **Tool registry:** typed `ToolDefinition`s with Zod input and output
+  schemas, risk, approval policy, and limits. Three tools: current time,
+  list workspace files, and read a workspace file (read-only, inside
+  `~/Solas/workspaces/<agent-id>`).
+- **Permissions:**
+  - per agent in `agent_tool_permissions`, off by default, edited in Agent
+    Builder;
+  - enforced in the worker on every call (permission → validation →
+    approval → execution → output contract → record).
+- **Claude:** tools reach it through the SDK's in-process MCP server. Built-in
+  tools stay off, and the session's tool list is verified at start.
+- **Approvals:** "Ask me first" or approval-required tools wait for Approve
+  or Reject in the conversation. They expire after 5 minutes and pause the
+  run's timeout. Rejected, expired, or stopped requests never run.
+- **Tool activity:** shown in conversations; finished runs fold it away.
+- **Tests:** Vitest 198, Playwright 24, and one real run where Claude used
+  three tools with one approval.
+
+**M4B — Workspace writing and approvals you can trust** *(proposed)*
+- **Writing tools:** create and edit text files in the agent's own workspace,
+  always with approval and a before/after preview. Never outside the
+  workspace, never deleting.
+- **Approvals:** a badge in the sidebar when something waits for you, and an
+  agent-level audit view of every tool call.
+- **Robustness:** approvals that survive a worker restart (the run is
+  re-queued with the decision), and a per-agent limit on tool calls per run.
+
 **M4 — Runs you can inspect** *(proposed)*
 A run history per agent and conversation: status, timing, tokens, errors.
 An agent's page lists its conversations.
@@ -206,16 +235,10 @@ long conversations (context strategy re-evaluated), failure drills.
 
 ### Phase 2 — Controlled autonomy (still local)
 
-**M6 — Tools, workspaces, and permissions**
-Per-agent workspace directory, tool profiles (none / read workspace /
-read-write workspace / custom Solas tools via an in-process MCP server), a
-policy gate (`PreToolUse` hook) that enforces paths and tool allowlists.
+**M6 / M7 — Tools and approvals** *(foundation done in M4A)*
+Remaining: writing tools inside the workspace (with approval), more Solas
+tools, approvals that survive a worker restart, and a per-agent audit view.
 Shell stays disabled.
-
-**M7 — Approvals**
-Sensitive tool calls pause the run and create an approval request. The owner
-approves or denies in the UI and the run continues. Includes timeouts,
-expired approvals, and an audit trail.
 
 **M8 — Tasks and schedules**
 Assign one-off tasks to an agent, see status and results. Schedules (cron-like)

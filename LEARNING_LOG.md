@@ -749,3 +749,161 @@ appeared twice in the conversation.
 and saved), make one of them yield to the other by a stable ID. Don't rely
 on timing. And when a duplicate shows up, check each layer from the source
 outward: database first, then the worker, then the browser.
+
+## M4A — Tools & permissions (2026-10-24)
+
+**Built:** Agents can now do things, not just talk, but only what you allow.
+Solas has a typed tool registry with three real tools: the time, listing
+workspace files, and reading a workspace file. You turn tools on per agent
+in Agent Builder, optionally with "Ask me first". The worker enforces every
+call. When approval is needed, a card in the conversation shows exactly what
+will run, with Approve and Reject.
+
+**Concepts**
+1. **A tool registry** is the one list of everything an agent could ever run.
+   - Each tool is backend code with a contract: Zod schemas for input and
+     output, risk, approval policy, time and size limits, and a handler.
+   - If it's not in `src/server/tools/registry.ts`, it doesn't exist. No
+     instruction, reply, or setting can create one.
+2. **How tools reach an agent.**
+   - At the start of each run, the worker reads the agent's permissions from
+     PostgreSQL. It turns only those tools into `RuntimeTool`s: a name, a
+     description, a schema, and an `invoke` function.
+   - The Claude adapter serves them through an **in-process MCP server**, the
+     SDK's official mechanism (`createSdkMcpServer`). It also lists exactly
+     those names in `allowedTools`.
+   - Claude Code's built-in tools stay off (`tools: []`). At session start
+     Solas checks that the session's tool list is exactly what it
+     registered.
+3. **How Claude requests a tool.** The model answers with a tool call:
+   "`mcp__solas__read_workspace_file` with `{ path: "notes/plan.md" }`".
+   Claude Code passes it to the MCP server, which calls Solas's `invoke`. The
+   model can only *ask*; it never runs anything itself.
+4. **How the backend validates.** The input is parsed with the tool's Zod
+   schema. Unknown fields, wrong types, and over-long strings are refused
+   before anything runs. The result must also match the output schema, so
+   the model never gets malformed data.
+5. **How permissions are enforced.**
+   - Inside `invoke`, in the worker, for *every* call: the permission is read
+     fresh, so turning a tool off works even mid-run.
+   - File paths go through `resolveWorkspacePath`, which allows no absolute
+     paths, no `..`, no hidden or key files, and no symbolic links.
+   - Around it, defense in depth: `allowedTools`, `dontAsk`, a hook that
+     denies anything else, and the session check.
+   - The UI only *edits* permissions. It enforces nothing.
+6. **How approvals work.**
+   - The call is saved as `awaiting_approval`, with a 5-minute expiry by the
+     database clock. The run's timeout pauses, and the worker checks the row
+     every half second.
+   - You approve or reject in the card, a Server Action behind the owner
+     guard. The update only succeeds while the request is still waiting and
+     not expired.
+   - On "approved", the worker flips the row to `running` (exactly once) and
+     runs the *stored* input. Rejected, expired, or stopped requests never
+     run.
+7. **How results return to Claude.** `invoke` returns
+   `{ text, isError }`. The adapter wraps it as an MCP tool result, and Claude
+   continues the same turn with that text: a JSON result, or an error it can
+   read and react to (such as "outside the workspace" or "the owner rejected
+   this"). Up to 10 such round trips per run.
+8. **How to add a tool.**
+   1. Write a `ToolDefinition` in `src/server/tools/builtin/`, with schemas,
+      risk, limits, summaries, and a handler that throws `ToolError` for
+      expected problems.
+   2. Add it to `createToolRegistry([...])`.
+   3. Write tests.
+
+   It then shows up in Agent Builder, off for every agent. No migration, no
+   UI change, no adapter change.
+
+**Lessons**
+- **"The model can't do X" must be true in code, not just in the prompt.**
+  The prompt names the tools, but the guarantee is the registry, the
+  permission check in `invoke`, and the session check.
+- **Check, then act on what you checked.** An approval is tied to one row
+  and one stored input. The worker runs that input, never a new one from the
+  model.
+- **Expiry needs one clock.** The worker and the web app both compare with
+  PostgreSQL's `now()`, so "expired" means the same thing on both sides.
+- **The SDK connects MCP servers lazily** (on the first message), so it
+  can't be probed for free. That's why the start-of-session check matters.
+
+**Security limitations (honest list)**
+- **Time-of-check to time-of-use:** a symlink swapped in between the path
+  check and opening the file is refused at the last step by `O_NOFOLLOW`. A
+  link swapped into a *parent* folder in that window isn't. That needs
+  someone writing into the workspace at the same moment; acceptable for one
+  owner, revisit before writing tools.
+- **File contents are untrusted.** A file can contain instructions aimed at
+  the agent (prompt injection). The tools are read-only, so the worst case is
+  a misleading answer, not an action.
+- **Approvals live in the worker's memory while waiting.** If the worker
+  stops, the run fails and the request can't be approved any more.
+- **Tool results aren't kept as conversation context.** The next message
+  sees the agent's final reply, not the raw tool output.
+
+**Files changed**
+- New, in `src/server/tools/`:
+  - `types.ts`, `registry.ts`, `workspace.ts`, `invoker.ts`;
+  - `builtin/current-time.ts` and `builtin/workspace-files.ts`;
+  - `tools.test.ts` and `invoker.test.ts`.
+- New UI: `components/agents/tool-permissions-fields.tsx` and
+  `components/conversations/tool-activity.tsx`.
+- New tests: `e2e/tools.spec.ts`.
+- Database: `drizzle/0004_tools_and_approvals.sql`, which adds two tables.
+- Changed:
+  - schema;
+  - shared agent validation (`tools`) and the agent service (permissions,
+    duplicate) with its queries;
+  - runtime types (`RuntimeTool`) and the Claude adapter (MCP server,
+    `allowedTools`, hook, session check);
+  - executor (tools per run, pausable deadline), prompt (tool-aware note),
+    config, and worker;
+  - conversation service and actions (tool calls, `decideToolCall`);
+  - agent form, details, and pages; conversation view and pages; Badge
+    tones;
+  - e2e helpers.
+
+**How it was verified**
+- `lint`, `typecheck`, and `build` pass.
+- Bundle checks:
+  - no tool handler code in the browser bundle;
+  - no Agent SDK in the web server;
+  - 12 Server Actions (`decideToolCall` is new).
+- Vitest: 198 tests pass. They cover:
+  - registration rules;
+  - input and output validation;
+  - allowed, disabled-mid-run, and other-agent calls;
+  - approve, reject, expiry (and a late decision), stop while waiting, and
+    double decisions;
+  - path traversal, absolute paths, and symlinks to files and folders;
+  - `.env` and key files; size, binary, and non-UTF-8 files;
+  - tool timeouts; errors without leaked internals;
+  - the adapter's options, hook, and session checks;
+  - worker runs that use tools, including a paused timeout while the owner
+    decides, with context kept.
+- Playwright: 24 tests pass, twice. They cover:
+  - enabling tools with the keyboard, "Ask me first", saving, the agent
+    page, and turning off;
+  - the approval card's exact input, Approve and Reject, and an expired
+    request;
+  - folded tool activity;
+  - the approval card on a phone in light and dark.
+- One real run through the UI and the worker:
+  - an agent made in Agent Builder (Haiku 5.5) answered "What time is it in
+    Oslo, list my notes, summarize plan.md";
+  - the session had exactly the three Solas tools (`dontAsk`,
+    `apiKeySource: "none"`);
+  - time and listing ran automatically, and listing hid the `.env` decoy;
+  - the file read waited for Approve in the UI, then ran;
+  - the reply used the file's content, in 7.2 s;
+  - the test agent and its folder were deleted afterwards.
+
+**Not tested automatically:** the MCP wrapping inside the SDK (covered by
+the real run), and approvals across a worker restart (not supported yet).
+
+**Exercise**
+- Add a tool `count_workspace_words` that reads a file and returns its word
+  count. Reuse `resolveWorkspacePath`, register it, and write two tests: one
+  normal file, one path outside the workspace. Then enable it for an agent
+  and ask it to count the words in a file.
