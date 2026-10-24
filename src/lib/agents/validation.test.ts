@@ -16,6 +16,7 @@ describe("createAgentSchema", () => {
       providerId: null,
       modelId: null,
       enabled: true,
+      tools: [], // every agent starts with no tools
     });
   });
 

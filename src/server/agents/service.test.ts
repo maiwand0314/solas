@@ -1,7 +1,9 @@
 import { sql } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { closeDatabase, createDatabase } from "@/server/db/client";
-import { agents } from "@/server/db/schema";
+import { agents, agentToolPermissions } from "@/server/db/schema";
+import { currentTimeTool } from "@/server/tools/builtin/current-time";
+import { createToolRegistry } from "@/server/tools/registry";
 import { createProviderRegistry, providerRegistry } from "@/server/providers/registry";
 import { AgentServiceError } from "./errors";
 import { createAgentService } from "./service";
@@ -221,5 +223,74 @@ describe("persistence and failure handling", () => {
     } finally {
       await closeDatabase(unreachable);
     }
+  });
+});
+
+describe("tool permissions", () => {
+  it("starts every agent with no tools", async () => {
+    const agent = await service.create(agentInput());
+    expect(await service.getTools(agent.id)).toEqual([]);
+  });
+
+  it("saves, replaces, and clears an agent's tools", async () => {
+    const agent = await service.create(
+      agentInput({ tools: [{ toolId: "read_workspace_file", mode: "ask" }, { toolId: "current_time", mode: "allow" }] }),
+    );
+    // Returned in registry order, whatever order they were sent in.
+    expect(await service.getTools(agent.id)).toEqual([
+      { toolId: "current_time", mode: "allow" },
+      { toolId: "read_workspace_file", mode: "ask" },
+    ]);
+
+    await service.update(agent.id, { tools: [{ toolId: "list_workspace_files", mode: "allow" }] });
+    expect(await service.getTools(agent.id)).toEqual([{ toolId: "list_workspace_files", mode: "allow" }]);
+
+    await service.update(agent.id, { tools: [] });
+    expect(await service.getTools(agent.id)).toEqual([]);
+  });
+
+  it("keeps each agent's tools separate", async () => {
+    const reader = await service.create(agentInput({ name: "Reader", tools: [{ toolId: "read_workspace_file", mode: "allow" }] }));
+    const clock = await service.create(agentInput({ name: "Clock", tools: [{ toolId: "current_time", mode: "allow" }] }));
+    expect((await service.getTools(reader.id)).map((tool) => tool.toolId)).toEqual(["read_workspace_file"]);
+    expect((await service.getTools(clock.id)).map((tool) => tool.toolId)).toEqual(["current_time"]);
+  });
+
+  it.each([
+    ["an unknown tool", [{ toolId: "run_shell", mode: "allow" }]],
+    ["a tool listed twice", [{ toolId: "current_time", mode: "allow" }, { toolId: "current_time", mode: "ask" }]],
+    ["an unknown mode", [{ toolId: "current_time", mode: "always" }]],
+    ["extra fields", [{ toolId: "current_time", mode: "allow", path: "/" }]],
+  ])("rejects %s and saves nothing", async (_label, tools) => {
+    await expectAgentError(service.create(agentInput({ tools })), "validation_failed");
+    expect(await countAgents()).toBe(0);
+  });
+
+  it("refuses to let a tool that always needs approval run automatically", async () => {
+    const strict = createToolRegistry([{ ...currentTimeTool, approval: "required", defaultMode: "ask" }]);
+    const withStrictTools = createAgentService({ db, providers: providerRegistry, tools: strict });
+    const error = await expectAgentError(
+      withStrictTools.create(agentInput({ tools: [{ toolId: "current_time", mode: "allow" }] })),
+      "validation_failed",
+    );
+    expect(error.fieldErrors.tools?.[0]).toContain("always needs your approval");
+    await withStrictTools.create(agentInput({ tools: [{ toolId: "current_time", mode: "ask" }] }));
+  });
+
+  it("copies tools to a duplicate, and deletes them with the agent", async () => {
+    const agent = await service.create(agentInput({ tools: [{ toolId: "current_time", mode: "ask" }] }));
+    const copy = await service.duplicate(agent.id);
+    expect(await service.getTools(copy.id)).toEqual([{ toolId: "current_time", mode: "ask" }]);
+
+    await service.remove(agent.id);
+    const [{ count }] = await db.select({ count: sql<number>`count(*)::int` }).from(agentToolPermissions);
+    expect(count).toBe(1); // only the copy's
+  });
+
+  it("a tools-only change still counts as an update", async () => {
+    const agent = await service.create(agentInput());
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const updated = await service.update(agent.id, { tools: [{ toolId: "current_time", mode: "allow" }] });
+    expect(updated.updatedAt.getTime()).toBeGreaterThan(agent.updatedAt.getTime());
   });
 });

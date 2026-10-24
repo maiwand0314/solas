@@ -2,7 +2,8 @@ import "server-only";
 import { eq, sql } from "drizzle-orm";
 import type { z } from "zod";
 import { getDatabase, type Database } from "@/server/db/client";
-import { agents, type AgentRow } from "@/server/db/schema";
+import { agents, agentToolPermissions, type AgentRow } from "@/server/db/schema";
+import { toolRegistry, type ToolRegistry } from "@/server/tools/registry";
 import {
   checkModelSelection,
   providerRegistry,
@@ -14,6 +15,7 @@ import {
   createAgentSchema,
   enabledSchema,
   updateAgentSchema,
+  type AgentToolSetting,
 } from "@/lib/agents/validation";
 import { AgentServiceError, fromDatabaseError, notFoundError, validationError } from "./errors";
 
@@ -22,6 +24,8 @@ export type Agent = AgentRow;
 type Dependencies = {
   db: Database;
   providers: ProviderRegistry;
+  /** Which tools exist. Defaults to the app's registry. */
+  tools?: ToolRegistry;
 };
 
 /**
@@ -33,7 +37,7 @@ type Dependencies = {
  *
  * Inputs are typed `unknown` on purpose: the service never trusts its caller.
  */
-export function createAgentService({ db, providers }: Dependencies) {
+export function createAgentService({ db, providers, tools = toolRegistry }: Dependencies) {
   async function list(): Promise<Agent[]> {
     return query(() => db.select().from(agents).orderBy(sql`lower(${agents.name})`, agents.createdAt));
   }
@@ -46,15 +50,39 @@ export function createAgentService({ db, providers }: Dependencies) {
   }
 
   async function create(input: unknown): Promise<Agent> {
-    const values = parse(createAgentSchema, input);
+    const { tools: toolSettings, ...values } = parse(createAgentSchema, input);
     assertModelSelection(values.providerId, values.modelId);
-    const [agent] = await query(() => db.insert(agents).values(values).returning());
-    return agent;
+    assertToolSettings(toolSettings);
+    return query(() =>
+      db.transaction(async (tx) => {
+        const [agent] = await tx.insert(agents).values(values).returning();
+        if (toolSettings.length > 0) {
+          await tx.insert(agentToolPermissions).values(toolSettings.map((tool) => ({ agentId: agent.id, ...tool })));
+        }
+        return agent;
+      }),
+    );
+  }
+
+  /** The agent's enabled tools, in registry order. Tools no longer in the registry are left out. */
+  async function getTools(id: unknown): Promise<AgentToolSetting[]> {
+    const agentId = parse(agentIdSchema, id);
+    const rows = await query(() =>
+      db
+        .select({ toolId: agentToolPermissions.toolId, mode: agentToolPermissions.mode })
+        .from(agentToolPermissions)
+        .where(eq(agentToolPermissions.agentId, agentId)),
+    );
+    const order = tools.list().map((tool) => tool.id);
+    return rows
+      .filter((row) => tools.get(row.toolId))
+      .sort((a, b) => order.indexOf(a.toolId) - order.indexOf(b.toolId));
   }
 
   async function update(id: unknown, input: unknown): Promise<Agent> {
     const agentId = parse(agentIdSchema, id);
-    const changes = parse(updateAgentSchema, input);
+    const { tools: toolSettings, ...changes } = parse(updateAgentSchema, input);
+    if (toolSettings) assertToolSettings(toolSettings);
 
     // The provider/model rule applies to the row as it will be after the
     // update, so fill in whichever half isn't changing from the current row.
@@ -66,8 +94,24 @@ export function createAgentService({ db, providers }: Dependencies) {
       );
     }
 
+    // One transaction: the agent and its tool permissions change together.
+    // A permission change applies to the next run (the worker reads them per run).
     const [agent] = await query(() =>
-      db.update(agents).set(changes).where(eq(agents.id, agentId)).returning(),
+      db.transaction(async (tx) => {
+        // Setting updatedAt also marks a tools-only change as an update.
+        const updated = await tx
+          .update(agents)
+          .set({ ...changes, updatedAt: sql`now()` })
+          .where(eq(agents.id, agentId))
+          .returning();
+        if (updated.length > 0 && toolSettings) {
+          await tx.delete(agentToolPermissions).where(eq(agentToolPermissions.agentId, agentId));
+          if (toolSettings.length > 0) {
+            await tx.insert(agentToolPermissions).values(toolSettings.map((tool) => ({ agentId, ...tool })));
+          }
+        }
+        return updated;
+      }),
     );
     if (!agent) throw notFoundError();
     return agent;
@@ -93,6 +137,7 @@ export function createAgentService({ db, providers }: Dependencies) {
    */
   async function duplicate(id: unknown): Promise<Agent> {
     const source = await get(id);
+    const sourceTools = await getTools(source.id);
     // Keep the model only while it's still selectable; otherwise start unconfigured.
     const keepModel = checkModelSelection(providers, source.providerId, source.modelId) === null;
 
@@ -106,6 +151,7 @@ export function createAgentService({ db, providers }: Dependencies) {
           providerId: keepModel ? source.providerId : null,
           modelId: keepModel ? source.modelId : null,
           enabled: false,
+          tools: sourceTools,
         });
       } catch (error) {
         if (error instanceof AgentServiceError && error.code === "name_taken") continue;
@@ -125,6 +171,19 @@ export function createAgentService({ db, providers }: Dependencies) {
     );
   }
 
+  /** Every tool must exist, and a tool that requires approval can't run automatically. */
+  function assertToolSettings(settings: AgentToolSetting[]) {
+    for (const setting of settings) {
+      const tool = tools.get(setting.toolId);
+      const message = !tool
+        ? `Unknown tool “${setting.toolId}”.`
+        : tool.approval === "required" && setting.mode !== "ask"
+          ? `${tool.name} always needs your approval.`
+          : null;
+      if (message) throw new AgentServiceError("validation_failed", message, { tools: [message] });
+    }
+  }
+
   function assertModelSelection(providerId: string | null, modelId: string | null) {
     const problem = checkModelSelection(providers, providerId, modelId);
     if (problem) {
@@ -134,7 +193,7 @@ export function createAgentService({ db, providers }: Dependencies) {
     }
   }
 
-  return { list, get, create, update, remove, setEnabled, duplicate };
+  return { list, get, getTools, create, update, remove, setEnabled, duplicate };
 }
 
 const MAX_COPY_ATTEMPTS = 20;

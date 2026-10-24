@@ -35,6 +35,26 @@ function identifier(label: string) {
     .nullable();
 }
 
+/**
+ * The tools an agent may use. Only the shape is checked here (the browser
+ * has no registry); the agent service checks each ID against the tool
+ * registry. A tool that isn't listed is off.
+ */
+const toolSettings = z
+  .array(
+    z.strictObject({
+      toolId: z.string({ error: "Tool ID must be text." }).trim().min(1).max(64),
+      mode: z.enum(["allow", "ask"], { error: "Choose whether the tool runs automatically or asks first." }),
+    }),
+    { error: "Tools must be a list." },
+  )
+  .max(32, { error: "Too many tools." })
+  .refine((tools) => new Set(tools.map((tool) => tool.toolId)).size === tools.length, {
+    error: "A tool is listed twice.",
+  });
+
+export type AgentToolSetting = z.output<typeof toolSettings>[number];
+
 const fields = {
   name: requiredText("Name", AGENT_LIMITS.name),
   role: requiredText("Role", AGENT_LIMITS.role),
@@ -43,6 +63,7 @@ const fields = {
   providerId: identifier("Provider"),
   modelId: identifier("Model"),
   enabled: z.boolean({ error: "Enabled must be true or false." }),
+  tools: toolSettings,
 };
 
 export const createAgentSchema = z.strictObject({
@@ -53,6 +74,7 @@ export const createAgentSchema = z.strictObject({
   providerId: fields.providerId.default(null),
   modelId: fields.modelId.default(null),
   enabled: fields.enabled.default(true),
+  tools: fields.tools.default([]),
 });
 
 export const updateAgentSchema = z
@@ -64,6 +86,7 @@ export const updateAgentSchema = z
     providerId: fields.providerId.optional(),
     modelId: fields.modelId.optional(),
     enabled: fields.enabled.optional(),
+    tools: fields.tools.optional(),
   })
   .refine((changes) => Object.keys(changes).length > 0, { error: "Nothing to update." });
 
