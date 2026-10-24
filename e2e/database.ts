@@ -8,16 +8,14 @@ import * as schema from "../src/server/db/schema";
 // needs, and check what the app saved. Replies are written here, as the
 // worker would write them, so no AI provider is involved.
 
-const client = postgres(e2eDatabaseUrl(), { max: 2, onnotice: () => {} });
+// Shared by every test file in the worker, so no file closes it: idle
+// connections close themselves, and the worker process ends after the run.
+const client = postgres(e2eDatabaseUrl(), { max: 2, idle_timeout: 1, onnotice: () => {} });
 export const db = drizzle({ client, schema });
-export const { agents, conversations, messages, runs } = schema;
+export const { agents, agentToolPermissions, conversations, messages, runs, toolCalls } = schema;
 
 export async function resetDatabase() {
   await db.delete(agents); // cascades to conversations, messages, and runs
-}
-
-export async function closeDatabase() {
-  await client.end({ timeout: 5 });
 }
 
 export async function createAgent(overrides: Partial<typeof agents.$inferInsert> = {}) {
@@ -94,4 +92,32 @@ export async function completeRun(runId: string, text: string) {
 /** Moves a pending run to running with some text written, as the worker does while streaming. */
 export async function streamInto(runId: string, text: string) {
   await db.update(runs).set({ status: "running", startedAt: new Date(), heartbeatAt: new Date(), partialOutput: text }).where(eq(runs.id, runId));
+}
+
+/** Enables tools for an agent, as Agent Builder would. */
+export async function setTools(agentId: string, tools: { toolId: string; mode: "allow" | "ask" }[]) {
+  await db.insert(agentToolPermissions).values(tools.map((tool) => ({ agentId, ...tool })));
+}
+
+/** Records a tool call on a run, the way the worker's invoker does. */
+export async function createToolCall(runId: string, overrides: Partial<typeof toolCalls.$inferInsert> = {}) {
+  const [call] = await db
+    .insert(toolCalls)
+    .values({
+      runId,
+      toolId: "read_workspace_file",
+      input: { path: "notes/plan.md" },
+      inputSummary: "notes/plan.md",
+      status: "awaiting_approval",
+      requiresApproval: true,
+      approvalExpiresAt: new Date(Date.now() + 5 * 60_000),
+      ...overrides,
+    })
+    .returning();
+  return call;
+}
+
+export async function toolCallById(id: string) {
+  const [call] = await db.select().from(toolCalls).where(eq(toolCalls.id, id));
+  return call;
 }

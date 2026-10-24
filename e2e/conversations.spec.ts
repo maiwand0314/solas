@@ -2,7 +2,6 @@ import { expect, test, type Page } from "@playwright/test";
 import { eq } from "drizzle-orm";
 import {
   agents,
-  closeDatabase,
   completeRun,
   conversations,
   createAgent,
@@ -22,10 +21,6 @@ import {
 
 test.beforeEach(async () => {
   await resetDatabase();
-});
-
-test.afterAll(async () => {
-  await closeDatabase();
 });
 
 /** The messages of the visible page (Next.js keeps the previous page mounted, hidden). */
