@@ -95,10 +95,17 @@ export const messages = pgTable(
     content: text("content").notNull(),
     // A function reference because runs is declared below (and points back here).
     runId: uuid("run_id").references((): AnyPgColumn => runs.id, { onDelete: "set null" }),
+    /**
+     * Chosen by the browser for each message it sends, and sent again if it
+     * retries. The unique index turns a repeated send into "already saved"
+     * instead of a duplicate message.
+     */
+    clientMessageId: uuid("client_message_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
     index("messages_conversation_id_created_at_idx").on(table.conversationId, table.createdAt),
+    uniqueIndex("messages_client_message_id_unique").on(table.clientMessageId),
     check("messages_role_valid", sql`${table.role} in ('user', 'assistant')`),
   ],
 );
@@ -132,6 +139,14 @@ export const runs = pgTable(
     errorMessage: text("error_message"),
     /** Set by the owner's Stop button; the worker notices and aborts. */
     cancelRequestedAt: timestamp("cancel_requested_at", { withTimezone: true }),
+    /**
+     * The reply as Claude writes it, updated while the run is running so the
+     * owner can read along. The finished reply is saved as a message; this
+     * keeps what was written before a stop or failure.
+     */
+    partialOutput: text("partial_output"),
+    /** Refreshed every second by the worker running it; a stale value means that worker is gone. */
+    heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),
     inputTokens: integer("input_tokens"),
     outputTokens: integer("output_tokens"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
