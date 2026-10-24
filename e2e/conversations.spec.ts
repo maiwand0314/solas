@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import {
   agents,
   closeDatabase,
+  completeRun,
   conversations,
   createAgent,
   createConversation,
@@ -12,6 +13,7 @@ import {
   resetDatabase,
   runs,
   runsOf,
+  streamInto,
 } from "./database";
 
 // Conversations in a real browser, against the production build. Each test
@@ -96,6 +98,10 @@ test("shows reply text as the worker saves it, then the saved reply", async ({ p
   await expect(page.getByRole("status")).toHaveCount(0);
   await expect(thread(page)).toContainText("Streaming means sending text as it is written.");
   await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+  // Regression (M3B): the streamed text and the saved reply must not both show.
+  await expect(thread(page).getByText("Streaming means sending text as it is written")).toHaveCount(1);
+  await page.waitForTimeout(1500); // a few more polls and refreshes
+  await expect(thread(page).getByText("Streaming means sending text as it is written")).toHaveCount(1);
 });
 
 test("opens at the newest message, and stops following when the owner scrolls up to read", async ({ page }) => {
@@ -121,6 +127,80 @@ test("opens at the newest message, and stops following when the owner scrolls up
 
   await page.getByRole("button", { name: "Jump to latest" }).click();
   await expect(page.getByText("The newest words, and more")).toBeInViewport();
+});
+
+test.describe("no duplicate messages (regression, M3B)", () => {
+  /**
+   * Elements whose whole text is `text`: a reply paragraph, or a message bubble
+   * (which starts with "You: " for screen readers).
+   */
+  const occurrences = (page: Page, text: string) =>
+    thread(page).getByText(new RegExp(`^(You: )?${text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`));
+
+  test("each turn of a streamed conversation shows its question and reply exactly once", async ({ page }) => {
+    const agent = await createAgent();
+    await page.goto(`/conversations/new?agent=${agent.id}`);
+
+    for (const [index, question] of ["My name is Alex.", "What is my name?"].entries()) {
+      await composer(page).fill(question);
+      await composer(page).press("Enter");
+      if (index === 0) await page.waitForURL(/\/conversations\/[0-9a-f-]{36}$/);
+      const conversationId = page.url().split("/").pop()!;
+      // Wait until the send has been saved: one run per question so far.
+      await expect.poll(async () => (await runsOf(conversationId)).length).toBe(index + 1);
+      const run = (await runsOf(conversationId)).at(-1)!;
+      await streamInto(run.id, `Answer ${index + 1}`);
+      await expect(thread(page)).toContainText(`Answer ${index + 1}`);
+      await completeRun(run.id, `Answer ${index + 1}.`);
+      await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+      await page.waitForTimeout(1200); // further polls and refreshes must not add a copy
+      await expect(occurrences(page, question)).toHaveCount(1);
+      await expect(occurrences(page, `Answer ${index + 1}.`)).toHaveCount(1);
+      await expect(thread(page).getByText(`Answer ${index + 1}`, { exact: true })).toHaveCount(0); // the draft is gone
+    }
+
+    const conversationId = page.url().split("/").pop()!;
+    expect((await messagesOf(conversationId)).map((message) => message.content)).toEqual([
+      "My name is Alex.",
+      "Answer 1.",
+      "What is my name?",
+      "Answer 2.",
+    ]);
+  });
+
+  test("a reload after a reply shows every message once", async ({ page }) => {
+    const agent = await createAgent();
+    const conversation = await createConversation(agent.id, "Reload", [
+      { user: "Question one", assistant: "Reply one" },
+      { user: "Question two", assistant: "Reply two" },
+    ]);
+    await page.goto(`/conversations/${conversation.id}`);
+    for (let reload = 0; reload < 3; reload++) {
+      await page.reload();
+      for (const text of ["Question one", "Reply one", "Question two", "Reply two"]) {
+        await expect(occurrences(page, text)).toHaveCount(1);
+      }
+    }
+  });
+
+  test("a retried reply is shown once, with the question once", async ({ page }) => {
+    const agent = await createAgent();
+    const conversation = await createConversation(agent.id, "Retry once", [
+      { user: "Try me", run: { status: "failed", errorMessage: "Claude is overloaded." } },
+    ]);
+    await page.goto(`/conversations/${conversation.id}`);
+    await page.getByRole("button", { name: "Retry" }).click();
+    await expect(page.getByRole("status").filter({ hasText: "Waiting for the worker" })).toBeVisible();
+
+    const retry = (await runsOf(conversation.id)).at(-1)!;
+    await streamInto(retry.id, "Second attempt");
+    await completeRun(retry.id, "Second attempt worked.");
+    await expect(occurrences(page, "Second attempt worked.")).toHaveCount(1);
+    await page.waitForTimeout(1200);
+    await expect(occurrences(page, "Second attempt worked.")).toHaveCount(1);
+    await expect(occurrences(page, "Try me")).toHaveCount(1);
+    await expect(page.getByText("Claude is overloaded.")).toHaveCount(0); // the latest run counts
+  });
 });
 
 test("renders Markdown safely, with copyable code", async ({ page, context }) => {

@@ -36,6 +36,10 @@ export type ConversationMessage = {
   role: "user" | "assistant";
   content: string;
   createdAt: Date;
+  /** On a reply: the run that produced it. */
+  runId: string | null;
+  /** On a message the owner sent: the ID the browser chose for it. */
+  clientMessageId: string | null;
 };
 
 type ConversationViewProps = {
@@ -75,10 +79,21 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
   // One ID per message the owner sends, reused if the same send is retried,
   // so the server can recognise a repeat instead of saving it twice.
   const sendId = useRef<string | null>(null);
-  const [optimisticMessages, addOptimisticMessage] = useOptimistic(messages, (current, content: string) => [
-    ...current,
-    { id: "sending", role: "user" as const, content, createdAt: new Date() },
-  ]);
+  const [optimisticMessages, addOptimisticMessage] = useOptimistic(
+    messages,
+    (current, sent: { content: string; clientMessageId: string }) => [
+      ...current,
+      { id: "sending", role: "user" as const, createdAt: new Date(), runId: null, ...sent },
+    ],
+  );
+  // Everything below is reconciled by ID, so nothing can show twice: the
+  // message being sent disappears once the saved one (same clientMessageId)
+  // is on the page, and a run's streamed text once its saved reply (same runId) is.
+  const savedClientIds = new Set(messages.map((message) => message.clientMessageId));
+  const savedReplyRunIds = new Set(messages.map((message) => message.runId));
+  const visibleMessages = optimisticMessages.filter(
+    (message) => message.id !== "sending" || !savedClientIds.has(message.clientMessageId),
+  );
 
   const activeRun = runs.find(isActive);
   const { liveRun, lastText, connectionLost } = useRunPolling(activeRun);
@@ -94,7 +109,7 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
     !agent.unavailableReason && !activeRun && (lastRun?.status === "failed" || lastRun?.status === "cancelled");
 
   const { endRef, atBottom, scrollToEnd } = useStickToBottom(
-    `${optimisticMessages.length}:${lastRun?.status}:${liveRun?.partialOutput?.length ?? 0}`,
+    `${visibleMessages.length}:${lastRun?.status}:${liveRun?.partialOutput?.length ?? 0}`,
   );
 
   const canSend = !agent.unavailableReason && !activeRun && !sending;
@@ -111,7 +126,7 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
     const clientMessageId = sendId.current;
     setError(null);
     startSending(async () => {
-      addOptimisticMessage(content);
+      addOptimisticMessage({ content, clientMessageId });
       try {
         const result = await sendMessage(
           conversationId
@@ -181,7 +196,7 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
   return (
     <div className="mx-auto flex w-full max-w-[720px] flex-col">
       <ol aria-label="Messages" className="flex flex-col gap-7 pb-6">
-        {optimisticMessages.length === 0 && (
+        {visibleMessages.length === 0 && (
           <li className="rounded-lg border border-dashed border-border-strong px-5 py-8 text-center">
             <p className="font-medium">Start the conversation</p>
             <p className="mt-1 text-sm text-muted">
@@ -191,7 +206,7 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
             </p>
           </li>
         )}
-        {optimisticMessages.map((message) => {
+        {visibleMessages.map((message) => {
           const run = message.role === "user" ? runByMessage.get(message.id) : undefined;
           return (
             <li key={message.id} className="flex flex-col gap-5">
@@ -208,10 +223,11 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
                   retrying={retrying}
                 />
               )}
-              {/* Finished, and the saved reply is on its way from the server. */}
-              {run?.status === "completed" && run.id === liveRun?.id && lastText && (
+              {/* Finished, and the saved reply is still on its way from the server.
+                  Shown only until a saved reply for this run is on the page. */}
+              {run?.status === "completed" && lastText?.runId === run.id && !savedReplyRunIds.has(run.id) && (
                 <AgentText agentName={agent.name} label="just now">
-                  {lastText}
+                  {lastText.text}
                 </AgentText>
               )}
             </li>
@@ -220,7 +236,7 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
       </ol>
 
       <div className="sticky bottom-0 -mx-4 bg-background px-4 pt-2 pb-4 md:mx-0 md:px-0">
-        {!atBottom && optimisticMessages.length > 0 && (
+        {!atBottom && visibleMessages.length > 0 && (
           <div className="pointer-events-none absolute -top-10 right-0 left-0 flex justify-center">
             <Button size="sm" onClick={scrollToEnd} className="pointer-events-auto shadow-popover">
               Jump to latest
@@ -437,27 +453,28 @@ function formatElapsed(ms: number): string {
 function useRunPolling(activeRun: RunState | undefined) {
   const router = useRouter();
   const [liveRun, setLiveRun] = useState<RunState | null>(null);
-  // The last text seen, shown for the moment between "completed" and the
-  // saved reply arriving (the run's draft is cleared when it completes).
-  const [lastText, setLastText] = useState<string | null>(null);
+  // The last text seen for a run, shown for the moment between "completed"
+  // and the saved reply arriving (the run's draft is cleared when it completes).
+  const [lastText, setLastText] = useState<{ runId: string; text: string } | null>(null);
   const [connectionLost, setConnectionLost] = useState(false);
   const runId = activeRun?.id;
 
   useEffect(() => {
     if (!runId) return;
+    const id = runId;
     let stopped = false;
     let timer: number | undefined;
     let status = "pending";
 
     async function tick() {
       try {
-        const result = await getRunState(runId);
+        const result = await getRunState(id);
         if (stopped) return;
         setConnectionLost(false);
         if (result.ok) {
           status = result.data.status;
           setLiveRun(result.data);
-          if (result.data.partialOutput) setLastText(result.data.partialOutput);
+          if (result.data.partialOutput) setLastText({ runId: id, text: result.data.partialOutput });
           if (!isActive(result.data)) {
             stopped = true;
             router.refresh();

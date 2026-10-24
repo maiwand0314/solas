@@ -58,7 +58,14 @@ async function ConversationContent({ params }: Pick<PageProps<"/conversations/[c
       <ConversationView
         agent={{ id: agent.id, name: agent.name, modelLabel, unavailableReason: chatUnavailableReason(agent) }}
         conversationId={conversation.id}
-        messages={messages.map(({ id, role, content, createdAt }) => ({ id, role, content, createdAt }))}
+        messages={messages.map(({ id, role, content, createdAt, runId, clientMessageId }) => ({
+          id,
+          role,
+          content,
+          createdAt,
+          runId,
+          clientMessageId,
+        }))}
         runs={runs}
       />
     </>

@@ -81,3 +81,17 @@ export async function runsOf(conversationId: string) {
 export async function messagesOf(conversationId: string) {
   return db.select().from(messages).where(eq(messages.conversationId, conversationId)).orderBy(messages.createdAt);
 }
+
+/** Finishes a run the way the worker does: saves the reply and completes the run, in one transaction. */
+export async function completeRun(runId: string, text: string) {
+  await db.transaction(async (tx) => {
+    const [run] = await tx.select().from(runs).where(eq(runs.id, runId));
+    await tx.insert(messages).values({ conversationId: run.conversationId, role: "assistant", content: text, runId });
+    await tx.update(runs).set({ status: "completed", partialOutput: null, finishedAt: new Date() }).where(eq(runs.id, runId));
+  });
+}
+
+/** Moves a pending run to running with some text written, as the worker does while streaming. */
+export async function streamInto(runId: string, text: string) {
+  await db.update(runs).set({ status: "running", startedAt: new Date(), heartbeatAt: new Date(), partialOutput: text }).where(eq(runs.id, runId));
+}
