@@ -106,6 +106,10 @@ export const messages = pgTable(
   (table) => [
     index("messages_conversation_id_created_at_idx").on(table.conversationId, table.createdAt),
     uniqueIndex("messages_client_message_id_unique").on(table.clientMessageId),
+    // One run produces at most one saved reply, whatever happens in the worker.
+    uniqueIndex("messages_one_reply_per_run")
+      .on(table.runId)
+      .where(sql`${table.role} = 'assistant'`),
     check("messages_role_valid", sql`${table.role} in ('user', 'assistant')`),
   ],
 );

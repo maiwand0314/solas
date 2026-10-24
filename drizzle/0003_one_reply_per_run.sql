@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "messages_one_reply_per_run" ON "messages" USING btree ("run_id") WHERE "messages"."role" = 'assistant';
