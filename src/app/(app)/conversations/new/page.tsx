@@ -26,7 +26,10 @@ export const metadata: Metadata = {
 export default function NewConversationPage({ searchParams }: PageProps<"/conversations/new">) {
   return (
     <>
-      <BackLink href="/conversations">Conversations</BackLink>
+      {/* On wide screens the list is beside the page, so no back link. */}
+      <div className="lg:hidden">
+        <BackLink href="/conversations">Conversations</BackLink>
+      </div>
       {/* searchParams are only known per request: so Suspense. */}
       <Suspense fallback={<ConversationSkeleton />}>
         <NewConversation searchParams={searchParams} />

@@ -26,14 +26,27 @@ function NewConversationButton() {
 export default function ConversationsPage() {
   return (
     <>
-      <PageHeader
-        title="Conversations"
-        description="Your chats with agents, saved so you can pick them up again."
-        actions={<NewConversationButton />}
-      />
-      <Suspense fallback={<ConversationListSkeleton />}>
-        <StoredConversations />
-      </Suspense>
+      {/* Narrow screens: this page is the list. */}
+      <div className="lg:hidden">
+        <PageHeader
+          title="Conversations"
+          description="Your chats with agents, saved so you can pick them up again."
+          actions={<NewConversationButton />}
+        />
+        <Suspense fallback={<ConversationListSkeleton />}>
+          <StoredConversations />
+        </Suspense>
+      </div>
+      {/* Wide screens: the list is beside this page, so just invite a choice. */}
+      <div className="hidden lg:block">
+        <EmptyState
+          icon={ConversationsIcon}
+          title="Pick a conversation"
+          description="Choose one from the list to continue it, or start a new one. Every conversation is saved, so you can come back any time."
+        >
+          <NewConversationButton />
+        </EmptyState>
+      </div>
     </>
   );
 }

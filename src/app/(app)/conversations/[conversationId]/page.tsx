@@ -1,12 +1,11 @@
 import type { Metadata } from "next";
-import Link from "next/link";
 import { notFound, unstable_rethrow } from "next/navigation";
 import { Suspense } from "react";
 import { BackLink } from "@/components/agents/back-link";
 import { ConversationSkeleton } from "@/components/conversations/conversation-list";
+import { ConversationActions } from "@/components/conversations/conversation-actions";
 import { ConversationView } from "@/components/conversations/conversation-view";
 import { LoadError } from "@/components/load-error";
-import { buttonClassName } from "@/components/ui/button";
 import { PageHeader } from "@/components/ui/page-header";
 import { ConversationServiceError } from "@/server/conversations/errors";
 import { chatUnavailableReason, getConversationForOwner } from "@/server/conversations/queries";
@@ -19,7 +18,10 @@ export const metadata: Metadata = {
 export default function ConversationPage({ params }: PageProps<"/conversations/[conversationId]">) {
   return (
     <>
-      <BackLink href="/conversations">Conversations</BackLink>
+      {/* On wide screens the list is beside the page, so no back link. */}
+      <div className="lg:hidden">
+        <BackLink href="/conversations">Conversations</BackLink>
+      </div>
       <Suspense fallback={<ConversationSkeleton />}>
         <ConversationContent params={params} />
       </Suspense>
@@ -48,15 +50,15 @@ async function ConversationContent({ params }: Pick<PageProps<"/conversations/[c
         title={conversation.title}
         description={[agent.name, modelLabel].filter(Boolean).join(" · ")}
         actions={
-          <Link href={`/agents/${agent.id}`} className={buttonClassName({ variant: "secondary" })}>
-            Agent
-          </Link>
+          <ConversationActions
+            conversation={{ id: conversation.id, title: conversation.title, agentId: agent.id }}
+          />
         }
       />
       <ConversationView
         agent={{ id: agent.id, name: agent.name, modelLabel, unavailableReason: chatUnavailableReason(agent) }}
         conversationId={conversation.id}
-        messages={messages.map(({ id, role, content }) => ({ id, role, content }))}
+        messages={messages.map(({ id, role, content, createdAt }) => ({ id, role, content, createdAt }))}
         runs={runs}
       />
     </>

@@ -13,12 +13,14 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from "react";
-import { cancelRun, getRunState, sendMessage } from "@/app/(app)/conversations/actions";
+import { cancelRun, getRunState, retryRun, sendMessage } from "@/app/(app)/conversations/actions";
 import { SendIcon, StopIcon } from "@/components/icons";
 import { Button, buttonClassName } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
+import { RelativeTime } from "@/components/ui/relative-time";
 import { MESSAGE_MAX_LENGTH, messageContentSchema } from "@/lib/conversations/validation";
 import type { RunState } from "@/server/conversations/service";
+import { Markdown } from "./markdown";
 
 export type ConversationAgent = {
   id: string;
@@ -33,6 +35,7 @@ export type ConversationMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  createdAt: Date;
 };
 
 type ConversationViewProps = {
@@ -43,17 +46,22 @@ type ConversationViewProps = {
   runs: RunState[];
 };
 
-const POLL_MS = 1_000;
+/** How often the run's state is fetched: often while text streams in. */
+const POLL_PENDING_MS = 1_000;
+const POLL_RUNNING_MS = 500;
 /** A pending run this old suggests the worker isn't running. */
 const WORKER_HINT_AFTER_MS = 10_000;
+/** Within this many pixels of the end counts as "reading the latest". */
+const NEAR_BOTTOM_PX = 120;
 
 const isActive = (run: RunState) => run.status === "pending" || run.status === "running";
 
 /**
- * One conversation with an agent. Everything shown here is real: messages
- * come from PostgreSQL, and the reply status is the run's actual state, polled
- * from the server every second while a reply is pending or running. When the
- * run finishes, the page re-renders on the server with the saved reply.
+ * One conversation with an agent. Everything shown is real: messages come
+ * from PostgreSQL, and the reply's status and text are the run's actual
+ * state, fetched from the server while it is pending or running. Text appears
+ * as the worker saves it from Claude's stream; nothing is typed out for show.
+ * When the run ends, the page re-renders on the server with the saved reply.
  */
 export function ConversationView({ agent, conversationId, messages, runs }: ConversationViewProps) {
   const router = useRouter();
@@ -62,23 +70,32 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
   const [error, setError] = useState<string | null>(null);
   const [sending, startSending] = useTransition();
   const [stopping, startStopping] = useTransition();
+  const [retrying, startRetrying] = useTransition();
   const [stopRequestedFor, setStopRequestedFor] = useState<string | null>(null);
+  // One ID per message the owner sends, reused if the same send is retried,
+  // so the server can recognise a repeat instead of saving it twice.
+  const sendId = useRef<string | null>(null);
   const [optimisticMessages, addOptimisticMessage] = useOptimistic(messages, (current, content: string) => [
     ...current,
-    { id: "sending", role: "user" as const, content },
+    { id: "sending", role: "user" as const, content, createdAt: new Date() },
   ]);
 
   const activeRun = runs.find(isActive);
-  const { liveRun, connectionLost } = useRunPolling(activeRun);
+  const { liveRun, lastText, connectionLost } = useRunPolling(activeRun);
   const now = useNow(Boolean(activeRun));
-  const runByMessage = new Map(runs.map((run) => [run.userMessageId, run.id === liveRun?.id ? liveRun : run]));
 
-  const endRef = useRef<HTMLDivElement>(null);
-  const lastRun = runs.at(-1);
-  // Keep the newest message and status in view as the conversation grows.
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
-  }, [optimisticMessages.length, lastRun?.status, liveRun?.status]);
+  // The latest run per message (a retry adds a newer one), with live state on top.
+  const runByMessage = new Map<string, RunState>();
+  for (const run of runs) runByMessage.set(run.userMessageId, run.id === liveRun?.id ? liveRun : run);
+
+  const lastMessage = messages.at(-1);
+  const lastRun = lastMessage?.role === "user" ? runByMessage.get(lastMessage.id) : undefined;
+  const canRetry =
+    !agent.unavailableReason && !activeRun && (lastRun?.status === "failed" || lastRun?.status === "cancelled");
+
+  const { endRef, atBottom, scrollToEnd } = useStickToBottom(
+    `${optimisticMessages.length}:${lastRun?.status}:${liveRun?.partialOutput?.length ?? 0}`,
+  );
 
   const canSend = !agent.unavailableReason && !activeRun && !sending;
 
@@ -90,23 +107,29 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
       return;
     }
     const content = check.data;
+    sendId.current ??= crypto.randomUUID();
+    const clientMessageId = sendId.current;
     setError(null);
     startSending(async () => {
       addOptimisticMessage(content);
       try {
         const result = await sendMessage(
-          conversationId ? { conversationId, content } : { agentId: agent.id, content },
+          conversationId
+            ? { conversationId, agentId: agent.id, content, clientMessageId }
+            : { agentId: agent.id, content, clientMessageId },
         );
         if (!result.ok) {
           setError(result.error.message);
           return;
         }
+        sendId.current = null;
         setDraft("");
         if (conversationId) router.refresh();
         else router.replace(`/conversations/${result.data.conversationId}`);
       } catch {
-        // The request itself failed (server stopped, network down). Nothing
-        // was saved that we know of, so keep the draft for another try.
+        // The request failed in transit (server stopped, network down). It may
+        // or may not have been saved; sending again reuses the same ID, so it
+        // can't be saved twice.
         setError("Couldn’t reach Solas. Check that it’s running, then send again.");
       }
     });
@@ -122,6 +145,19 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
         else if (!isActive(result.data)) router.refresh();
       } catch {
         setError("Couldn’t reach Solas to stop the reply. Try again.");
+      }
+    });
+  }
+
+  function retry() {
+    if (!lastRun || !canRetry || retrying) return;
+    startRetrying(async () => {
+      try {
+        const result = await retryRun(lastRun.id);
+        if (!result.ok) setError(result.error.message);
+        else router.refresh();
+      } catch {
+        setError("Couldn’t reach Solas. Try again.");
       }
     });
   }
@@ -144,38 +180,53 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
 
   return (
     <div className="mx-auto flex w-full max-w-[720px] flex-col">
-      <ol aria-label="Messages" className="flex flex-col gap-6 pb-6">
+      <ol aria-label="Messages" className="flex flex-col gap-7 pb-6">
         {optimisticMessages.length === 0 && (
           <li className="rounded-lg border border-dashed border-border-strong px-5 py-8 text-center">
             <p className="font-medium">Start the conversation</p>
             <p className="mt-1 text-sm text-muted">
               {agent.name} answers with its saved instructions
-              {agent.modelLabel ? <> using {agent.modelLabel}</> : null}. Each reply is a real Claude run.
+              {agent.modelLabel ? <> using {agent.modelLabel}</> : null}. The conversation is saved, so you can
+              leave and continue later.
             </p>
           </li>
         )}
         {optimisticMessages.map((message) => {
           const run = message.role === "user" ? runByMessage.get(message.id) : undefined;
           return (
-            <li key={message.id} className="flex flex-col gap-3">
-              <MessageBubble message={message} agentName={agent.name} />
+            <li key={message.id} className="flex flex-col gap-5">
+              <MessageBlock message={message} agentName={agent.name} />
               {message.id === "sending" && <StatusLine>Sending…</StatusLine>}
               {run && run.status !== "completed" && (
-                <RunStatus
+                <RunBlock
                   run={run}
                   agentName={agent.name}
                   now={now}
                   connectionLost={connectionLost && run.id === activeRun?.id}
                   stopRequested={stopRequestedFor === run.id}
+                  onRetry={run.id === lastRun?.id && canRetry ? retry : undefined}
+                  retrying={retrying}
                 />
+              )}
+              {/* Finished, and the saved reply is on its way from the server. */}
+              {run?.status === "completed" && run.id === liveRun?.id && lastText && (
+                <AgentText agentName={agent.name} label="just now">
+                  {lastText}
+                </AgentText>
               )}
             </li>
           );
         })}
       </ol>
-      <div ref={endRef} />
 
       <div className="sticky bottom-0 -mx-4 bg-background px-4 pt-2 pb-4 md:mx-0 md:px-0">
+        {!atBottom && optimisticMessages.length > 0 && (
+          <div className="pointer-events-none absolute -top-10 right-0 left-0 flex justify-center">
+            <Button size="sm" onClick={scrollToEnd} className="pointer-events-auto shadow-popover">
+              Jump to latest
+            </Button>
+          </div>
+        )}
         {agent.unavailableReason ? (
           <Callout
             title={`${agent.name} can’t answer right now`}
@@ -201,6 +252,7 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
               value={draft}
               onChange={(event) => {
                 setDraft(event.target.value);
+                sendId.current = null; // a changed message is a new message
                 if (error) setError(null);
               }}
               onKeyDown={onKeyDown}
@@ -235,71 +287,130 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
           </p>
         )}
       </div>
+      {/* Below the sticky composer, so "the end" really is the end of the page. */}
+      <div ref={endRef} />
     </div>
   );
 }
 
-function MessageBubble({ message, agentName }: { message: ConversationMessage; agentName: string }) {
+function MessageBlock({ message, agentName }: { message: ConversationMessage; agentName: string }) {
   if (message.role === "user") {
     return (
-      <div className="ml-auto max-w-[85%] rounded-lg bg-surface-hover px-4 py-2.5 text-reading break-words whitespace-pre-wrap">
-        <span className="sr-only">You: </span>
-        {message.content}
+      <div className="ml-auto flex max-w-[85%] flex-col items-end gap-1">
+        <div className="rounded-lg bg-surface-hover px-4 py-2.5 text-reading break-words whitespace-pre-wrap">
+          <span className="sr-only">You: </span>
+          {message.content}
+        </div>
+        {message.id !== "sending" && (
+          <span className="text-xs text-subtle tabular-nums">
+            <RelativeTime date={message.createdAt} />
+          </span>
+        )}
       </div>
     );
   }
   return (
-    <div>
-      <p className="mb-1 text-xs font-medium text-subtle">{agentName}</p>
-      {/* Plain text for now: Markdown isn't rendered yet, so formatting marks show as typed. */}
-      <div className="text-reading break-words whitespace-pre-wrap">{message.content}</div>
+    <AgentText agentName={agentName} time={message.createdAt}>
+      {message.content}
+    </AgentText>
+  );
+}
+
+/** An agent's text: name and time above, Markdown below. */
+function AgentText({
+  agentName,
+  time,
+  label,
+  muted = false,
+  children,
+}: {
+  agentName: string;
+  time?: Date;
+  label?: string;
+  muted?: boolean;
+  children: string;
+}) {
+  return (
+    <div className={muted ? "text-muted" : undefined}>
+      <p className="mb-1.5 flex items-center gap-1.5 text-xs text-subtle">
+        <span className="font-medium text-muted">{agentName}</span>
+        <span aria-hidden="true">·</span>
+        <span className="tabular-nums">{time ? <RelativeTime date={time} /> : label}</span>
+      </p>
+      <Markdown>{children}</Markdown>
     </div>
   );
 }
 
-function RunStatus({
+function RunBlock({
   run,
   agentName,
   now,
   connectionLost,
   stopRequested,
+  onRetry,
+  retrying,
 }: {
   run: RunState;
   agentName: string;
   now: number | null;
   connectionLost: boolean;
   stopRequested: boolean;
+  onRetry?: () => void;
+  retrying: boolean;
 }) {
-  if (run.status === "failed") {
+  const retryButton = onRetry && (
+    <Button size="sm" onClick={onRetry} disabled={retrying}>
+      {retrying ? "Retrying…" : "Retry"}
+    </Button>
+  );
+
+  if (run.status === "failed" || run.status === "cancelled") {
     return (
-      <Callout tone="danger" title="No reply">
-        {run.errorMessage ?? "The run failed. Check the worker log."}
-      </Callout>
+      <div className="flex flex-col gap-3">
+        {run.partialOutput && (
+          <AgentText agentName={agentName} label="incomplete, not saved" muted>
+            {run.partialOutput}
+          </AgentText>
+        )}
+        {run.status === "failed" ? (
+          <Callout tone="danger" title="No reply" actions={retryButton}>
+            {run.errorMessage ?? "The run failed. Check the worker log."}
+          </Callout>
+        ) : (
+          <div className="flex items-center gap-3">
+            <StatusLine>Stopped. No reply was saved.</StatusLine>
+            {retryButton}
+          </div>
+        )}
+      </div>
     );
   }
-  if (run.status === "cancelled") {
-    return <StatusLine>Stopped. No reply was saved.</StatusLine>;
-  }
 
-  let text: string;
-  if (run.status === "running") {
-    text = stopRequested ? "Stopping" : `${agentName} is responding`;
-    if (now !== null && run.startedAt) text += ` · ${formatElapsed(now - new Date(run.startedAt).getTime())}`;
-  } else {
-    text = "Waiting for the worker to start…";
-  }
+  const elapsed = now !== null && run.startedAt ? ` · ${formatElapsed(now - new Date(run.startedAt).getTime())}` : "";
   const waitedLong =
     run.status === "pending" && now !== null && now - new Date(run.createdAt).getTime() > WORKER_HINT_AFTER_MS;
 
   return (
-    <div>
-      <StatusLine active>{text}</StatusLine>
+    <div className="flex flex-col gap-3">
+      {run.status === "running" && run.partialOutput && (
+        <AgentText agentName={agentName} label="writing">
+          {run.partialOutput}
+        </AgentText>
+      )}
+      <StatusLine active>
+        {run.status === "pending"
+          ? "Waiting for the worker to start…"
+          : stopRequested
+            ? `Stopping${elapsed}`
+            : `${run.partialOutput ? `${agentName} is writing` : `${agentName} is responding`}${elapsed}`}
+      </StatusLine>
       {waitedLong && (
-        <p className="mt-1 text-sm text-muted">
+        <p className="text-sm text-muted">
           Nothing has picked this up yet. Is the worker running? Start it with <code>npm run worker</code>.
         </p>
       )}
-      {connectionLost && <p className="mt-1 text-sm text-muted">Lost contact with Solas. Retrying…</p>}
+      {connectionLost && <p className="text-sm text-muted">Lost contact with Solas. Retrying…</p>}
     </div>
   );
 }
@@ -319,41 +430,92 @@ function formatElapsed(ms: number): string {
 }
 
 /**
- * Polls the active run's real state. When it finishes, refreshes the page so
- * the server renders the saved reply (or the error) from the database.
+ * Fetches the active run's real state: every second while it waits, twice a
+ * second while text streams in. When it ends, refreshes the page so the
+ * server renders the saved reply (or the error) from the database.
  */
 function useRunPolling(activeRun: RunState | undefined) {
   const router = useRouter();
   const [liveRun, setLiveRun] = useState<RunState | null>(null);
+  // The last text seen, shown for the moment between "completed" and the
+  // saved reply arriving (the run's draft is cleared when it completes).
+  const [lastText, setLastText] = useState<string | null>(null);
   const [connectionLost, setConnectionLost] = useState(false);
   const runId = activeRun?.id;
 
   useEffect(() => {
     if (!runId) return;
     let stopped = false;
-    const timer = window.setInterval(async () => {
+    let timer: number | undefined;
+    let status = "pending";
+
+    async function tick() {
       try {
         const result = await getRunState(runId);
         if (stopped) return;
         setConnectionLost(false);
-        if (!result.ok) return;
-        setLiveRun(result.data);
-        if (!isActive(result.data)) {
-          stopped = true;
-          window.clearInterval(timer);
-          router.refresh();
+        if (result.ok) {
+          status = result.data.status;
+          setLiveRun(result.data);
+          if (result.data.partialOutput) setLastText(result.data.partialOutput);
+          if (!isActive(result.data)) {
+            stopped = true;
+            router.refresh();
+            return;
+          }
         }
       } catch {
         if (!stopped) setConnectionLost(true);
       }
-    }, POLL_MS);
+      if (!stopped) timer = window.setTimeout(tick, status === "running" ? POLL_RUNNING_MS : POLL_PENDING_MS);
+    }
+
+    timer = window.setTimeout(tick, POLL_RUNNING_MS);
     return () => {
       stopped = true;
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
     };
   }, [runId, router]);
 
-  return { liveRun: liveRun?.id === runId ? liveRun : null, connectionLost };
+  return {
+    // Keep the finished state until the refreshed page replaces it.
+    liveRun: liveRun && (liveRun.id === runId || !isActive(liveRun)) ? liveRun : null,
+    lastText,
+    connectionLost,
+  };
+}
+
+/**
+ * Keeps the newest content in view, but only while the owner is reading the
+ * end. Scrolling up to read stops the following; "Jump to latest" resumes it.
+ */
+function useStickToBottom(contentKey: string) {
+  const endRef = useRef<HTMLDivElement>(null);
+  // Starts true so a conversation opens at its newest message.
+  const following = useRef(true);
+  const [atBottom, setAtBottom] = useState(true);
+
+  useEffect(() => {
+    function onScroll() {
+      const distance = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
+      following.current = distance < NEAR_BOTTOM_PX;
+      setAtBottom(following.current);
+    }
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    if (following.current) endRef.current?.scrollIntoView({ block: "end" });
+  }, [contentKey]);
+
+  function scrollToEnd() {
+    const smooth = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    following.current = true;
+    endRef.current?.scrollIntoView({ block: "end", behavior: smooth ? "smooth" : "auto" });
+  }
+
+  return { endRef, atBottom, scrollToEnd };
 }
 
 function subscribeEverySecond(onTick: () => void) {
