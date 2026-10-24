@@ -659,3 +659,93 @@ worker restart. Sending twice never stores a message twice.
   once tool calls need a live timeline?
 - Should the worker refuse to start when another worker is already running,
   or is heartbeat safety enough?
+
+## Fix — duplicate assistant replies in the UI (2026-10-24)
+
+**Symptom:** after "My name is Alex…" and a follow-up, the correct reply
+appeared twice in the conversation.
+
+**Investigation, layer by layer**
+- **Database:** that conversation had exactly 2 user messages and 2 replies.
+  No run had more than one reply, and no message had more than one run.
+  Nothing was saved twice.
+- **Worker:** one run per message, one Claude session per run (worker log).
+  Claude was not called twice, and no job was processed twice.
+- **Browser:** reproduced without Claude in a Playwright test. The same reply
+  text appeared **2** times on the page.
+
+**Root cause** (in `conversation-view.tsx`, introduced in M3B):
+- While a reply streams, the view remembers the latest text. When the run
+  completes, it shows that text as a temporary "bridge", so nothing flickers
+  away before the saved reply arrives from the server.
+- The bridge was shown whenever "this run is completed". It didn't check
+  whether the saved reply was already on the page.
+- After `router.refresh()`, the page therefore showed both the saved reply
+  and the bridge, until the next full reload.
+- Two sources of truth for the same content, with no reconciliation by ID.
+
+**The fix**
+- **UI, by stable IDs:**
+  - The bridge shows only while no saved message carries that run's `runId`.
+  - The remembered text belongs to one run.
+  - The optimistic "sending" message disappears when the saved message with
+    the same `clientMessageId` is on the page.
+- **Database, as the last word:** a partial unique index
+  `messages_one_reply_per_run` (one assistant message per run). Even a
+  future bug can't save a reply twice.
+- **Worker, defensively:**
+  - A run handed to the executor again is skipped without calling Claude:
+    when it's already executing here, or no longer `running`.
+  - The first version of that guard had a race of its own: it checked, then
+    awaited the database, then marked. Two calls in the same tick both
+    passed. A test caught it; the run is now marked before any `await`.
+  - Saving a reply that the unique index refuses is logged as "already
+    saved", not treated as a crash.
+
+**What the regression tests protect**
+
+| # | Requirement | Test |
+| --- | --- | --- |
+| 1, 2 | One message → one execution → one saved reply | Vitest: "one message gives one execution and one saved reply"; Playwright: each turn shown once |
+| 3 | Duplicate event delivery | Vitest: the same run delivered again, or twice at once → executed once; Playwright: extra polls/refreshes add no copy |
+| 4 | Browser refresh | Playwright: three reloads, every message once |
+| 5 | Worker restart | Vitest: recovered run gets no reply; pending runs get exactly one |
+| 6 | Retry | Vitest and Playwright: after a failure and Retry, exactly one reply |
+| 7, 8 | Several turns; context | Vitest: three turns, each reply once, the history repeats nothing; Playwright: two streamed turns |
+| 9 | Concurrent workers | Vitest: two workers race for one run → one execution, one reply |
+| 10 | No duplicates in the database | Vitest: the database refuses a second reply for a run |
+
+**The `solas-runtime` mention**
+- Claude Code always adds an "Environment" section to the prompt: working
+  directory, git status, platform. It does this even when the system prompt
+  is fully custom; the SDK has no option to remove it, and changing the
+  binary is not allowed.
+- The agent saw `…/solas-runtime`, "not a git repo", and its own rule "Cite
+  every claim". It cited the environment and offered to read the owner's
+  project files, which it can't do.
+- **Fix:** a short, true note from Solas now goes before the agent's
+  instructions: no tools in this conversation, and those environment details
+  describe an empty sandbox, not the user's project. The agent's
+  instructions follow unchanged.
+- Verified:
+  - tools are still off (`tools: 0`, `mcpServers: 0`, `dontAsk` in the
+    worker log);
+  - the real test's replies no longer mention the sandbox.
+
+**How it was verified**
+- `lint`, `typecheck`, and `build` pass.
+- Vitest: 140 tests pass, three times.
+- Playwright: 17 tests pass, three times. The first regression assertion
+  failed with 2 copies before the fix and passed after it.
+- A real two-turn test through the UI and a fixed worker (Opus 5.5):
+  - 1 question and 1 reply per turn, while streaming, after completion, and
+    after a reload;
+  - 0 runs with more than one reply in the database;
+  - exactly one Claude session per message;
+  - the right context (Alex, Solas, Next.js, PostgreSQL);
+  - no mention of the sandbox.
+
+**Lesson:** when the same content can reach the screen two ways (streamed
+and saved), make one of them yield to the other by a stable ID. Don't rely
+on timing. And when a duplicate shows up, check each layer from the source
+outward: database first, then the worker, then the browser.
