@@ -5,7 +5,7 @@ type InputVariant = "default" | "bare";
 
 const variantClasses: Record<InputVariant, string> = {
   default:
-    "h-8 rounded-md border border-border-strong bg-surface px-2.5 shadow-control hover:border-subtle focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/25",
+    "h-8 rounded-md border border-border-strong bg-surface px-2.5 shadow-control hover:border-subtle focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/25 aria-invalid:border-danger aria-invalid:focus-visible:ring-danger/25",
   // No chrome of its own, for inputs that sit inside a styled container
   // (e.g. the command menu's search row).
   bare: "bg-transparent",

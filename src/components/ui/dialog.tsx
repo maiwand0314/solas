@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, type ComponentProps, type MouseEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, type ComponentProps, type MouseEvent } from "react";
 import { cn } from "@/lib/cn";
 
 type DialogProps = Omit<ComponentProps<"dialog">, "open" | "onClose"> & {
@@ -26,6 +26,13 @@ export function Dialog({ open, onOpenChange, className, onClick, children, ...pr
     if (open && !dialog.open) dialog.showModal();
     if (!open && dialog.open) dialog.close();
   }, [open]);
+
+  // Close when the page is hidden (Next.js keeps visited pages mounted), so
+  // a modal never comes back open, or keeps the rest of the page inert.
+  useLayoutEffect(() => {
+    const dialog = ref.current;
+    return () => dialog?.close();
+  }, []);
 
   function handleClick(event: MouseEvent<HTMLDialogElement>) {
     onClick?.(event);

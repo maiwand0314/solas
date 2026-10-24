@@ -1,9 +1,10 @@
 import { z } from "zod";
 
-// Input rules for agents. Everything that arrives from outside (a form, an
-// action call, the CLI) passes through these schemas before it reaches the
-// database. Strict objects reject unknown keys, so callers can't set `id`,
-// `createdAt`, or any column we didn't mean to expose.
+// Input rules for agents, shared by the browser and the server. The Agent
+// Builder form uses them for instant feedback; the agent service runs them
+// again on every write, because the browser can't be trusted. Strict objects
+// reject unknown keys, so callers can't set `id`, `createdAt`, or any column
+// we didn't mean to expose.
 
 export const AGENT_LIMITS = {
   name: 80,
@@ -13,17 +14,15 @@ export const AGENT_LIMITS = {
   identifier: 100,
 } as const;
 
-const name = z
-  .string({ error: "Name must be text." })
-  .trim()
-  .min(1, { error: "Name is required." })
-  .max(AGENT_LIMITS.name, { error: `Name must be at most ${AGENT_LIMITS.name} characters.` });
-
 function text(label: string, max: number) {
   return z
     .string({ error: `${label} must be text.` })
     .trim()
     .max(max, { error: `${label} must be at most ${max.toLocaleString("en")} characters.` });
+}
+
+function requiredText(label: string, max: number) {
+  return text(label, max).min(1, { error: `${label} can’t be empty.` });
 }
 
 /** Provider and model IDs: short identifiers, or null for "not configured". */
@@ -37,10 +36,10 @@ function identifier(label: string) {
 }
 
 const fields = {
-  name,
+  name: requiredText("Name", AGENT_LIMITS.name),
+  role: requiredText("Role", AGENT_LIMITS.role),
   description: text("Description", AGENT_LIMITS.description),
-  role: text("Role", AGENT_LIMITS.role),
-  instructions: text("Instructions", AGENT_LIMITS.instructions),
+  instructions: requiredText("Instructions", AGENT_LIMITS.instructions),
   providerId: identifier("Provider"),
   modelId: identifier("Model"),
   enabled: z.boolean({ error: "Enabled must be true or false." }),
@@ -48,9 +47,9 @@ const fields = {
 
 export const createAgentSchema = z.strictObject({
   name: fields.name,
+  role: fields.role,
   description: fields.description.default(""),
-  role: fields.role.default(""),
-  instructions: fields.instructions.default(""),
+  instructions: fields.instructions,
   providerId: fields.providerId.default(null),
   modelId: fields.modelId.default(null),
   enabled: fields.enabled.default(true),
@@ -59,8 +58,8 @@ export const createAgentSchema = z.strictObject({
 export const updateAgentSchema = z
   .strictObject({
     name: fields.name.optional(),
-    description: fields.description.optional(),
     role: fields.role.optional(),
+    description: fields.description.optional(),
     instructions: fields.instructions.optional(),
     providerId: fields.providerId.optional(),
     modelId: fields.modelId.optional(),
@@ -74,3 +73,19 @@ export const enabledSchema = fields.enabled;
 
 export type CreateAgentInput = z.input<typeof createAgentSchema>;
 export type UpdateAgentInput = z.input<typeof updateAgentSchema>;
+/** The fields an owner can edit, in form order. */
+export type AgentField = keyof typeof fields;
+
+/** Field name → messages, ready to show next to form inputs. */
+export type FieldErrors = Partial<Record<string, string[]>>;
+
+/** Runs a schema and returns field errors in the same shape the server uses. */
+export function validateAgentInput(
+  schema: typeof createAgentSchema | typeof updateAgentSchema,
+  input: unknown,
+): { ok: true } | { ok: false; formError?: string; fieldErrors: FieldErrors } {
+  const result = schema.safeParse(input);
+  if (result.success) return { ok: true };
+  const { formErrors, fieldErrors } = z.flattenError(result.error);
+  return { ok: false, formError: formErrors[0], fieldErrors: fieldErrors as FieldErrors };
+}

@@ -195,8 +195,9 @@ widening this one.
    │
    ▼
  agent service                   src/server/agents/service.ts
-   ├─ validate input (Zod)       src/server/agents/validation.ts — strict objects,
+   ├─ validate input (Zod)       src/lib/agents/validation.ts — strict objects,
    │                             trimmed strings, length limits, UUID ids
+   │                             (shared: the form runs the same rules first)
    ├─ check provider/model       src/server/providers/registry.ts
    ├─ query with Drizzle         src/server/db/
    └─ map failures               src/server/agents/errors.ts → AgentServiceError

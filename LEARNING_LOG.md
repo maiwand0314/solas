@@ -238,3 +238,121 @@ exists.
 - Delete vs. archive once conversations reference agents (M5).
 - Should reads in Server Components also go through a guarded helper, so no
   page can forget `requireOwner()`? (M2B)
+
+## M2B — Agent Builder UI (2026-10-24)
+
+**Built:** You can now manage agents in the browser: list and search, create,
+view, edit, enable/disable, duplicate, and delete. Agents still can't run;
+every page says so honestly instead of offering a model picker that doesn't
+work.
+
+**Concepts**
+- **One set of rules, run twice.** The Zod schemas moved to
+  `src/lib/agents/validation.ts` so the browser can use them too. The form
+  checks input instantly; the server checks it again, because anything the
+  browser sends can be forged. Both return errors in the same shape, so the
+  form shows them the same way.
+- **Server Actions from client code.** The form calls `createAgent(input)` like
+  a normal async function. Next.js turns that into a POST to the server. The
+  action returns `{ ok, data }` or `{ ok, error }` instead of throwing, so a
+  failure becomes a message next to a field, not a crash.
+- **Why not `useActionState`.** It's built for forms that post `FormData`
+  and re-render from the server's answer. This form validates first, sends a
+  typed object, and on edit sends only the fields that changed. A plain
+  `useTransition` around the action call was simpler and gives the same
+  `pending` flag.
+- **Optimistic UI.** The enable switch uses `useOptimistic`: it moves at once,
+  and React puts it back by itself if the save fails.
+- **Suspense under Cache Components.** Anything read per request (the agent
+  list, an agent from the URL, even `usePathname()` on a dynamic route) must
+  sit inside `<Suspense>`. The static frame is sent first, and the data
+  streams in after.
+- **Revalidation.** After a change, `revalidatePath("/agents", "layout")`
+  marks the list and every agent page as stale. Delete refreshes only the
+  list, so the deleted agent's page doesn't flash "not found".
+- **Hidden, not unmounted.** Next.js keeps visited pages mounted but hidden.
+  The form and dialog reset in a layout-effect cleanup. Otherwise they come
+  back with an old draft, or with a modal still open.
+- **Accessible errors.** Each error is linked to its input with
+  `aria-describedby`, and the input gets `aria-invalid`. Focus moves to the
+  first invalid field. The delete dialog opens with Cancel focused.
+- **Guarded reads.** Pages import `listAgentsForOwner()` and
+  `getAgentForOwner()`, never the raw service. Each of them calls
+  `requireOwner()` first, so no page can forget the check. This answers the
+  M2A question.
+- **Not-found status after streaming.** `notFound()` inside Suspense shows the
+  not-found page, but the HTTP status is 200. The headers were already sent
+  when streaming began. That's fine for a private app; search engines get a
+  `noindex` tag.
+
+**Files changed**
+- New pages in `src/app/(app)/agents/`:
+  - `new/`;
+  - `[agentId]/` (details, `edit/`, not-found, `load-agent.ts`);
+  - `error.tsx`.
+- Changed in `src/app/(app)/agents/`:
+  - `page.tsx`: list in Suspense;
+  - `actions.ts`: `duplicateAgent`, and scoped revalidation.
+- New: `src/components/agents/`:
+  - list, details, form, actions menu, delete dialog, enabled switch,
+    skeletons, and load error;
+  - the hooks `use-agent-commands` and `use-unsaved-changes`.
+- New UI primitives in `src/components/ui/`: Field, Textarea, Select, Switch,
+  Menu, Callout, Toast, and RelativeTime.
+- Changed primitives:
+  - Button: danger variants;
+  - Input: `aria-invalid` styling;
+  - Dialog: closes when its page is hidden;
+  - PageHeader: a badge slot.
+- Shell:
+  - breadcrumbs go deeper ("Agents / Details / Edit");
+  - the ⌘K menu gets "New agent";
+  - sidebar, breadcrumbs, and menu read the path inside Suspense;
+  - the `Toaster` is in the layout;
+  - a `--danger-foreground` token.
+- Server:
+  - validation moved to `src/lib/agents/`;
+  - name, role, and instructions are required;
+  - `service.duplicate()` was added;
+  - `queries.ts` was added;
+  - `describeModelSelection()` was added to the registry;
+  - the CLI gets `duplicate`.
+- Docs: `ARCHITECTURE.md` (validation path) and `PROJECT_PLAN.md`.
+
+**How it was verified**
+- `lint`, `typecheck`, and `build` pass. All 61 Vitest tests pass, including
+  new tests for duplicate, for required fields, and for the form error shape.
+- The build registers exactly five Server Actions: create, update,
+  setEnabled, duplicate, and delete. The client bundle has no connection
+  string, password, or Drizzle code.
+- A Playwright script in the browser, against the production build. The script
+  isn't in the repo; Playwright is not a project dependency.
+  - An empty submit shows three field errors, focuses Name, and sets
+    `aria-invalid`.
+  - Create opens the details page.
+  - A duplicate name (other case) shows the server's error on Name.
+  - The enable switch saves and survives a reload.
+  - Edit is disabled until something changes, and saves.
+  - Duplicate makes a disabled "(copy)".
+  - Search filters the list.
+  - The delete dialog opens on Cancel, Escape closes it, and confirm deletes.
+  - Delete from the details page returns to the list.
+  - Deleted and malformed ids show not-found.
+  - At 390 px wide there is no horizontal scroll.
+  - No console errors. The test agents were removed afterwards.
+- With the database stopped, the list shows "Can't load agents" with a retry
+  button. It recovers after `db:up`.
+
+**Exercise**
+- Add a "Disable all" button to the Agents page header:
+  1. Write a `setAllEnabled(false)` service method, with a test.
+  2. Add a Server Action that calls it.
+  3. Add a client button with a confirmation dialog.
+- Decide which revalidation scope it needs, and why.
+
+**Questions to revisit**
+- Should search move to the database once there are many agents? (Not
+  before it's needed.)
+- When conversations reference agents (M5), does delete become archive?
+- Playwright as a real dev dependency for key flows. The plan says "later";
+  M4/M5 (live runs) is probably when it pays off.

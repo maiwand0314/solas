@@ -146,14 +146,21 @@ No new dependencies.
   `server-only`; dev: `drizzle-kit`, `vitest`, `tsx`. `@types/node` was raised
   to ^24 to match the Node 24 runtime.
 
-**M2B — Agent Builder UI**
-- The Agents page lists stored agents, which requires `<Suspense>` under Cache
-  Components.
-- Create and edit forms call the M2A Server Actions and show field errors.
-- Enable/disable and delete, with confirmation.
-- A read-only provider/model picker that honestly shows "not configured".
-- Concepts: forms with `useActionState`, pending states, optimistic UI, and
-  accessible error messages.
+**M2B — Agent Builder UI** *(done 2026-10-24)*
+- The Agents page lists stored agents inside `<Suspense>` (Cache Components),
+  with instant client-side search.
+- Pages for new agent, agent details, and edit. Create and edit share one form
+  that validates with the same Zod schemas as the server, then calls the M2A
+  Server Actions and shows the server's field errors.
+- Enable/disable (optimistic), duplicate (copies start disabled), and delete
+  with a confirmation dialog.
+- A read-only provider/model section that honestly shows "not configured".
+- Role and instructions are now required.
+- Reads go through owner-guarded query helpers (`src/server/agents/queries.ts`).
+- Concepts: Server Actions from client components, transitions and pending
+  states, `useOptimistic`, accessible field errors, Suspense under Cache
+  Components. `useActionState` was considered and not used (see the learning
+  log). No new dependencies.
 
 **M3 — Agent runtime spike**
 Define `AgentRuntime` and Solas's own `RunEvent` types. Implement the Claude

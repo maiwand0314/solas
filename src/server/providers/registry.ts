@@ -47,6 +47,17 @@ export const providerRegistry = createProviderRegistry([
   },
 ]);
 
+/** Human-readable "Provider · Model", or null when the agent has no model. */
+export function describeModelSelection(
+  registry: ProviderRegistry,
+  agent: { providerId: string | null; modelId: string | null },
+): string | null {
+  if (agent.providerId === null || agent.modelId === null) return null;
+  const provider = registry.get(agent.providerId);
+  const model = provider?.models.find((candidate) => candidate.id === agent.modelId);
+  return `${provider?.label ?? agent.providerId} · ${model?.label ?? agent.modelId}`;
+}
+
 export type ModelSelectionProblem = {
   field: "providerId" | "modelId";
   message: string;

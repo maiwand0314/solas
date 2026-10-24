@@ -8,6 +8,7 @@
 //   npm run agents -- get <id>
 //   npm run agents -- update <id> --description "New description"
 //   npm run agents -- disable <id>   |   enable <id>
+//   npm run agents -- duplicate <id>
 //   npm run agents -- delete <id>
 //   npm run agents -- providers
 //
@@ -82,6 +83,9 @@ try {
     case "disable":
       show(await agents.setEnabled(id, command === "enable"));
       break;
+    case "duplicate":
+      show(await agents.duplicate(id));
+      break;
     case "delete":
       await agents.remove(id);
       console.log(`Deleted ${id}.`);
@@ -92,14 +96,14 @@ try {
       }
       break;
     default:
-      console.log("Commands: list, create, get <id>, update <id>, enable <id>, disable <id>, delete <id>, providers");
+      console.log("Commands: list, create, get <id>, update <id>, enable <id>, disable <id>, duplicate <id>, delete <id>, providers");
       process.exitCode = command ? 1 : 0;
   }
 } catch (error) {
   if (error instanceof AgentServiceError) {
     console.error(`Error (${error.code}): ${error.message}`);
     for (const [field, messages] of Object.entries(error.fieldErrors)) {
-      console.error(`  ${field}: ${messages.join(" ")}`);
+      console.error(`  ${field}: ${messages?.join(" ")}`);
     }
     process.exitCode = 1;
   } else {

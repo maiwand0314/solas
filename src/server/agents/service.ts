@@ -8,8 +8,14 @@ import {
   providerRegistry,
   type ProviderRegistry,
 } from "@/server/providers/registry";
+import {
+  AGENT_LIMITS,
+  agentIdSchema,
+  createAgentSchema,
+  enabledSchema,
+  updateAgentSchema,
+} from "@/lib/agents/validation";
 import { AgentServiceError, fromDatabaseError, notFoundError, validationError } from "./errors";
-import { agentIdSchema, createAgentSchema, enabledSchema, updateAgentSchema } from "./validation";
 
 export type Agent = AgentRow;
 
@@ -79,6 +85,46 @@ export function createAgentService({ db, providers }: Dependencies) {
     return update(id, { enabled: parse(enabledSchema, enabled) });
   }
 
+  /**
+   * Creates a new agent from an existing one's configuration, through the
+   * normal create path (so all validation applies). Only configuration is
+   * copied: never ids, timestamps, or (later) history or runtime state.
+   * The copy starts disabled so it can be reviewed before it's used.
+   */
+  async function duplicate(id: unknown): Promise<Agent> {
+    const source = await get(id);
+    // Keep the model only while it's still selectable; otherwise start unconfigured.
+    const keepModel = checkModelSelection(providers, source.providerId, source.modelId) === null;
+
+    for (let attempt = 1; attempt <= MAX_COPY_ATTEMPTS; attempt++) {
+      try {
+        return await create({
+          name: copyName(source.name, attempt),
+          role: source.role,
+          description: source.description,
+          instructions: source.instructions,
+          providerId: keepModel ? source.providerId : null,
+          modelId: keepModel ? source.modelId : null,
+          enabled: false,
+        });
+      } catch (error) {
+        if (error instanceof AgentServiceError && error.code === "name_taken") continue;
+        if (error instanceof AgentServiceError && error.code === "validation_failed") {
+          throw new AgentServiceError(
+            "validation_failed",
+            "This agent is missing required details. Edit it, then duplicate it again.",
+            error.fieldErrors,
+          );
+        }
+        throw error;
+      }
+    }
+    throw new AgentServiceError(
+      "name_taken",
+      "There are already many copies of this agent. Rename some of them and try again.",
+    );
+  }
+
   function assertModelSelection(providerId: string | null, modelId: string | null) {
     const problem = checkModelSelection(providers, providerId, modelId);
     if (problem) {
@@ -88,7 +134,15 @@ export function createAgentService({ db, providers }: Dependencies) {
     }
   }
 
-  return { list, get, create, update, remove, setEnabled };
+  return { list, get, create, update, remove, setEnabled, duplicate };
+}
+
+const MAX_COPY_ATTEMPTS = 20;
+
+/** "Name (copy)", then "Name (copy 2)", … — shortened to fit the name limit. */
+export function copyName(name: string, attempt: number): string {
+  const suffix = attempt === 1 ? " (copy)" : ` (copy ${attempt})`;
+  return name.slice(0, AGENT_LIMITS.name - suffix.length).trimEnd() + suffix;
 }
 
 export type AgentService = ReturnType<typeof createAgentService>;

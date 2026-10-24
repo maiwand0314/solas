@@ -1,5 +1,6 @@
 import { Sidebar } from "@/components/shell/sidebar";
 import { TopBar } from "@/components/shell/top-bar";
+import { Toaster } from "@/components/ui/toast";
 
 /**
  * The application shell, shared by every page in the (app) route group.
@@ -23,6 +24,7 @@ export default function AppLayout({ children }: LayoutProps<"/">) {
           </div>
         </main>
       </div>
+      <Toaster />
     </div>
   );
 }

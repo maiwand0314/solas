@@ -2,6 +2,7 @@
 
 import { usePathname, useRouter } from "next/navigation";
 import {
+  Suspense,
   useEffect,
   useId,
   useMemo,
@@ -12,6 +13,7 @@ import {
 import {
   MonitorIcon,
   MoonIcon,
+  PlusIcon,
   SearchIcon,
   SidebarIcon,
   SunIcon,
@@ -28,7 +30,7 @@ import { allNavItems, isActivePath } from "./nav-items";
 
 type Command = {
   id: string;
-  group: "Go to" | "Theme" | "Layout";
+  group: "Create" | "Go to" | "Theme" | "Layout";
   label: string;
   icon: ComponentType<IconProps>;
   /** Shown on the right, e.g. "Current". */
@@ -44,8 +46,21 @@ type Command = {
  * Enter runs it, and Escape closes the dialog.
  */
 export function CommandMenu() {
+  // usePathname() suspends while prerendering dynamic routes (Cache
+  // Components); the fallback is the same menu without "Current" hints.
+  return (
+    <Suspense fallback={<CommandMenuView pathname={null} />}>
+      <CurrentCommandMenu />
+    </Suspense>
+  );
+}
+
+function CurrentCommandMenu() {
+  return <CommandMenuView pathname={usePathname()} />;
+}
+
+function CommandMenuView({ pathname }: { pathname: string | null }) {
   const router = useRouter();
-  const pathname = usePathname();
   const theme = useThemePreference();
   const listboxId = useId();
 
@@ -56,12 +71,13 @@ export function CommandMenu() {
   const commands = useMemo(() => {
     const currentHint = (isCurrent: boolean) => (isCurrent ? "Current" : undefined);
     const list: Command[] = [
+      { id: "new-agent", group: "Create", label: "New agent", icon: PlusIcon, run: () => router.push("/agents/new") },
       ...allNavItems.map((item): Command => ({
         id: `go-${item.href}`,
         group: "Go to",
         label: item.label,
         icon: item.icon,
-        hint: currentHint(isActivePath(pathname, item.href)),
+        hint: currentHint(pathname !== null && isActivePath(pathname, item.href)),
         run: () => router.push(item.href),
       })),
       { id: "theme-light", group: "Theme", label: "Light", icon: SunIcon, hint: currentHint(theme === "light"), run: () => setThemePreference("light") },

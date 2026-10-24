@@ -1,5 +1,8 @@
 import { z } from "zod";
+import type { FieldErrors } from "@/lib/agents/validation";
 import { classifyDatabaseError } from "@/server/db/errors";
+
+export type { FieldErrors };
 
 export type AgentErrorCode =
   | "validation_failed"
@@ -7,9 +10,6 @@ export type AgentErrorCode =
   | "name_taken"
   | "database_unavailable"
   | "unexpected";
-
-/** Field name → messages, ready to show next to form inputs. */
-export type FieldErrors = Record<string, string[]>;
 
 /**
  * The only error type the agent service throws. `code` is stable and safe to

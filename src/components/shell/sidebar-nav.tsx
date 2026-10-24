@@ -2,16 +2,32 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { Suspense } from "react";
 import { cn } from "@/lib/cn";
 import { isActivePath, primaryNavItems, secondaryNavItems, type NavItem } from "./nav-items";
 
 /**
  * The navigation list, shared by the desktop sidebar and the mobile drawer.
  * It is a Client Component only because it reads the current URL.
+ *
+ * With Cache Components, usePathname() can't be known while prerendering a
+ * page with a dynamic segment (e.g. /agents/[agentId]), so it suspends. The
+ * Suspense fallback renders the same links without an active item; the
+ * browser fills in the active item immediately.
  */
 export function SidebarNav() {
-  const pathname = usePathname();
+  return (
+    <Suspense fallback={<NavLists pathname={null} />}>
+      <CurrentSidebarNav />
+    </Suspense>
+  );
+}
 
+function CurrentSidebarNav() {
+  return <NavLists pathname={usePathname()} />;
+}
+
+function NavLists({ pathname }: { pathname: string | null }) {
   return (
     <nav aria-label="Main" className="flex flex-1 flex-col justify-between gap-6 px-2 py-2">
       <NavList items={primaryNavItems} pathname={pathname} />
@@ -20,12 +36,12 @@ export function SidebarNav() {
   );
 }
 
-function NavList({ items, pathname }: { items: NavItem[]; pathname: string }) {
+function NavList({ items, pathname }: { items: NavItem[]; pathname: string | null }) {
   return (
     <ul className="flex flex-col gap-0.5">
       {items.map((item) => (
         <li key={item.href}>
-          <NavLink item={item} active={isActivePath(pathname, item.href)} />
+          <NavLink item={item} active={pathname !== null && isActivePath(pathname, item.href)} />
         </li>
       ))}
     </ul>
