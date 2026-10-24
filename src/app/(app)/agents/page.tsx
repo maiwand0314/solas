@@ -3,7 +3,7 @@ import Link from "next/link";
 import { unstable_rethrow } from "next/navigation";
 import { Suspense } from "react";
 import { AgentList } from "@/components/agents/agent-list";
-import { AgentLoadError } from "@/components/agents/agent-load-error";
+import { LoadError } from "@/components/load-error";
 import { AgentListSkeleton } from "@/components/agents/agent-skeletons";
 import { AgentsIcon, PlusIcon } from "@/components/icons";
 import { buttonClassName } from "@/components/ui/button";
@@ -47,7 +47,7 @@ async function StoredAgents() {
     agents = await listAgentsForOwner();
   } catch (error) {
     unstable_rethrow(error);
-    return <AgentLoadError error={error} />;
+    return <LoadError error={error} />;
   }
 
   if (agents.length === 0) {
@@ -55,7 +55,7 @@ async function StoredAgents() {
       <EmptyState
         icon={AgentsIcon}
         title="No agents yet"
-        description="Create an agent to give it a role and instructions. Agents can’t run until the Agent Engine is connected."
+        description="Create an agent with a role, instructions, and a model, then chat with it in Conversations."
       >
         <NewAgentButton />
       </EmptyState>

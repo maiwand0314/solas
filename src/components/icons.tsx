@@ -246,3 +246,19 @@ export function InfoIcon(props: IconProps) {
     </Icon>
   );
 }
+
+export function SendIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M12 19V5M6 11l6-6 6 6" />
+    </Icon>
+  );
+}
+
+export function StopIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <rect x="7" y="7" width="10" height="10" rx="1.5" />
+    </Icon>
+  );
+}

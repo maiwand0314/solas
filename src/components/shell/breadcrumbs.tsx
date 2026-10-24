@@ -8,18 +8,19 @@ import { findActiveNavItem } from "./nav-items";
 type Crumb = { label: string; href?: string };
 
 /** Labels for pages below a section, matched against the rest of the path. */
-function subpageLabel(rest: string[]): string | null {
+function subpageLabel(section: string, rest: string[]): string | null {
   if (rest.length === 0) return null;
-  if (rest[0] === "new") return "New agent";
+  const isConversations = section === "/conversations";
+  if (rest[0] === "new") return isConversations ? "New conversation" : "New agent";
   if (rest[1] === "edit") return "Edit";
-  return "Details";
+  return isConversations ? "Conversation" : "Details";
 }
 
 function crumbsFor(pathname: string): Crumb[] {
   const section = findActiveNavItem(pathname);
   if (!section) return [{ label: "Not found" }];
   const rest = pathname.slice(section.href.length).split("/").filter(Boolean);
-  const sub = subpageLabel(rest);
+  const sub = subpageLabel(section.href, rest);
   if (!sub) return [{ label: section.label }];
   const crumbs: Crumb[] = [{ label: section.label, href: section.href }];
   // /agents/<id>/edit links back to the agent's details page.

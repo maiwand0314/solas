@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import { AgentForm } from "@/components/agents/agent-form";
-import { AgentLoadError } from "@/components/agents/agent-load-error";
+import { LoadError } from "@/components/load-error";
 import { AgentDetailsSkeleton } from "@/components/agents/agent-skeletons";
 import { BackLink } from "@/components/agents/back-link";
 import { PageHeader } from "@/components/ui/page-header";
@@ -23,7 +23,7 @@ export default function EditAgentPage({ params }: PageProps<"/agents/[agentId]/e
 async function EditAgentContent({ params }: Pick<PageProps<"/agents/[agentId]/edit">, "params">) {
   const { agentId } = await params;
   const result = await loadAgent(agentId);
-  if ("error" in result) return <AgentLoadError error={result.error} />;
+  if ("error" in result) return <LoadError error={result.error} />;
   const { agent } = result;
   return (
     <>
