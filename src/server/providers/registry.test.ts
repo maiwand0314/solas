@@ -30,8 +30,10 @@ describe("checkModelSelection", () => {
     expect(checkModelSelection(testRegistry, providerId, modelId)?.field).toBe(field);
   });
 
-  it("offers no usable provider yet in the real registry", () => {
-    expect(providerRegistry.list().every((provider) => provider.status !== "available")).toBe(true);
+  it("offers Claude in the real registry with full model IDs, not aliases", () => {
+    const claude = providerRegistry.get("claude-agent-sdk");
+    expect(claude?.status).toBe("available");
+    expect(claude?.models.map((model) => model.id)).toEqual(["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]);
   });
 });
 

@@ -13,10 +13,10 @@ const testUrl = process.env.TEST_DATABASE_URL!;
 const db = createDatabase(testUrl);
 const service = createAgentService({ db, providers: providerRegistry });
 
-// A registry with one usable provider, to test the "configured" path that the
-// real registry doesn't offer yet.
+// A fixed registry, so these tests don't change when real providers or models do.
 const availableProviders = createProviderRegistry([
   { id: "test-provider", label: "Test provider", status: "available", models: [{ id: "test-model", label: "Test" }] },
+  { id: "later-provider", label: "Later provider", status: "unconfigured", statusReason: "Not built.", models: [] },
 ]);
 
 const MISSING_ID = "00000000-0000-4000-8000-000000000000";
@@ -133,8 +133,9 @@ describe("agent service", () => {
 
 describe("provider and model selection", () => {
   it("refuses providers that aren't available yet", async () => {
+    const withProviders = createAgentService({ db, providers: availableProviders });
     const error = await expectAgentError(
-      service.create(agentInput({ name: "Coder", providerId: "claude-agent-sdk", modelId: "any" })),
+      withProviders.create(agentInput({ name: "Coder", providerId: "later-provider", modelId: "any" })),
       "validation_failed",
     );
     expect(error.fieldErrors.providerId?.[0]).toContain("can’t be used yet");

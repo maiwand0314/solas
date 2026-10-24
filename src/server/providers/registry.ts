@@ -33,17 +33,22 @@ export function createProviderRegistry(providers: readonly ProviderDefinition[])
 }
 
 /**
- * Nothing is "available" until Solas can actually run an agent through it.
- * The Claude Agent SDK provider is verified and enabled in M3; until then
- * every agent is honestly "not configured".
+ * The providers Solas can run. Model IDs are passed to the provider unchanged,
+ * so each one must be a real model ID: the adapter refuses to run if the
+ * provider starts a different model, rather than silently substituting one.
+ * Verified on 2026-10-24 against the models the owner's Claude account
+ * reports (Agent SDK `supportedModels()`).
  */
 export const providerRegistry = createProviderRegistry([
   {
     id: "claude-agent-sdk",
-    label: "Claude (Claude Agent SDK)",
-    status: "unconfigured",
-    statusReason: "Agent execution isn’t built yet.",
-    models: [],
+    label: "Claude",
+    status: "available",
+    models: [
+      { id: "claude-opus-5-5", label: "Opus 5.5" },
+      { id: "claude-sonnet-5-5", label: "Sonnet 5.5" },
+      { id: "claude-haiku-5-5", label: "Haiku 5.5" },
+    ],
   },
 ]);
 
