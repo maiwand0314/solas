@@ -5,7 +5,9 @@ import {
   check,
   index,
   integer,
+  jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -169,6 +171,78 @@ export const runs = pgTable(
   ],
 );
 
+/**
+ * Which tools an agent may use, and how. A row exists only for an enabled
+ * tool: no row means the tool is off, so every agent starts with none.
+ * Tool IDs are checked against the tool registry in code (like providers),
+ * so adding a tool never needs a migration.
+ */
+export const agentToolPermissions = pgTable(
+  "agent_tool_permissions",
+  {
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    toolId: text("tool_id").notNull(),
+    /** "allow": runs when the agent asks. "ask": waits for the owner's approval each time. */
+    mode: text("mode", { enum: ["allow", "ask"] }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.agentId, table.toolId] }),
+    check("agent_tool_permissions_mode_valid", sql`${table.mode} in ('allow', 'ask')`),
+  ],
+);
+
+export const TOOL_CALL_STATUSES = [
+  "awaiting_approval",
+  "approved",
+  "rejected",
+  "expired",
+  "running",
+  "succeeded",
+  "failed",
+  "denied",
+  "cancelled",
+] as const;
+export type ToolCallStatus = (typeof TOOL_CALL_STATUSES)[number];
+
+/**
+ * Every tool call an agent makes, including refused ones: the activity log
+ * the conversation shows, and the approval record. Inputs are the validated
+ * arguments the tool ran with (never credentials; tools don't take any).
+ */
+export const toolCalls = pgTable(
+  "tool_calls",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => runs.id, { onDelete: "cascade" }),
+    toolId: text("tool_id").notNull(),
+    input: jsonb("input").notNull(),
+    /** A short, readable version of the input, e.g. "notes/plan.md". */
+    inputSummary: text("input_summary").notNull(),
+    status: text("status", { enum: TOOL_CALL_STATUSES }).notNull(),
+    requiresApproval: boolean("requires_approval").notNull().default(false),
+    approvalExpiresAt: timestamp("approval_expires_at", { withTimezone: true }),
+    decidedAt: timestamp("decided_at", { withTimezone: true }),
+    resultSummary: text("result_summary"),
+    errorMessage: text("error_message"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (table) => [
+    index("tool_calls_run_id_idx").on(table.runId, table.createdAt),
+    check(
+      "tool_calls_status_valid",
+      sql`${table.status} in ('awaiting_approval', 'approved', 'rejected', 'expired', 'running', 'succeeded', 'failed', 'denied', 'cancelled')`,
+    ),
+  ],
+);
+
+export type AgentToolPermissionRow = typeof agentToolPermissions.$inferSelect;
+export type ToolCallRow = typeof toolCalls.$inferSelect;
 export type ConversationRow = typeof conversations.$inferSelect;
 export type MessageRow = typeof messages.$inferSelect;
 export type RunRow = typeof runs.$inferSelect;
