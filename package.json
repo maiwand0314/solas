@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "next build && playwright test",
     "db:up": "docker compose --env-file .env.local up -d --wait",
     "db:down": "docker compose --env-file .env.local down",
     "db:reset": "docker compose --env-file .env.local down -v",

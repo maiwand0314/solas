@@ -10,7 +10,14 @@ import postgres from "postgres";
 export default async function setup() {
   const testUrl = process.env.TEST_DATABASE_URL;
   if (!testUrl) throw new Error("TEST_DATABASE_URL is not set. See .env.example.");
+  await prepareTestDatabase(testUrl);
+}
 
+/**
+ * Creates the database if needed and applies migrations. Shared with the
+ * browser tests (e2e/global-setup.ts), which use their own database.
+ */
+export async function prepareTestDatabase(testUrl: string) {
   const url = new URL(testUrl);
   const databaseName = url.pathname.slice(1);
   if (!databaseName.endsWith("_test")) {
