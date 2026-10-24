@@ -356,3 +356,155 @@ work.
 - When conversations reference agents (M5), does delete become archive?
 - Playwright as a real dev dependency for key flows. The plan says "later";
   M4/M5 (live runs) is probably when it pays off.
+
+## M3A — First working agent engine (2026-10-24)
+
+**Built:** Agents can now answer. Pick an agent, write a message, and a
+genuine Claude reply comes back, using that agent's stored instructions and
+model. The reply is saved in PostgreSQL. A separate worker process does the
+AI work; the web app never calls Claude. It runs on the owner's Claude Team
+login through the official Agent SDK, locally only. No API key, no API
+credits.
+
+**Concepts**
+- **Agent Engine.** The part of Solas that turns "this agent + this message"
+  into a reply. Here it is three layers:
+  - the executor (`runs/executor.ts`) claims a run and records the outcome;
+  - the runtime interface (`runtime/types.ts`) is the one way to ask a
+    provider for an answer;
+  - the Claude adapter (`runtime/claude-agent-sdk.ts`) speaks the SDK.
+- **Agents are data.** The worker loads the agent row by ID when the run
+  starts, and loads it fresh: if you disable it in between, it won't run.
+  Nothing in the code knows "Research Assistant"; any agent you create works.
+- **Provider interface.** `AgentRuntime.run(input, signal)` returns
+  completed / failed / aborted and never throws. The executor only knows
+  this. Another provider (an API-key adapter, say) is one new file plus a
+  registry entry.
+- **How instructions reach Claude.** `systemPrompt: agent.instructions`, as
+  a plain string. A string *replaces* Claude Code's own system prompt, so the
+  agent is exactly what you wrote. In the smoke test, the reply followed the
+  agent's own rule "Cite every claim."
+- **From message to run.**
+  1. The Server Action validates the message.
+  2. It checks the agent: enabled, and a model the registry offers.
+  3. In one transaction it saves the message and a `pending` run.
+  4. The worker claims the run, builds the prompt (recent history + the new
+     message), and calls the runtime.
+  5. It saves the reply and marks the run `completed`.
+- **Back to the browser.** The page polls the run's real status every second
+  ("Waiting for the worker…", "… is responding · 0:12"). When the run is
+  finished, the page asks the server to render again, and the reply comes
+  from the database. Nothing is faked: no typing effect, no invented
+  progress.
+- **Errors and usage limits.** Claude Code reports problems as codes:
+  - `authentication_failed`, `rate_limit`, `model_not_found`, …;
+  - a `rate_limit_event` that is `rejected`, or that shows paid extra usage.
+
+  The adapter maps each one to a Solas code and writes its own message, such
+  as "Run `claude auth login`". Provider text never reaches the UI. It goes
+  to the worker log, shortened.
+- **Permissions, enforced twice.**
+  1. *Ask for nothing:*
+     - `tools: []`;
+     - `permissionMode: "dontAsk"`;
+     - a hook that denies every tool;
+     - no settings files, no MCP servers;
+     - an allowlisted environment, so no `DATABASE_URL` and no API keys;
+     - an empty working directory outside the repo.
+  2. *Check what you got:* the session's first message must say no API key,
+     zero tools, zero MCP servers, `dontAsk`, and the requested model.
+     Otherwise the run stops. Settings can come from places Solas doesn't
+     control, so it verifies the result.
+- **Why `dontAsk` must be explicit.** The SDK's types say an omitted
+  `permissionMode` can start in `auto`, where a classifier approves actions.
+  A default is not a decision.
+- **Credential precedence.** An `ANTHROPIC_API_KEY` in the environment beats
+  the subscription login, which would quietly switch to paid API billing.
+  The allowlisted environment removes it, and the `apiKeySource: "none"`
+  check catches anything else.
+- **The queue is a table.** `runs.status` is the queue. Two safeguards:
+  - `FOR UPDATE SKIP LOCKED` lets the worker claim a run safely;
+  - a partial unique index (one pending/running run per conversation) makes
+    a double click harmless at the database level.
+- **`IN` vs `=` with a subquery (found by a test).** The first claim query
+  was `id IN (SELECT … LIMIT 1 FOR UPDATE SKIP LOCKED)`. PostgreSQL planned
+  it as a nested-loop semi-join and re-ran the subquery for each row, so
+  "LIMIT 1" didn't hold and one claim marked *two* runs running. With `=`,
+  the subquery becomes an InitPlan that runs once. `EXPLAIN` showed both
+  plans. Lesson: SQL says *what*, the planner decides *how*; check the plan
+  when it matters.
+- **Next.js keeps pages mounted.** After navigating, the previous page stays
+  in the DOM, hidden. My browser test first counted elements from both
+  pages and reported a reply too early. The database and worker log showed
+  the truth. Lesson: verify outcomes at the source, not only through the UI.
+
+**Files changed**
+- New:
+  - `src/server/runtime/` (types, Claude adapter, tests);
+  - `src/server/runs/` (executor, prompt, config, tests, test helpers);
+  - `src/server/conversations/` (service, queries, errors, tests);
+  - `src/server/logger.ts`;
+  - `src/worker/index.mts`;
+  - `src/lib/conversations/validation.ts`.
+- New UI:
+  - `src/app/(app)/conversations/` (actions; pages `new/` and
+    `[conversationId]/`; not-found; error);
+  - `src/components/conversations/` (conversation view, list, agent picker).
+- Database: `drizzle/0001_conversations_and_runs.sql`, which adds tables
+  and changes nothing existing.
+- Changed:
+  - registry: Claude is available with three models;
+  - agent pages: a Chat button and updated copy; deleting an agent now also
+    deletes its conversations;
+  - breadcrumbs;
+  - `LoadError` and `RetryButton` moved to `src/components/` so both
+    features use them;
+  - `package.json`: the `worker` script and the SDK dependency;
+  - docs.
+
+**How it was verified**
+- `lint`, `typecheck`, and `build` pass. All 109 Vitest tests pass, three
+  times in a row. They use a fake runtime and a fake SDK, so no Claude usage
+  is spent. Among them:
+  - instructions and model are passed through;
+  - disabled, missing, and unconfigured agents are refused;
+  - invalid input is rejected;
+  - unsupported models are refused;
+  - sign-in failure, usage limit, paid overage, and budget are handled;
+  - timeout, Stop, shutdown, and crash recovery work;
+  - no secrets in errors or in the environment;
+  - no tools are enabled;
+  - a run is never claimed twice.
+- The Agent SDK appears in neither the browser bundle nor the web server
+  bundle. Exactly 8 Server Actions are registered.
+- **One real smoke test** through the UI:
+  - Agents → Research Assistant → Edit (Claude · Opus 5.5) → enable →
+    Chat → the example question;
+  - the worker log showed `apiKeySource: "none"`, `tools: 0`,
+    `mcpServers: 0`, `permissionMode: "dontAsk"`, and
+    `model: "claude-opus-5-5"`;
+  - the run took 24 s and produced 2,532 output tokens; a 6,150-character
+    reply was saved and shown, in light, dark, and at 390 px.
+- UI states checked **without** Claude, with the worker stopped:
+  - pending, then the "Is the worker running?" hint;
+  - Stop on a pending run;
+  - "responding" with a live timer (set in the database);
+  - Esc → "Stopping";
+  - a worker restart marks the stuck run failed, and the UI shows why.
+
+**Exercise**
+- Give the Research Assistant a second conversation and ask a follow-up that
+  depends on the first answer. Then read `buildPrompt` in `runs/prompt.ts`
+  and explain how the agent "remembers". Change `historyMessages` to 2 and
+  see what it forgets.
+
+**Questions to revisit**
+- Is the Team seat (Xala organization) the right account for a personal
+  project? Ask the org admin, or move to a personal plan or API key.
+- Streaming (M3B): the SDK can send partial messages. Store them as
+  `run_events` and stream over SSE?
+- Markdown rendering: write a small safe renderer, or approve a dependency?
+- Long conversations: replaying history costs tokens on every turn. Is SDK
+  session resume worth writing transcripts into `~/.claude`?
+- `input_tokens` from the SDK result was 2: it counts only uncached input.
+  Track cache tokens too, if usage becomes interesting.

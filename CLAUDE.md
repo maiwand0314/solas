@@ -63,6 +63,7 @@ dynamic data.
 npm run db:up        # start local PostgreSQL (Docker); db:down stops, db:reset wipes data
 npm run db:migrate   # apply migrations; db:generate creates one after editing src/server/db/schema.ts
 npm run dev          # dev server on 127.0.0.1:3000
+npm run worker       # the agent worker: runs agents (Claude). Start it next to dev/start
 npm run lint         # ESLint
 npm run typecheck    # tsc --noEmit (run after a build or dev start; stale .next/types can mislead)
 npm test             # Vitest: unit + integration tests (needs db:up)

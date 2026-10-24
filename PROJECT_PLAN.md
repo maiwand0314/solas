@@ -119,7 +119,7 @@ not up front. Each one stops for review before the next starts.
 
 ### Phase 1 — MVP (local)
 
-**M0 — Documentation and architecture** *(this milestone)*
+**M0 — Documentation and architecture** *(done 2026-10-23)*
 The five documents, the runtime decision, and a verified fresh project.
 
 **M1 — Design system and application foundation** *(done 2026-10-23)*
@@ -162,28 +162,33 @@ No new dependencies.
   Components. `useActionState` was considered and not used (see the learning
   log). No new dependencies.
 
-**M3 — Agent runtime spike**
-Define `AgentRuntime` and Solas's own `RunEvent` types. Implement the Claude
-Agent SDK adapter and run it from a terminal script against a stored agent.
-No tools; isolated settings. Verify subscription sign-in works through the
-official flow and that errors (not signed in, limit reached) are classified.
-Concepts: the agent loop, SDK message stream, adapters and interfaces,
-credential precedence, why the runtime is isolated.
-Dependency to approve: `@anthropic-ai/claude-agent-sdk`.
+**M3A — First working agent engine** *(done 2026-10-24)*
+One real execution path, end to end: pick an agent, send a message, get a
+genuine Claude reply. It pulled forward the minimum of the old M3–M5:
+- `AgentRuntime` interface and a Claude Agent SDK adapter (no tools, isolated
+  settings, subscription login only, verified at session start).
+- `conversations`, `messages`, and `runs` tables; `runs` is the job queue
+  (pending → running → completed / failed / cancelled).
+- A worker process (`npm run worker`) that claims runs with
+  `FOR UPDATE SKIP LOCKED`, one at a time, with timeout, Stop, shutdown, and
+  crash recovery.
+- Conversations UI: agent picker, chat view, real run status by polling.
+- Earlier turns are replayed as a transcript; no SDK session resume.
+- Dependency added (approved): `@anthropic-ai/claude-agent-sdk` 0.3.310.
 
-**M4 — Worker and runs**
-`runs` and `run_events` tables, a worker process that claims queued runs
-(`FOR UPDATE SKIP LOCKED`), executes them through the runtime, records events,
-and handles cancellation, timeouts, and crash recovery.
-Concepts: why agent work does not belong in web requests, job states,
-idempotency, process lifecycle.
+**M3B — Live output and readable replies** *(proposed)*
+Stream reply text while it is written (SDK partial messages → `run_events` →
+Server-Sent Events) instead of polling for the final answer. Render Markdown
+safely (dependency decision). Show when a usage limit resets.
+Concepts: SSE, append-only event logs, reconnecting streams, sanitizing HTML.
 
-**M5 — Conversations and live chat** *(MVP complete)*
-`conversations` and `messages`. Sending a message stores it and enqueues a run.
-The UI follows the run live over Server-Sent Events and shows history after.
-Conversation continuity via stored history and/or SDK session resume
-(decided in M5).
-Concepts: SSE, append-only histories, optimistic UI, reconnecting streams.
+**M4 — Runs you can inspect** *(proposed)*
+A run history per agent and conversation: status, timing, tokens, errors.
+Rename and delete conversations.
+
+**M5 — MVP complete** *(proposed)*
+Review against the MVP success criteria: keyboard-only, 375 px, both themes,
+long conversations (context strategy re-evaluated), failure drills.
 
 ### Phase 2 — Controlled autonomy (still local)
 
@@ -224,13 +229,13 @@ execution for any future shell or code tools.
 
 | Decision | When | Notes |
 | --- | --- | --- |
-| **Team seat ownership** | Before M3 | This Mac's Claude Code is signed in to a Team plan in the "Xala team" organization. Personal-project usage counts against that seat and falls under that organization's commercial agreement and admin policies. Confirm with the org admin that this use is acceptable, or use a personal plan / API key instead. |
-| Runtime isolation (dedicated `CLAUDE_CONFIG_DIR` for Solas vs. default) | M3 | A dedicated directory keeps Solas agents away from the owner's personal Claude Code settings, memory, and sessions, at the cost of one extra sign-in through the official flow |
+| **Team seat ownership** | Still open | This Mac's Claude Code is signed in to a Team plan in the "Xala team" organization. M3A runs on it (owner's decision, local only). Personal-project usage counts against that seat and falls under that organization's commercial agreement and admin policies, including any extra-usage setting. Confirm with the org admin, or move to a personal plan / API key. |
+| Runtime isolation | ✓ M3A | Default config directory (no second sign-in), isolated per run: `settingSources: []`, `strictMcpConfig`, no auto memory, no claude.ai connectors, `persistSession: false`, empty working directory outside the repo. A dedicated `CLAUDE_CONFIG_DIR` stays an option |
 | Local PostgreSQL install method | ✓ M2A | Docker Compose with `postgres:18-alpine` (same image works on a Linux VPS) |
 | Validation library | ✓ M2A | Zod 4 |
-| Agent deletion once history exists | M5 | Hard delete today. Once conversations reference agents, choose archive vs. cascade |
-| How the worker runs TypeScript | M4 | Node 24 native type stripping vs. `tsx` |
-| Conversation continuity | M5 | Replay stored history vs. SDK session resume (sessions live in the Claude Code config directory) |
+| Agent deletion once history exists | ✓ M3A | Cascade: deleting an agent deletes its conversations (the dialog says so). Archive can come later |
+| How the worker runs TypeScript | ✓ M3A | `tsx` (already a dev dependency), like the agents CLI |
+| Conversation continuity | ✓ M3A (revisit) | Replay stored history (last 20 messages / 60,000 characters). SDK session resume would write transcripts into `~/.claude` |
 | Test tooling | ✓ M2A | Vitest (unit + integration). Playwright for key UI flows later |
 | Hosted runtime credentials | M10 | Re-check terms; API key by default for hosted use |
 | Hosting cost and setup | M10 | Explicit approval required |

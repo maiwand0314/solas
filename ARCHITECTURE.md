@@ -62,9 +62,9 @@ Four ideas to hold on to:
 | **Domain + data access** | Plain TypeScript functions that validate input, check authorization, and read/write the database. Shared by web and worker | `src/server/` | M2+ |
 | **Persistent storage** | PostgreSQL with Drizzle ORM and versioned migrations | `src/server/db/` | M2 |
 | **Agent management** | CRUD for agent definitions: name, role, instructions, model, tool profile, budgets | `src/server/agents/` | M2 |
-| **Agent execution layer** | `AgentRuntime` interface + adapters. Turns "agent + input" into a stream of Solas `RunEvent`s | `src/server/runtime/` | M3 |
-| **Background worker** | Separate Node process: claims queued runs, supervises them, fires schedules, recovers after crashes | `src/worker/` | M4 |
-| **Conversations** | Per-agent threads. Each user message creates a run; the agent's reply is stored as messages and run events | `src/server/conversations/` | M5 |
+| **Agent execution layer** | `AgentRuntime` interface + adapters. Turns "agent + input" into a Solas `RunResult` (events and streaming in M3B) | `src/server/runtime/`, `src/server/runs/` | M3A |
+| **Background worker** | Separate Node process: claims pending runs, supervises them, recovers after crashes (schedules in M8) | `src/worker/` | M3A |
+| **Conversations** | Per-agent threads. Each user message creates a run; the agent's reply is stored as a message | `src/server/conversations/` | M3A |
 | **Tools and permissions** | Tool profiles, workspace directories, a policy hook that enforces them | `src/server/tools/`, `src/server/policy/` | M6 |
 | **Approvals** | Sensitive tool calls pause a run until the owner decides | `src/server/approvals/` | M7 |
 | **Tasks and schedules** | One-off assignments and recurring triggers that create runs | `src/server/tasks/` | M8 |
@@ -104,23 +104,26 @@ agents (M2A, built — see §4a)
   later, in their own tables or columns: tool profile, workspace,
   execution settings (budgets), archived_at
 
-conversations (M5)
-  id, agent_id → agents, title, runtime_session_id (nullable),
-  archived_at, created_at, updated_at
+conversations (M3A, built)
+  id, agent_id → agents (cascade), title, created_at, updated_at
+  later: archived_at
 
-messages (M5)
-  id, conversation_id → conversations, role ('user' | 'agent'),
-  content (text / jsonb), run_id → runs (nullable), created_at
+messages (M3A, built)
+  id, conversation_id → conversations (cascade), role ('user' | 'assistant'),
+  content (text), run_id → runs (nullable; set on assistant messages),
+  created_at
 
-runs (M4)
-  id, agent_id, conversation_id (nullable), task_id (nullable),
-  status ('queued' | 'running' | 'awaiting_approval' | 'succeeded' |
-          'failed' | 'cancelled'),
-  input, runtime ('claude-agent-sdk' | …), error_code, error_message,
-  usage (jsonb), claimed_by, heartbeat_at,
-  queued_at, started_at, finished_at
+runs (M3A, built)
+  id, conversation_id → conversations, agent_id → agents,
+  user_message_id → messages (the message being answered),
+  status ('pending' | 'running' | 'completed' | 'failed' | 'cancelled'),
+  model_id (recorded at start), error_code, error_message,
+  cancel_requested_at, input_tokens, output_tokens,
+  created_at, started_at, finished_at
+  unique: one pending/running run per conversation
+  later: task_id, 'awaiting_approval', heartbeat_at
 
-run_events (M4)
+run_events (M3B, planned)
   id (sequential), run_id → runs, type, payload (jsonb), created_at
 
 approvals (M7)
@@ -138,9 +141,11 @@ Design choices:
 - **`run_events` is append-only.** It is the audit log, the source for live
   streaming, and the history of what an agent did. Events are never edited.
 - **`runs` is the queue.** No separate queue service: the worker claims the
-  oldest `queued` row with `SELECT … FOR UPDATE SKIP LOCKED`, sets `running`,
-  and updates `heartbeat_at` while working. A run whose heartbeat goes stale
-  (the worker crashed) is marked failed or re-queued on worker start.
+  oldest `pending` row with `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP
+  LOCKED LIMIT 1)` and sets `running`. Note the `=`: with `IN`, PostgreSQL
+  may re-run the subquery per row and claim several runs at once (found by a
+  test in M3A). There is one worker, so on start it marks any run still
+  `running` as failed (`worker_stopped`); a heartbeat comes with more workers.
 - **Solas stores its own event format,** not the SDK's raw messages. That keeps
   the UI and database independent of the runtime (see §5.2).
 
@@ -228,8 +233,11 @@ widening this one.
 
 `src/server/providers/registry.ts` lists the execution providers Solas knows
 about. Each one has a status (`available` / `unconfigured`) and a list of
-models. Today it contains only `claude-agent-sdk`, marked `unconfigured`,
-because nothing has verified that agents can run through it. M3 changes that.
+models. Since M3A it contains `claude-agent-sdk` (label "Claude"), available,
+with full model IDs verified against the owner's account on 2026-10-24:
+`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`. Model IDs are
+passed to Claude unchanged; the adapter refuses a session that starts any
+other model, so a model is never silently substituted.
 
 Consequences:
 - A provider/model pair is accepted only if the provider is `available` and
@@ -291,6 +299,10 @@ Verified against Anthropic's documentation on 2026-10-23:
   "CI pipelines, scripts, or other environments where interactive browser
   login isn't available".
 
+Re-verified on 2026-10-24 (M3A): the same statements still apply, and the
+owner chose to run M3A on the Team subscription, locally only. The account
+probe reported `subscriptionType: "Claude Team"` with no API key source.
+
 What Solas does with that:
 
 | Stage | Runtime | Credential | Rationale |
@@ -310,60 +322,85 @@ Hard rules, enforced in code review:
 - No modified Claude Code binary, no unofficial clients, no rate-limit
   workarounds. When a limit is hit, the run fails with a clear status.
 
-### 5.2 The runtime interface
+### 5.2 The runtime interface (built in M3A)
+
+`src/server/runtime/types.ts`. Solas-owned types; no SDK type leaves the adapter.
 
 ```ts
-// Shape only — implemented in M3. Solas-owned types; no SDK types leak out.
 interface AgentRuntime {
-  readonly id: "claude-agent-sdk" | "anthropic-api";
-  run(input: RunInput, control: RunControl): AsyncIterable<RunEvent>;
+  readonly providerId: string;                 // "claude-agent-sdk"
+  run(input: RunInput, signal: AbortSignal): Promise<RunResult>;  // never throws
 }
 
-type RunInput = {
-  agent: AgentDefinition;     // instructions, model, tool profile, budgets
-  prompt: string;
-  workspaceDir: string;       // the only directory the agent may touch
-  resumeSessionId?: string;   // continuity, if the runtime supports it
-};
+type RunInput = { systemPrompt: string; prompt: string; model: string };
 
-type RunControl = {
-  signal: AbortSignal;                                   // cancel / timeout
-  requestApproval(request: ApprovalRequest): Promise<ApprovalDecision>; // M7
-};
-
-type RunEvent =
-  | { type: "status"; status: "started" | "thinking" | "working" }
-  | { type: "text"; text: string }
-  | { type: "tool_call"; tool: string; input: unknown }
-  | { type: "tool_result"; tool: string; ok: boolean; summary: string }
-  | { type: "approval_requested"; approvalId: string }
-  | { type: "usage"; inputTokens: number; outputTokens: number }
-  | { type: "completed"; sessionId?: string }
-  | { type: "failed"; code: RunErrorCode; message: string };
+type RunResult =
+  | { status: "completed"; text: string; usage: { inputTokens; outputTokens } }
+  | { status: "failed"; code: RunErrorCode; message: string; retryAt?: Date }
+  | { status: "aborted" };   // the caller knows whether that was a timeout or Stop
 ```
 
-Swapping runtimes means writing one new adapter that produces these events.
+`RunErrorCode` is a fixed list (`not_signed_in`, `usage_limit`,
+`paid_credential_refused`, `model_unavailable`, `provider_unavailable`, …).
+Messages shown to the owner are written by Solas from these codes; provider
+text never reaches the UI, so nothing internal can leak.
+
+M3A returns the finished answer (a `Promise`). Streaming (M3B) will change
+`run` to produce events, as sketched in the original design; only the
+adapter and the executor change, not the UI's data or the database.
+
+Adding a provider means: one adapter implementing `AgentRuntime`, one entry
+in the registry, and passing it to the worker. Nothing else changes.
 
 ### 5.3 The Claude Agent SDK adapter: locked down by default
 
-The SDK runs Claude Code's full agent loop, including powerful built-in tools
-(file edits, shell). Solas starts from **nothing allowed** and opens up
-deliberately:
+`src/server/runtime/claude-agent-sdk.ts`. The SDK starts the unmodified
+Claude Code binary bundled with it; that binary uses the owner's own sign-in.
 
-| Control | Setting | Why |
+| Control | Setting (as built) | Why |
 | --- | --- | --- |
-| Settings isolation | Explicit `settingSources` (none, or Solas-provided only); possibly a dedicated `CLAUDE_CONFIG_DIR` (decide in M3) | Agents must not inherit the owner's personal `~/.claude` settings, memory, skills, or MCP servers |
-| Built-in tools | `disallowedTools` removes `Bash` and every tool not in the agent's profile | Removed tools are not even visible to the model |
-| Permission mode | `default` or `dontAsk`; **never** `bypassPermissions` | Anything not explicitly allowed is denied or routed to approval |
-| Working directory | `cwd` = the agent's workspace (outside the repo, under a Solas data directory) | File tools are scoped to it |
-| Policy hook | A `PreToolUse` hook checks every call (tool allowlist, paths inside the workspace) | Hooks run first and a hook deny holds in every mode: defense in depth |
-| Approvals | `canUseTool` callback → `RunControl.requestApproval` → `approvals` row → owner decides | Sensitive actions wait for a human (M7) |
-| Budgets | Max turns, max wall-clock time, one concurrent run by default | Protects plan limits and the machine |
-| Custom tools | Solas tools exposed through an in-process MCP server, each with a schema and risk level | Solas defines exactly what an agent can do (M6) |
+| System prompt | `systemPrompt: <agent.instructions>` (a plain string) | Replaces Claude Code's own prompt entirely: the agent is exactly its stored instructions |
+| Built-in tools | `tools: []`, `allowedTools: []` | No tool exists in the session at all |
+| Permission mode | `dontAsk`, set explicitly | Anything not pre-approved is denied. If omitted, Claude Code may start in `auto`. **Never** `bypassPermissions` |
+| Policy hook | `PreToolUse` hook that denies every call | Hooks run first and hold in every mode: defense in depth |
+| Settings isolation | `settingSources: []`, `strictMcpConfig: true`, `mcpServers: {}` | Ignores the owner's `~/.claude` settings, CLAUDE.md, skills, plugins, and MCP servers |
+| Environment | Allowlist only: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TMPDIR`; plus `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `ENABLE_CLAUDEAI_MCP_SERVERS=false`, `CLAUDE_AGENT_SDK_CLIENT_APP=solas/0.1.0` | No `DATABASE_URL`, no passwords, and no `ANTHROPIC_*` / `CLAUDE_CODE_USE_*` that could switch to a paid API key or another provider |
+| Working directory | `$TMPDIR/solas-runtime`, created empty, refused if inside the repo | Nothing for the agent to find |
+| Sessions | `persistSession: false` | No transcripts written to `~/.claude/projects`; Solas keeps history in PostgreSQL |
+| Budgets | `maxTurns: 1`, `maxBudgetUsd: 1`, 3-minute timeout, one run at a time | Protects plan limits and the machine |
+| **Verified at start** | The session's `init` message must report `apiKeySource: "none"`, zero tools, zero MCP servers, `dontAsk`, and the requested model, or the run stops | Settings can also come from places Solas doesn't control (managed policy, a Console login). Solas checks the result instead of trusting its options |
+| Usage limits | A `rate_limit_event` that is `rejected`, or that shows paid extra usage (`isUsingOverage`), stops the run as `usage_limit` | No silent fall-through to paid usage |
 
-Exact option names are verified against the SDK reference when M3 starts.
+Smoke test, 2026-10-24: `apiKeySource: "none"`, `tools: 0`, `mcpServers: 0`,
+`permissionMode: "dontAsk"`, `model: "claude-opus-5-5"`, Claude Code 2.1.310.
 
-### 5.4 Tools and permissions model
+### 5.4 How a message becomes a reply (M3A)
+
+```
+Browser                Web (Next.js)                       PostgreSQL         Worker
+ │ Enter ──────────▶ sendMessage (Server Action)
+ │                   ├ requireOwner()
+ │                   ├ validate (Zod, shared with the composer)
+ │                   ├ load agent; enabled? model in registry?
+ │                   └ one transaction: conversation, user message,
+ │                     run (pending) ───────────────────────▶ runs
+ │ ◀── { conversationId, runId }
+ │ poll getRunState every 1 s ─────────────────────────────▶ runs ◀── claim (= subquery, SKIP LOCKED)
+ │   "Waiting for the worker…" / "… is responding · 0:12"          ├ load agent again (may have changed)
+ │                                                                   ├ prompt = recent history + message
+ │                                                                   ├ runtime.run({ instructions, prompt, model })
+ │                                                                   │   (timeout 3 min; Stop polled every 1 s)
+ │                                                                   └ one transaction: assistant message,
+ │                                                                     run completed (or failed / cancelled)
+ │ terminal status → router.refresh() → server renders the saved reply
+```
+
+The browser can close at any point; the run continues and the reply is
+there on the next visit. Stop on a pending run cancels it at once; on a
+running run it sets `cancel_requested_at`, and the worker aborts within a
+second.
+
+### 5.5 Tools and permissions model (planned, M6)
 
 Every agent has a **tool profile**:
 
@@ -384,24 +421,10 @@ not from trusting the model to ignore it.
 
 ## 6. Request flows
 
-### 6.1 Sending a message (M5)
+### 6.1 Sending a message
 
-```
-Browser                Web (Next.js)                 PostgreSQL            Worker
-  │ submit message ──▶ Server Action
-  │                    ├ (M9) check owner session
-  │                    ├ validate input
-  │                    ├ insert message ───────────▶ messages
-  │                    └ insert run (queued) ──────▶ runs
-  │ ◀── redirect/refresh
-  │ open SSE ────────▶ GET /api/runs/:id/events
-  │                    └ stream new run_events ◀──── run_events ◀── write events
-  │                                                   runs ───────▶ claim (SKIP LOCKED)
-  │                                                                  runtime.run(…)
-  │ ◀── text / status events, live                                   ├ events → run_events
-  │                                                                  └ final → messages, runs
-  │ (browser may close at any point; the run continues)
-```
+Built in M3A; see §5.4. M3B replaces polling with Server-Sent Events from
+`run_events`, so text appears while it is written.
 
 ### 6.2 Approval (M7)
 
@@ -434,7 +457,7 @@ Worker scheduler tick → schedules where next_run_at <= now and enabled
 | Claude credentials | Managed only by Claude Code's official sign-in. Never read, stored, or transmitted by Solas |
 | Other secrets | `.env.local` / server environment only; `.env*` is git-ignored; never `NEXT_PUBLIC_` |
 | Server/client boundary | `import 'server-only'` in `src/server/`; pass only the fields the UI needs |
-| Agent execution | Only in the worker; no network listener; least-privilege tool profiles; policy hook; approvals |
+| Agent execution | Only in the worker (the Agent SDK is not even in the web server bundle); no network listener; no tools in M3A; deny-all policy hook; approvals later |
 | Working directories | One workspace per agent under a Solas data directory; never the repo or home directory |
 | Shell | No shell tool for agents; no endpoint anywhere that runs commands |
 | Network exposure (dev) | `npm run dev` / `npm start` bind to `127.0.0.1` (since M2A); PostgreSQL is published on `127.0.0.1` only |
@@ -474,11 +497,14 @@ src/
 │  ├─ providers/              provider registry, readiness                  (M2A)
 │  ├─ auth/                   owner guard (M2A), sessions (M9)
 │  ├─ actions/                ActionResult + error mapping for Server Actions (M2A)
-│  ├─ conversations/  runs/  approvals/  tasks/
-│  ├─ runtime/                AgentRuntime, RunEvent, adapters/claude-agent-sdk.ts
+│  ├─ conversations/          service, queries, errors                      (M3A)
+│  ├─ runs/                   executor, prompt, config (limits)             (M3A)
+│  ├─ runtime/                AgentRuntime types, claude-agent-sdk adapter  (M3A)
+│  ├─ logger.ts               JSON-line logs, scalar fields only            (M3A)
+│  ├─ approvals/  tasks/
 │  └─ policy/  tools/
 ├─ test/                      Vitest global setup (test database)           (M2A)
-├─ worker/                    worker entry point, job loop, scheduler
+├─ worker/index.mts          worker entry point and job loop               (M3A)
 └─ proxy.ts                   (M9)
 
 drizzle/                      generated SQL migrations (committed)          (M2A)
@@ -512,7 +538,7 @@ Owner's devices ──(private network, e.g. Tailscale)──▶ Hetzner VPS
 | Static | ESLint, `tsc --noEmit`, `next build` | Every milestone |
 | Unit | Vitest (since M2A) | Pure logic: validation, provider rules, host checks, error mapping |
 | Integration | Vitest + `solas_test` database (since M2A) | Agent service CRUD, constraints, persistence, database-down handling |
-| Runtime | A fake `AgentRuntime` that emits scripted events | Worker and UI tests without calling Claude |
+| Runtime | A fake `AgentRuntime` (executor tests) and a fake SDK `query` (adapter tests) | Since M3A: instructions passed through, error mapping, refusals, timeouts, Stop, recovery, no Claude call |
 | End-to-end | Playwright (to be added) | Key flows once the MVP is stable |
 | Manual | Per-milestone checklist | Both themes, keyboard only, 375px, real agent run |
 
