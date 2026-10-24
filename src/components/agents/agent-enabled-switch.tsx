@@ -38,8 +38,8 @@ export function AgentEnabledSwitch({ agent }: AgentEnabledSwitchProps) {
         </p>
         <p id={descriptionId} className="mt-0.5 text-sm text-muted">
           {enabled
-            ? "This agent will be available to run once the Agent Engine is connected. Nothing runs yet."
-            : "This agent is saved but unavailable. Turn it on when you want to use it."}
+            ? "You can chat with this agent in Conversations."
+            : "This agent is saved but can’t answer messages. Turn it on to chat with it."}
         </p>
       </div>
       <Switch

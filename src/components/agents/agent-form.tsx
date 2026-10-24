@@ -241,7 +241,10 @@ export function AgentForm({ mode, agent, providers }: AgentFormProps) {
         </Field>
       </FormSection>
 
-      <FormSection title="AI model" description="The AI provider and model the agent will use.">
+      <FormSection
+        title="AI model"
+        description="Needed to chat. Claude runs through your own Claude Code sign-in on this computer."
+      >
         <ModelFields
           providers={providers}
           values={values}
@@ -261,8 +264,7 @@ export function AgentForm({ mode, agent, providers }: AgentFormProps) {
               Enabled
             </p>
             <p id={fieldId("enabled-hint")} className="mt-0.5 text-sm text-muted">
-              Enabled agents will be available to run once the Agent Engine is connected. You can change
-              this at any time.
+              Only enabled agents answer messages. You can change this at any time.
             </p>
           </div>
           <Switch
@@ -343,8 +345,7 @@ function ModelFields({
           </div>
         </dl>
         <Callout>
-          AI execution will be available once the Agent Engine is connected. Until then, agents are saved
-          without a model.
+          No AI provider is available in this build of Solas, so agents are saved without a model.
         </Callout>
       </div>
     );

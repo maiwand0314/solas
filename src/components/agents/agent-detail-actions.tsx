@@ -3,14 +3,14 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { CopyIcon, PencilIcon } from "@/components/icons";
+import { ConversationsIcon, CopyIcon, PencilIcon } from "@/components/icons";
 import { Button, buttonClassName } from "@/components/ui/button";
 import { DeleteAgentDialog } from "./delete-agent-dialog";
 import { useAgentCommands } from "./use-agent-commands";
 
 type AgentRef = { id: string; name: string };
 
-/** Header actions on the details page: Duplicate and Edit. */
+/** Header actions on the details page: Duplicate, Edit, and Chat. */
 export function AgentHeaderActions({ agent }: { agent: AgentRef }) {
   const { pending, duplicate } = useAgentCommands();
   return (
@@ -19,9 +19,13 @@ export function AgentHeaderActions({ agent }: { agent: AgentRef }) {
         <CopyIcon className="size-4" />
         {pending ? "Duplicating…" : "Duplicate"}
       </Button>
-      <Link href={`/agents/${agent.id}/edit`} className={buttonClassName({ variant: "primary" })}>
+      <Link href={`/agents/${agent.id}/edit`} className={buttonClassName({ variant: "secondary" })}>
         <PencilIcon className="size-4" />
         Edit
+      </Link>
+      <Link href={`/conversations/new?agent=${agent.id}`} className={buttonClassName({ variant: "primary" })}>
+        <ConversationsIcon className="size-4" />
+        Chat
       </Link>
     </>
   );

@@ -56,7 +56,7 @@ export function AgentDetails({ agent, modelLabel }: AgentDetailsProps) {
           <div className="flex flex-col gap-3">
             <p className={modelLabel ? "font-medium" : "font-medium text-muted"}>{modelLabel ?? "Not configured"}</p>
             {!modelLabel && (
-              <Callout>AI execution will be available once the Agent Engine is connected.</Callout>
+              <Callout>Choose a model (Edit) to chat with this agent.</Callout>
             )}
           </div>
         </DetailSection>
