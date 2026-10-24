@@ -1,5 +1,16 @@
 import { sql } from "drizzle-orm";
-import { boolean, check, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import {
+  type AnyPgColumn,
+  boolean,
+  check,
+  index,
+  integer,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
 
 // The database schema, written in TypeScript. drizzle-kit compares this file
 // with the migrations in /drizzle and generates SQL for the difference.
@@ -47,3 +58,98 @@ export const agents = pgTable(
 );
 
 export type AgentRow = typeof agents.$inferSelect;
+
+/**
+ * A chat thread between the owner and one agent. Deleting the agent deletes
+ * its conversations: a conversation can't outlive the agent that answers it.
+ */
+export const conversations = pgTable(
+  "conversations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    title: text("title").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => sql`now()`),
+  },
+  (table) => [index("conversations_agent_id_idx").on(table.agentId)],
+);
+
+/**
+ * One message in a conversation. History is append-only: messages are never
+ * edited. An assistant message points at the run that produced it.
+ */
+export const messages = pgTable(
+  "messages",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    conversationId: uuid("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    role: text("role", { enum: ["user", "assistant"] }).notNull(),
+    content: text("content").notNull(),
+    // A function reference because runs is declared below (and points back here).
+    runId: uuid("run_id").references((): AnyPgColumn => runs.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("messages_conversation_id_created_at_idx").on(table.conversationId, table.createdAt),
+    check("messages_role_valid", sql`${table.role} in ('user', 'assistant')`),
+  ],
+);
+
+export const RUN_STATUSES = ["pending", "running", "completed", "failed", "cancelled"] as const;
+export type RunStatus = (typeof RUN_STATUSES)[number];
+
+/**
+ * One execution of an agent: "answer this user message". The web app inserts
+ * it as pending; the worker claims it, runs it, and records the outcome. The
+ * table doubles as the job queue, so there's no separate queue service.
+ */
+export const runs = pgTable(
+  "runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    conversationId: uuid("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    userMessageId: uuid("user_message_id")
+      .notNull()
+      .references((): AnyPgColumn => messages.id, { onDelete: "cascade" }),
+    status: text("status", { enum: RUN_STATUSES }).notNull().default("pending"),
+    /** The model actually requested, recorded when the run starts. */
+    modelId: text("model_id"),
+    /** Stable code and owner-safe message; set when status is failed. */
+    errorCode: text("error_code"),
+    errorMessage: text("error_message"),
+    /** Set by the owner's Stop button; the worker notices and aborts. */
+    cancelRequestedAt: timestamp("cancel_requested_at", { withTimezone: true }),
+    inputTokens: integer("input_tokens"),
+    outputTokens: integer("output_tokens"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (table) => [
+    check("runs_status_valid", sql`${table.status} in ('pending', 'running', 'completed', 'failed', 'cancelled')`),
+    // At most one unfinished run per conversation. This is what stops a double
+    // click (or two tabs) from asking the agent the same thing twice.
+    uniqueIndex("runs_one_active_per_conversation")
+      .on(table.conversationId)
+      .where(sql`${table.status} in ('pending', 'running')`),
+    // The worker looks for the oldest pending run.
+    index("runs_status_created_at_idx").on(table.status, table.createdAt),
+  ],
+);
+
+export type ConversationRow = typeof conversations.$inferSelect;
+export type MessageRow = typeof messages.$inferSelect;
+export type RunRow = typeof runs.$inferSelect;
