@@ -18,13 +18,22 @@ type Outcome =
   | { status: "failed"; code: string; message: string }
   | { status: "cancelled" };
 
+export type ExecutorLimits = {
+  timeoutMs: number;
+  heartbeatMs: number;
+  staleAfterMs: number;
+  progressWriteMs: number;
+  historyMessages: number;
+  historyCharacters: number;
+};
+
 type Dependencies = {
   db: Database;
   providers: ProviderRegistry;
   /** One runtime per provider ID. */
   runtimes: AgentRuntime[];
   log: Logger;
-  limits?: { timeoutMs: number; cancelCheckMs: number; historyMessages: number; historyCharacters: number };
+  limits?: ExecutorLimits;
 };
 
 export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_LIMITS }: Dependencies) {
@@ -33,19 +42,28 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
   let stopActiveRun: ((reason: StopReason) => void) | null = null;
 
   /**
-   * Runs left "running" by a worker that crashed or was killed can't be
-   * finished, so they're marked failed. Safe because there is one worker.
+   * The recovery policy for interrupted runs. A run is "running" only while a
+   * worker keeps its heartbeat fresh. If the heartbeat is stale, that worker
+   * crashed or was killed mid-run. Such a run is marked failed, never re-run
+   * automatically: Claude may already have done (and been charged for) the
+   * work, and Solas can't verify a result it never received. The owner can
+   * press Retry. Runs that were still pending are untouched and simply run.
    */
-  async function recoverInterruptedRuns(): Promise<number> {
+  async function recoverStaleRuns(): Promise<number> {
     const recovered = await db
       .update(runs)
       .set({
         status: "failed",
         errorCode: "worker_stopped",
-        errorMessage: "The worker stopped while this reply was being written. Send your message again.",
+        errorMessage: "The worker stopped while this reply was being written. No reply was saved; use Retry to ask again.",
         finishedAt: sql`now()`,
       })
-      .where(eq(runs.status, "running"))
+      .where(
+        and(
+          eq(runs.status, "running"),
+          sql`(${runs.heartbeatAt} is null or ${runs.heartbeatAt} < now() - make_interval(secs => ${limits.staleAfterMs / 1000}))`,
+        ),
+      )
       .returning({ id: runs.id });
     return recovered.length;
   }
@@ -72,7 +90,7 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
       .for("update", { skipLocked: true });
     const [run] = await db
       .update(runs)
-      .set({ status: "running", startedAt: sql`now()` })
+      .set({ status: "running", startedAt: sql`now()`, heartbeatAt: sql`now()` })
       .where(and(sql`${runs.id} = (${oldestPending})`, eq(runs.status, "pending")))
       .returning();
     return run ?? null;
@@ -91,15 +109,17 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
     const fields = { runId: run.id, agentId: run.agentId, conversationId: run.conversationId };
     log("info", "run.started", fields);
 
+    // The latest reply text the runtime has sent, kept for a failed or stopped run.
+    const partial = { text: null as string | null };
     let outcome: Outcome;
     try {
-      outcome = await perform(run);
+      outcome = await perform(run, partial);
     } catch (error) {
       log("error", "run.crashed", { ...fields, error: truncate(error instanceof Error ? error.message : String(error)) });
       outcome = { status: "failed", code: "unexpected", message: "Something went wrong in the worker. Check its log." };
     }
 
-    const saved = await finish(run, outcome);
+    const saved = await finish(run, outcome, partial.text);
     log(outcome.status === "failed" ? "warn" : "info", "run.finished", {
       ...fields,
       status: outcome.status,
@@ -112,7 +132,7 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
     return outcome.status;
   }
 
-  async function perform(run: RunRow): Promise<Outcome> {
+  async function perform(run: RunRow, partial: { text: string | null }): Promise<Outcome> {
     // Load the agent fresh: it may have changed since the message was sent.
     const [agent] = await db.select().from(agents).where(eq(agents.id, run.agentId)).limit(1);
     if (!agent) return failed("agent_unavailable", "The agent was deleted before it could answer.");
@@ -135,22 +155,49 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
       stopReason ??= reason;
       controller.abort();
     };
+    const stillRunning = and(eq(runs.id, run.id), eq(runs.status, "running"));
     const timer = setTimeout(() => stop("timeout"), limits.timeoutMs);
-    const cancelWatcher = setInterval(() => {
-      db.select({ cancelRequestedAt: runs.cancelRequestedAt })
-        .from(runs)
-        .where(eq(runs.id, run.id))
+    // Once a second: prove this worker is alive, and learn whether the owner
+    // pressed Stop. No row means the run was deleted (with its conversation)
+    // or taken over by recovery: either way, stop working on it.
+    const heartbeat = setInterval(() => {
+      db.update(runs)
+        .set({ heartbeatAt: sql`now()` })
+        .where(stillRunning)
+        .returning({ cancelRequestedAt: runs.cancelRequestedAt })
         .then(([row]) => {
-          if (row?.cancelRequestedAt) stop("cancelled");
+          if (!row) stop("gone");
+          else if (row.cancelRequestedAt) stop("cancelled");
         })
-        .catch(() => {}); // A missed check is retried a second later.
-    }, limits.cancelCheckMs);
+        .catch(() => {}); // A missed beat is retried a second later.
+    }, limits.heartbeatMs);
+
+    // Save the reply written so far, at most every progressWriteMs, so the
+    // browser can show it while it's being written. Only the newest text matters.
+    let unsaved: string | null = null;
+    let saving = false;
+    const progressWriter = setInterval(() => {
+      if (unsaved === null || saving) return;
+      const text = unsaved;
+      unsaved = null;
+      saving = true;
+      db.update(runs)
+        .set({ partialOutput: text })
+        .where(stillRunning)
+        .catch(() => {})
+        .finally(() => (saving = false));
+    }, limits.progressWriteMs);
+    const onProgress = (text: string) => {
+      unsaved = text;
+      partial.text = text;
+    };
     stopActiveRun = stop;
 
     try {
       const result = await runtime.run(
         { systemPrompt: agent.instructions, prompt, model: agent.modelId! },
         controller.signal,
+        onProgress,
       );
       if (result.status === "completed") return result;
       if (result.status === "failed") {
@@ -160,7 +207,8 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
       return stopped(stopReason ?? "cancelled");
     } finally {
       clearTimeout(timer);
-      clearInterval(cancelWatcher);
+      clearInterval(heartbeat);
+      clearInterval(progressWriter);
       stopActiveRun = null;
     }
   }
@@ -182,8 +230,9 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
       return failed("timeout", `No reply within ${minutes} ${minutes === 1 ? "minute" : "minutes"}, so the run was stopped.`);
     }
     if (reason === "shutdown") {
-      return failed("worker_stopped", "The worker was stopped while this reply was being written. Send your message again.");
+      return failed("worker_stopped", "The worker was stopped while this reply was being written. Use Retry to ask again.");
     }
+    // "cancelled" (Stop) or "gone" (deleted / recovered): nothing more to save.
     return { status: "cancelled" };
   }
 
@@ -191,7 +240,7 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
    * Records the outcome. Updates only a run that is still "running", so a
    * run that was deleted (with its agent or conversation) is left alone.
    */
-  async function finish(run: RunRow, outcome: Outcome): Promise<boolean> {
+  async function finish(run: RunRow, outcome: Outcome, partialText: string | null): Promise<boolean> {
     return db.transaction(async (tx) => {
       const stillRunning = and(eq(runs.id, run.id), eq(runs.status, "running"));
       if (outcome.status === "completed") {
@@ -202,6 +251,8 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
             finishedAt: sql`now()`,
             inputTokens: outcome.usage.inputTokens,
             outputTokens: outcome.usage.outputTokens,
+            // The finished reply is now a message; the draft isn't needed.
+            partialOutput: null,
           })
           .where(stillRunning)
           .returning({ id: runs.id });
@@ -218,6 +269,9 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
           status: outcome.status,
           errorCode: outcome.status === "failed" ? outcome.code : null,
           errorMessage: outcome.status === "failed" ? outcome.message : null,
+          // Kept so the owner can see how far the reply got. It is never added
+          // to the conversation, so it isn't used as context later.
+          partialOutput: partialText,
           finishedAt: sql`now()`,
         })
         .where(stillRunning)
@@ -231,10 +285,10 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
     stopActiveRun?.("shutdown");
   }
 
-  return { recoverInterruptedRuns, claimNextRun, runOnce, executeRun, abortActiveRun };
+  return { recoverStaleRuns, claimNextRun, runOnce, executeRun, abortActiveRun };
 }
 
-type StopReason = "timeout" | "cancelled" | "shutdown";
+type StopReason = "timeout" | "cancelled" | "shutdown" | "gone";
 
 function failed(code: string, message: string): Outcome {
   return { status: "failed", code, message };

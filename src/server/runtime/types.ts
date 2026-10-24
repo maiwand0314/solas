@@ -39,9 +39,16 @@ export type RunResult =
   /** The signal was aborted; the caller knows whether that was a timeout or Stop. */
   | { status: "aborted" };
 
+/** Called with the reply written so far, each time the provider sends more of it. */
+export type OnProgress = (textSoFar: string) => void;
+
 export interface AgentRuntime {
   /** Matches the provider ID in the registry, e.g. "claude-agent-sdk". */
   readonly providerId: string;
-  /** Runs one execution to the end. Never throws: every outcome is a RunResult. */
-  run(input: RunInput, signal: AbortSignal): Promise<RunResult>;
+  /**
+   * Runs one execution to the end. Never throws: every outcome is a RunResult.
+   * `onProgress` receives real partial text as it arrives (if the provider
+   * streams); the final text is always the one in the result.
+   */
+  run(input: RunInput, signal: AbortSignal, onProgress?: OnProgress): Promise<RunResult>;
 }

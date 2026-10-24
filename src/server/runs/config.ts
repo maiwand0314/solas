@@ -11,8 +11,14 @@ export const RUN_LIMITS = {
   maxBudgetUsd: 1,
   /** How often the worker looks for new runs when idle. */
   pollIntervalMs: 1_000,
-  /** How often a running run checks whether the owner pressed Stop. */
-  cancelCheckMs: 1_000,
+  /** How often a running run refreshes its heartbeat and checks for Stop. */
+  heartbeatMs: 1_000,
+  /** A running run whose heartbeat is older than this has lost its worker. */
+  staleAfterMs: 30_000,
+  /** How often the worker looks for such runs. */
+  recoveryIntervalMs: 30_000,
+  /** At most this often, the reply written so far is saved for the browser. */
+  progressWriteMs: 300,
   /** Earlier messages included as context: at most this many… */
   historyMessages: 20,
   /** …and at most this many characters, dropping the oldest first. */

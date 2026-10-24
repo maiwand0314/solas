@@ -6,7 +6,8 @@
 //
 // The .mts extension makes this an ES module, so top-level await works.
 // It runs one agent at a time. Stop it with Ctrl+C: a run in progress is
-// stopped and marked failed, so it never stays "running" forever.
+// stopped and marked failed, so it never stays "running" forever. Pending
+// runs wait in PostgreSQL and are picked up when the worker starts again.
 
 import { setTimeout as sleep } from "node:timers/promises";
 import { closeDatabase, createDatabase } from "@/server/db/client";
@@ -48,14 +49,24 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 log("info", "worker.started", { pid: process.pid, timeoutMs: RUN_LIMITS.timeoutMs, concurrency: 1 });
 
-try {
-  const recovered = await executor.recoverInterruptedRuns();
-  if (recovered > 0) log("warn", "worker.recovered_runs", { count: recovered });
-} catch (error) {
-  log("error", "worker.recovery_failed", { error: truncate(error instanceof Error ? error.message : String(error)) });
+/** Marks runs whose worker died as failed (see recoverStaleRuns). */
+async function recover() {
+  try {
+    const recovered = await executor.recoverStaleRuns();
+    if (recovered > 0) log("warn", "worker.recovered_runs", { count: recovered });
+  } catch (error) {
+    log("error", "worker.recovery_failed", { error: truncate(error instanceof Error ? error.message : String(error)) });
+  }
 }
 
+await recover();
+let lastRecovery = Date.now();
+
 while (!stopping) {
+  if (Date.now() - lastRecovery > RUN_LIMITS.recoveryIntervalMs) {
+    await recover();
+    lastRecovery = Date.now();
+  }
   let didWork = false;
   try {
     didWork = await executor.runOnce();

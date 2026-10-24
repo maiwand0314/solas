@@ -1,7 +1,7 @@
 import { agents } from "@/server/db/schema";
 import type { Database } from "@/server/db/client";
 import { createProviderRegistry } from "@/server/providers/registry";
-import type { AgentRuntime, RunInput, RunResult } from "@/server/runtime/types";
+import type { AgentRuntime, OnProgress, RunInput, RunResult } from "@/server/runtime/types";
 
 // Shared by the conversation and executor tests: a fixed provider registry and
 // a fake runtime, so tests never depend on (or call) the real Claude.
@@ -29,13 +29,15 @@ export async function insertAgent(db: Database, overrides: Partial<typeof agents
  * A runtime whose behavior each test sets. It records every input, so tests
  * can check exactly what the agent was asked and with which instructions.
  */
-export function fakeRuntime(behave: (input: RunInput, signal: AbortSignal) => Promise<RunResult>) {
+export function fakeRuntime(
+  behave: (input: RunInput, signal: AbortSignal, onProgress?: OnProgress) => Promise<RunResult>,
+) {
   const inputs: RunInput[] = [];
   const runtime: AgentRuntime = {
     providerId: "fake",
-    run: (input, signal) => {
+    run: (input, signal, onProgress) => {
       inputs.push(input);
-      return behave(input, signal);
+      return behave(input, signal, onProgress);
     },
   };
   return { runtime, inputs };

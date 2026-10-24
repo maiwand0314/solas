@@ -204,6 +204,26 @@ describe("outcomes", () => {
   });
 });
 
+describe("streaming", () => {
+  it("asks for partial messages and passes on only the reply text, as it grows", async () => {
+    const delta = (delta: unknown) => ({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta } });
+    const { query, calls } = fakeQuery([
+      init,
+      delta({ type: "thinking_delta", thinking: "private reasoning" }),
+      delta({ type: "text_delta", text: "Super" }),
+      delta({ type: "text_delta", text: "vised" }),
+      success,
+    ]);
+    const progress: string[] = [];
+    const result = await runtimeWith(query).run(input, new AbortController().signal, (text) => progress.push(text));
+
+    expect(calls[0].options.includePartialMessages).toBe(true);
+    expect(progress).toEqual(["Super", "Supervised"]);
+    // The final text always comes from the result, not from the deltas.
+    expect(result).toMatchObject({ status: "completed", text: success.result });
+  });
+});
+
 describe("cancellation", () => {
   it("returns aborted when the signal fires mid-run, and closes the session", async () => {
     const controller = new AbortController();

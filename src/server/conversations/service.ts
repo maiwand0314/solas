@@ -1,7 +1,7 @@
 import "server-only";
 import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
-import { sendMessageSchema } from "@/lib/conversations/validation";
+import { conversationTitleSchema, sendMessageSchema } from "@/lib/conversations/validation";
 import { getDatabase, type Database } from "@/server/db/client";
 import {
   agents,
@@ -19,8 +19,18 @@ import { ConversationServiceError, fromDatabaseError, validationError } from "./
 /** What the UI needs to know about a run: its state, never its internals. */
 export type RunState = Pick<
   RunRow,
-  "id" | "userMessageId" | "status" | "errorCode" | "errorMessage" | "createdAt" | "startedAt" | "finishedAt"
+  | "id"
+  | "userMessageId"
+  | "status"
+  | "errorCode"
+  | "errorMessage"
+  | "partialOutput"
+  | "createdAt"
+  | "startedAt"
+  | "finishedAt"
 >;
+
+export type SendResult = { conversationId: string; runId: string };
 
 export type ConversationSummary = Pick<ConversationRow, "id" | "title" | "createdAt" | "updatedAt"> & {
   agentId: string;
@@ -40,6 +50,7 @@ const runStateColumns = {
   status: runs.status,
   errorCode: runs.errorCode,
   errorMessage: runs.errorMessage,
+  partialOutput: runs.partialOutput,
   createdAt: runs.createdAt,
   startedAt: runs.startedAt,
   finishedAt: runs.finishedAt,
@@ -63,39 +74,138 @@ export function createConversationService({ db, providers }: Dependencies) {
    * Saves the owner's message and queues a run, in one transaction. Checks
    * the agent first so the owner gets an immediate, clear error instead of a
    * run that fails in the worker a second later.
+   *
+   * Safe to repeat: with the same `clientMessageId`, a second call (say, the
+   * browser retrying after a dropped connection) returns the first result.
    */
-  async function sendMessage(input: unknown): Promise<{ conversationId: string; runId: string }> {
-    const { conversationId, agentId, content } = parse(sendMessageSchema, input);
+  async function sendMessage(input: unknown): Promise<SendResult> {
+    const { conversationId, agentId, clientMessageId, content } = parse(sendMessageSchema, input);
+
+    if (clientMessageId) {
+      const alreadySent = await findSent(clientMessageId);
+      if (alreadySent) return alreadySent;
+    }
 
     const existing = conversationId ? await getConversationRow(conversationId) : undefined;
+    if (existing && agentId && existing.agentId !== agentId) {
+      throw new ConversationServiceError("validation_failed", "This conversation belongs to a different agent.");
+    }
     const agent = await getAgentRow(existing?.agentId ?? agentId!);
     assertAgentCanRun(agent);
 
+    try {
+      return await query(() =>
+        db.transaction(async (tx) => {
+          let id = existing?.id;
+          if (id) {
+            await tx.update(conversations).set({ updatedAt: sql`now()` }).where(eq(conversations.id, id));
+          } else {
+            const [created] = await tx
+              .insert(conversations)
+              .values({ agentId: agent.id, title: titleFrom(content) })
+              .returning({ id: conversations.id });
+            id = created.id;
+          }
+          const [message] = await tx
+            .insert(messages)
+            .values({ conversationId: id, role: "user", content, clientMessageId })
+            .returning({ id: messages.id });
+          // Fails on the "one active run per conversation" index if a reply is
+          // still pending: that's what stops two different messages racing.
+          const [run] = await tx
+            .insert(runs)
+            .values({ conversationId: id, agentId: agent.id, userMessageId: message.id })
+            .returning({ id: runs.id });
+          return { conversationId: id, runId: run.id };
+        }),
+      );
+    } catch (error) {
+      // Two identical sends at the same moment: the loser's transaction rolled
+      // back, and it reports the winner's result.
+      if (error instanceof ConversationServiceError && error.code === "duplicate_message" && clientMessageId) {
+        const winner = await findSent(clientMessageId);
+        if (winner) return winner;
+      }
+      throw error;
+    }
+  }
+
+  /** The conversation and latest run for a message the browser already sent. */
+  async function findSent(clientMessageId: string): Promise<SendResult | null> {
+    const [sent] = await query(() =>
+      db
+        .select({ conversationId: messages.conversationId, runId: runs.id })
+        .from(messages)
+        .innerJoin(runs, eq(runs.userMessageId, messages.id))
+        .where(eq(messages.clientMessageId, clientMessageId))
+        .orderBy(desc(runs.createdAt))
+        .limit(1),
+    );
+    return sent ?? null;
+  }
+
+  /**
+   * Asks again for the latest message after its reply failed or was stopped.
+   * Creates a new run for the same message; the old run stays in the record.
+   * Only the latest message qualifies, so a retry never answers out of order.
+   */
+  async function retryRun(id: unknown): Promise<SendResult> {
+    const runId = parse(idSchema, id);
+    const [run] = await query(() => db.select().from(runs).where(eq(runs.id, runId)).limit(1));
+    if (!run) throw new ConversationServiceError("not_found", "This reply no longer exists.");
+    if (run.status !== "failed" && run.status !== "cancelled") {
+      throw new ConversationServiceError("validation_failed", "Only a failed or stopped reply can be retried.");
+    }
+    const [latest] = await query(() =>
+      db
+        .select({ id: messages.id })
+        .from(messages)
+        .where(eq(messages.conversationId, run.conversationId))
+        .orderBy(desc(messages.createdAt))
+        .limit(1),
+    );
+    if (latest?.id !== run.userMessageId) {
+      throw new ConversationServiceError("validation_failed", "Only the latest message can be retried.");
+    }
+    assertAgentCanRun(await getAgentRow(run.agentId));
+
     return query(() =>
       db.transaction(async (tx) => {
-        let id = existing?.id;
-        if (id) {
-          await tx.update(conversations).set({ updatedAt: sql`now()` }).where(eq(conversations.id, id));
-        } else {
-          const [created] = await tx
-            .insert(conversations)
-            .values({ agentId: agent.id, title: titleFrom(content) })
-            .returning({ id: conversations.id });
-          id = created.id;
-        }
-        const [message] = await tx
-          .insert(messages)
-          .values({ conversationId: id, role: "user", content })
-          .returning({ id: messages.id });
-        // Fails on the "one active run per conversation" index if a reply is
-        // still pending: that's what stops duplicate submissions.
-        const [run] = await tx
+        const [retry] = await tx
           .insert(runs)
-          .values({ conversationId: id, agentId: agent.id, userMessageId: message.id })
+          .values({ conversationId: run.conversationId, agentId: run.agentId, userMessageId: run.userMessageId })
           .returning({ id: runs.id });
-        return { conversationId: id, runId: run.id };
+        await tx.update(conversations).set({ updatedAt: sql`now()` }).where(eq(conversations.id, run.conversationId));
+        return { conversationId: run.conversationId, runId: retry.id };
       }),
     );
+  }
+
+  async function rename(id: unknown, title: unknown): Promise<ConversationRow> {
+    const conversationId = parse(idSchema, id);
+    const newTitle = parse(conversationTitleSchema, title);
+    const [renamed] = await query(() =>
+      db
+        .update(conversations)
+        // Keep updatedAt: the list is ordered by activity, and a rename isn't activity.
+        .set({ title: newTitle, updatedAt: sql`${conversations.updatedAt}` })
+        .where(eq(conversations.id, conversationId))
+        .returning(),
+    );
+    if (!renamed) throw notFoundError();
+    return renamed;
+  }
+
+  /**
+   * Deletes a conversation with its messages and runs. A reply still being
+   * written is abandoned: the worker's next heartbeat finds no run and stops.
+   */
+  async function remove(id: unknown): Promise<void> {
+    const conversationId = parse(idSchema, id);
+    const deleted = await query(() =>
+      db.delete(conversations).where(eq(conversations.id, conversationId)).returning({ id: conversations.id }),
+    );
+    if (deleted.length === 0) throw notFoundError();
   }
 
   async function list(): Promise<ConversationSummary[]> {
@@ -181,9 +291,7 @@ export function createConversationService({ db, providers }: Dependencies) {
     const [conversation] = await query(() =>
       db.select().from(conversations).where(eq(conversations.id, id)).limit(1),
     );
-    if (!conversation) {
-      throw new ConversationServiceError("not_found", "This conversation doesn’t exist. It may have been deleted.");
-    }
+    if (!conversation) throw notFoundError();
     return conversation;
   }
 
@@ -206,7 +314,11 @@ export function createConversationService({ db, providers }: Dependencies) {
     }
   }
 
-  return { sendMessage, list, get, getRun, cancelRun };
+  return { sendMessage, retryRun, rename, remove, list, get, getRun, cancelRun };
+}
+
+function notFoundError() {
+  return new ConversationServiceError("not_found", "This conversation doesn’t exist. It may have been deleted.");
 }
 
 /** The first line of the first message, shortened: a title that needs no AI call. */

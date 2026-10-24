@@ -9,7 +9,7 @@ import {
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { truncate, type Logger } from "@/server/logger";
-import type { AgentRuntime, RunErrorCode, RunInput, RunResult } from "./types";
+import type { AgentRuntime, OnProgress, RunErrorCode, RunInput, RunResult } from "./types";
 
 // The Claude adapter. It runs the official Claude Agent SDK, which starts the
 // unmodified Claude Code binary bundled with it. That binary signs in with the
@@ -81,6 +81,8 @@ export function buildQueryOptions(
     // Don't write session transcripts to ~/.claude/projects. Solas keeps its
     // own history in PostgreSQL.
     persistSession: false,
+    // Stream text as Claude writes it (real deltas from the API).
+    includePartialMessages: true,
     // One answer, no tool round trips.
     maxTurns: 1,
     // A safety cap on Claude Code's own cost estimate for a single run.
@@ -99,7 +101,7 @@ type Dependencies = {
 };
 
 export function createClaudeAgentSdkRuntime({ workDir, maxBudgetUsd, log, query = sdkQuery }: Dependencies): AgentRuntime {
-  async function run(input: RunInput, signal: AbortSignal): Promise<RunResult> {
+  async function run(input: RunInput, signal: AbortSignal, onProgress?: OnProgress): Promise<RunResult> {
     if (signal.aborted) return { status: "aborted" };
 
     const abortController = new AbortController();
@@ -120,6 +122,7 @@ export function createClaudeAgentSdkRuntime({ workDir, maxBudgetUsd, log, query 
     let assistantError: SDKAssistantMessageError | undefined;
     let rateLimit: SDKRateLimitInfo | undefined;
     let result: SDKResultMessage | undefined;
+    let textSoFar = "";
 
     try {
       for await (const message of session) {
@@ -152,6 +155,13 @@ export function createClaudeAgentSdkRuntime({ workDir, maxBudgetUsd, log, query 
           }
           if (rateLimit.status === "allowed_warning") {
             log("warn", "runtime.usage_warning", { limitType: rateLimit.rateLimitType, utilization: rateLimit.utilization });
+          }
+        } else if (message.type === "stream_event") {
+          // Only the visible reply text; thinking and other blocks are skipped.
+          const event = message.event;
+          if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+            textSoFar += event.delta.text;
+            onProgress?.(textSoFar);
           }
         } else if (message.type === "assistant" && message.error) {
           assistantError = message.error;

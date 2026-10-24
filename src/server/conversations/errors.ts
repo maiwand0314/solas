@@ -8,6 +8,7 @@ export type ConversationErrorCode =
   | "agent_not_found"
   | "agent_unavailable"
   | "run_in_progress"
+  | "duplicate_message"
   | "database_unavailable"
   | "unexpected";
 
@@ -40,6 +41,10 @@ export function fromDatabaseError(error: unknown): ConversationServiceError {
       {},
       { cause: error },
     );
+  }
+  if (failure.kind === "unique_violation" && failure.constraint === "messages_client_message_id_unique") {
+    // Not shown to the owner: sendMessage turns it into "already saved".
+    return new ConversationServiceError("duplicate_message", "This message was already sent.", {}, { cause: error });
   }
   if (failure.kind === "unavailable") {
     return new ConversationServiceError(
