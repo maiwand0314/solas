@@ -15,6 +15,7 @@ import { AgentServiceError } from "@/server/agents/errors";
 import { getAgentForOwner, listAgentsForOwner } from "@/server/agents/queries";
 import { chatUnavailableReason } from "@/server/conversations/queries";
 import { describeModelSelection, providerRegistry } from "@/server/providers/registry";
+import { toolDisplayInfo } from "@/server/tools/registry";
 
 export const metadata: Metadata = {
   title: "New conversation",
@@ -64,6 +65,8 @@ async function ChatWithAgent({ agentId }: { agentId: string }) {
         conversationId={null}
         messages={[]}
         runs={[]}
+        toolCalls={[]}
+        toolInfo={toolDisplayInfo()}
       />
     </>
   );

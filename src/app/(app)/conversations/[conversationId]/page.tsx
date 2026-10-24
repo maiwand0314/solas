@@ -10,6 +10,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { ConversationServiceError } from "@/server/conversations/errors";
 import { chatUnavailableReason, getConversationForOwner } from "@/server/conversations/queries";
 import { describeModelSelection, providerRegistry } from "@/server/providers/registry";
+import { toolDisplayInfo } from "@/server/tools/registry";
 
 export const metadata: Metadata = {
   title: "Conversation",
@@ -67,6 +68,8 @@ async function ConversationContent({ params }: Pick<PageProps<"/conversations/[c
           clientMessageId,
         }))}
         runs={runs}
+        toolCalls={thread.toolCalls}
+        toolInfo={toolDisplayInfo()}
       />
     </>
   );

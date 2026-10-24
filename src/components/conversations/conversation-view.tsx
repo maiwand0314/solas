@@ -19,8 +19,9 @@ import { Button, buttonClassName } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { MESSAGE_MAX_LENGTH, messageContentSchema } from "@/lib/conversations/validation";
-import type { RunState } from "@/server/conversations/service";
+import type { RunSnapshot, RunState, ToolCallView } from "@/server/conversations/service";
 import { Markdown } from "./markdown";
+import { ToolActivity, type ToolInfo } from "./tool-activity";
 
 export type ConversationAgent = {
   id: string;
@@ -48,6 +49,9 @@ type ConversationViewProps = {
   conversationId: string | null;
   messages: ConversationMessage[];
   runs: RunState[];
+  /** Every tool call in the conversation, oldest first. */
+  toolCalls: ToolCallView[];
+  toolInfo: ToolInfo;
 };
 
 /** How often the run's state is fetched: often while text streams in. */
@@ -67,7 +71,7 @@ const isActive = (run: RunState) => run.status === "pending" || run.status === "
  * as the worker saves it from Claude's stream; nothing is typed out for show.
  * When the run ends, the page re-renders on the server with the saved reply.
  */
-export function ConversationView({ agent, conversationId, messages, runs }: ConversationViewProps) {
+export function ConversationView({ agent, conversationId, messages, runs, toolCalls, toolInfo }: ConversationViewProps) {
   const router = useRouter();
   const composerId = useId();
   const [draft, setDraft] = useState("");
@@ -103,13 +107,18 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
   const runByMessage = new Map<string, RunState>();
   for (const run of runs) runByMessage.set(run.userMessageId, run.id === liveRun?.id ? liveRun : run);
 
+  // Tool calls per run; the live run's come from the latest poll.
+  const callsByRun = new Map<string, ToolCallView[]>();
+  for (const call of toolCalls) callsByRun.set(call.runId, [...(callsByRun.get(call.runId) ?? []), call]);
+  const callsFor = (runId: string) => (liveRun?.id === runId ? liveRun.toolCalls : (callsByRun.get(runId) ?? []));
+
   const lastMessage = messages.at(-1);
   const lastRun = lastMessage?.role === "user" ? runByMessage.get(lastMessage.id) : undefined;
   const canRetry =
     !agent.unavailableReason && !activeRun && (lastRun?.status === "failed" || lastRun?.status === "cancelled");
 
   const { endRef, atBottom, scrollToEnd } = useStickToBottom(
-    `${visibleMessages.length}:${lastRun?.status}:${liveRun?.partialOutput?.length ?? 0}`,
+    `${visibleMessages.length}:${lastRun?.status}:${liveRun?.partialOutput?.length ?? 0}:${liveRun?.toolCalls.map((call) => call.status).join()}`,
   );
 
   const canSend = !agent.unavailableReason && !activeRun && !sending;
@@ -212,9 +221,14 @@ export function ConversationView({ agent, conversationId, messages, runs }: Conv
             <li key={message.id} className="flex flex-col gap-5">
               <MessageBlock message={message} agentName={agent.name} />
               {message.id === "sending" && <StatusLine>Sending…</StatusLine>}
+              {run?.status === "completed" && (
+                <ToolActivity calls={callsFor(run.id)} toolInfo={toolInfo} agentName={agent.name} now={now} collapsed />
+              )}
               {run && run.status !== "completed" && (
                 <RunBlock
                   run={run}
+                  calls={callsFor(run.id)}
+                  toolInfo={toolInfo}
                   agentName={agent.name}
                   now={now}
                   connectionLost={connectionLost && run.id === activeRun?.id}
@@ -360,6 +374,8 @@ function AgentText({
 
 function RunBlock({
   run,
+  calls,
+  toolInfo,
   agentName,
   now,
   connectionLost,
@@ -368,6 +384,8 @@ function RunBlock({
   retrying,
 }: {
   run: RunState;
+  calls: ToolCallView[];
+  toolInfo: ToolInfo;
   agentName: string;
   now: number | null;
   connectionLost: boolean;
@@ -384,6 +402,7 @@ function RunBlock({
   if (run.status === "failed" || run.status === "cancelled") {
     return (
       <div className="flex flex-col gap-3">
+        <ToolActivity calls={calls} toolInfo={toolInfo} agentName={agentName} now={now} />
         {run.partialOutput && (
           <AgentText agentName={agentName} label="incomplete, not saved" muted>
             {run.partialOutput}
@@ -407,8 +426,10 @@ function RunBlock({
   const waitedLong =
     run.status === "pending" && now !== null && now - new Date(run.createdAt).getTime() > WORKER_HINT_AFTER_MS;
 
+  const awaitingApproval = calls.some((call) => call.status === "awaiting_approval");
   return (
     <div className="flex flex-col gap-3">
+      <ToolActivity calls={calls} toolInfo={toolInfo} agentName={agentName} now={now} />
       {run.status === "running" && run.partialOutput && (
         <AgentText agentName={agentName} label="writing">
           {run.partialOutput}
@@ -417,9 +438,11 @@ function RunBlock({
       <StatusLine active>
         {run.status === "pending"
           ? "Waiting for the worker to start…"
-          : stopRequested
-            ? `Stopping${elapsed}`
-            : `${run.partialOutput ? `${agentName} is writing` : `${agentName} is responding`}${elapsed}`}
+          : awaitingApproval
+            ? "Waiting for your approval"
+            : stopRequested
+              ? `Stopping${elapsed}`
+              : `${run.partialOutput ? `${agentName} is writing` : `${agentName} is responding`}${elapsed}`}
       </StatusLine>
       {waitedLong && (
         <p className="text-sm text-muted">
@@ -452,7 +475,7 @@ function formatElapsed(ms: number): string {
  */
 function useRunPolling(activeRun: RunState | undefined) {
   const router = useRouter();
-  const [liveRun, setLiveRun] = useState<RunState | null>(null);
+  const [liveRun, setLiveRun] = useState<RunSnapshot | null>(null);
   // The last text seen for a run, shown for the moment between "completed"
   // and the saved reply arriving (the run's draft is cleared when it completes).
   const [lastText, setLastText] = useState<{ runId: string; text: string } | null>(null);

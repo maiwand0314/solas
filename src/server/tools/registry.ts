@@ -43,3 +43,8 @@ export function createToolRegistry(tools: readonly AnyToolDefinition[]): ToolReg
 }
 
 export const toolRegistry = createToolRegistry([currentTimeTool, listWorkspaceFilesTool, readWorkspaceFileTool]);
+
+/** Tool names and risk levels by ID, for showing tool activity (plain data). */
+export function toolDisplayInfo(registry: ToolRegistry = toolRegistry) {
+  return Object.fromEntries(registry.list().map((tool) => [tool.id, { name: tool.name, risk: tool.risk }]));
+}
