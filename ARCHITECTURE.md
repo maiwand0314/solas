@@ -87,11 +87,13 @@ the bundled docs in `node_modules/next/dist/docs/` before using an API.
 | Cache Components | Enabled in `next.config.ts`. Pages prerender into a static shell; per-request data must sit inside `<Suspense>` or be explicitly cached with `'use cache'` | Every database-backed page |
 | Route groups `(name)` | Folders that group routes without changing the URL | `(app)` for the shell, `(auth)` for login |
 
-**Why SSE for live output?** The worker writes events to the database. A Route
-Handler streams new events for one run to the browser as `text/event-stream`.
-If the connection drops, the browser reconnects with the last event ID it saw,
-so nothing is lost. Nothing in the browser depends on the run's process being
-alive; the stream is just a view of the database.
+**How live output reaches the browser (M3B).** The worker saves the reply
+written so far on the run row (at most every 300 ms), and the conversation
+view fetches the run's state twice a second while it runs. Nothing in the
+browser depends on the run's process: the view is just a reading of the
+database, so a reload or a closed tab loses nothing. Server-Sent Events from
+an append-only `run_events` table remain the upgrade path if polling ever
+feels slow or tool calls need to be shown step by step.
 
 ## 4. Data model (target)
 
@@ -106,12 +108,16 @@ agents (M2A, built — see §4a)
 
 conversations (M3A, built)
   id, agent_id → agents (cascade), title, created_at, updated_at
+  no provider session reference: context is rebuilt from messages (§5.5)
   later: archived_at
 
 messages (M3A, built)
   id, conversation_id → conversations (cascade), role ('user' | 'assistant'),
   content (text), run_id → runs (nullable; set on assistant messages),
+  client_message_id (M3B; unique, chosen by the browser per send),
   created_at
+  a message is only stored when it is final, so it needs no status of its own;
+  the status lives on the run
 
 runs (M3A, built)
   id, conversation_id → conversations, agent_id → agents,
@@ -119,11 +125,13 @@ runs (M3A, built)
   status ('pending' | 'running' | 'completed' | 'failed' | 'cancelled'),
   model_id (recorded at start), error_code, error_message,
   cancel_requested_at, input_tokens, output_tokens,
+  partial_output (M3B; the reply so far, kept on a stopped or failed run),
+  heartbeat_at (M3B; refreshed every second by the worker running it),
   created_at, started_at, finished_at
   unique: one pending/running run per conversation
-  later: task_id, 'awaiting_approval', heartbeat_at
+  later: task_id, 'awaiting_approval'
 
-run_events (M3B, planned)
+run_events (planned, when tool calls need a timeline)
   id (sequential), run_id → runs, type, payload (jsonb), created_at
 
 approvals (M7)
@@ -144,8 +152,8 @@ Design choices:
   oldest `pending` row with `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP
   LOCKED LIMIT 1)` and sets `running`. Note the `=`: with `IN`, PostgreSQL
   may re-run the subquery per row and claim several runs at once (found by a
-  test in M3A). There is one worker, so on start it marks any run still
-  `running` as failed (`worker_stopped`); a heartbeat comes with more workers.
+  test in M3A). A running run carries a heartbeat; recovery is described in
+  §5.6.
 - **Solas stores its own event format,** not the SDK's raw messages. That keeps
   the UI and database independent of the runtime (see §5.2).
 
@@ -345,9 +353,10 @@ type RunResult =
 Messages shown to the owner are written by Solas from these codes; provider
 text never reaches the UI, so nothing internal can leak.
 
-M3A returns the finished answer (a `Promise`). Streaming (M3B) will change
-`run` to produce events, as sketched in the original design; only the
-adapter and the executor change, not the UI's data or the database.
+`run` also takes an optional `onProgress(textSoFar)` callback (M3B). The
+Claude adapter calls it for each real text delta from the API; the final
+text is always the one in the result. A provider that can't stream simply
+never calls it.
 
 Adding a provider means: one adapter implementing `AgentRuntime`, one entry
 in the registry, and passing it to the worker. Nothing else changes.
@@ -368,13 +377,14 @@ Claude Code binary bundled with it; that binary uses the owner's own sign-in.
 | Working directory | `$TMPDIR/solas-runtime`, created empty, refused if inside the repo | Nothing for the agent to find |
 | Sessions | `persistSession: false` | No transcripts written to `~/.claude/projects`; Solas keeps history in PostgreSQL |
 | Budgets | `maxTurns: 1`, `maxBudgetUsd: 1`, 3-minute timeout, one run at a time | Protects plan limits and the machine |
+| Streaming | `includePartialMessages: true`; only `text_delta` events are passed on (thinking is skipped) | Real text as it is written, for the live view |
 | **Verified at start** | The session's `init` message must report `apiKeySource: "none"`, zero tools, zero MCP servers, `dontAsk`, and the requested model, or the run stops | Settings can also come from places Solas doesn't control (managed policy, a Console login). Solas checks the result instead of trusting its options |
 | Usage limits | A `rate_limit_event` that is `rejected`, or that shows paid extra usage (`isUsingOverage`), stops the run as `usage_limit` | No silent fall-through to paid usage |
 
 Smoke test, 2026-10-24: `apiKeySource: "none"`, `tools: 0`, `mcpServers: 0`,
 `permissionMode: "dontAsk"`, `model: "claude-opus-5-5"`, Claude Code 2.1.310.
 
-### 5.4 How a message becomes a reply (M3A)
+### 5.4 How a message becomes a reply (M3A, streaming since M3B)
 
 ```
 Browser                Web (Next.js)                       PostgreSQL         Worker
@@ -385,11 +395,12 @@ Browser                Web (Next.js)                       PostgreSQL         Wo
  │                   └ one transaction: conversation, user message,
  │                     run (pending) ───────────────────────▶ runs
  │ ◀── { conversationId, runId }
- │ poll getRunState every 1 s ─────────────────────────────▶ runs ◀── claim (= subquery, SKIP LOCKED)
- │   "Waiting for the worker…" / "… is responding · 0:12"          ├ load agent again (may have changed)
+ │ poll getRunState (1 s pending, 0.5 s running) ───────────▶ runs ◀── claim (= subquery, SKIP LOCKED)
+ │   "Waiting for the worker…" / text so far + "… is writing · 0:12" ├ load agent again (may have changed)
  │                                                                   ├ prompt = recent history + message
- │                                                                   ├ runtime.run({ instructions, prompt, model })
- │                                                                   │   (timeout 3 min; Stop polled every 1 s)
+ │                                                                   ├ runtime.run({ instructions, prompt, model }, onProgress)
+ │                                                                   │   onProgress → runs.partial_output (≤ every 300 ms)
+ │                                                                   │   heartbeat + Stop check every 1 s; timeout 3 min
  │                                                                   └ one transaction: assistant message,
  │                                                                     run completed (or failed / cancelled)
  │ terminal status → router.refresh() → server renders the saved reply
@@ -400,7 +411,79 @@ there on the next visit. Stop on a pending run cancels it at once; on a
 running run it sets `cancel_requested_at`, and the worker aborts within a
 second.
 
-### 5.5 Tools and permissions model (planned, M6)
+### 5.5 Conversation context (M3B)
+
+**Decision: PostgreSQL is the only memory.** Each run is a fresh Claude
+session. The worker rebuilds the conversation from the `messages` table and
+sends it with the new message (`src/server/runs/prompt.ts`):
+
+```
+Earlier messages in this conversation, oldest first:
+
+<user>
+My project uses Next.js and PostgreSQL.
+</user>
+<assistant>
+Understood. …
+</assistant>
+
+Reply to the user's new message:
+
+Which database library would you recommend for this project?
+```
+
+- **Bounded:** at most the last 20 messages and 60,000 characters; the oldest
+  are dropped first. Context never grows without limit.
+- **Isolated:** only messages of the run's own conversation are read, and the
+  agent is the conversation's agent. Tests check that two conversations, and
+  two agents, never see each other's messages.
+- **Honest:** only saved messages count. The partial text of a stopped or
+  failed reply is shown, but never used as context.
+- **Instructions:** the agent row is read when each run starts. An edit in
+  Agent Builder applies from the **next message** in every conversation,
+  including old ones. A reply already being written keeps the instructions
+  it started with.
+
+**Why not the SDK's session resume?** `resume: sessionId` replays a
+transcript that Claude Code stores as a file under `~/.claude/projects/`. That
+would put conversation content outside Solas's database (and outside its
+delete button), tie context to one machine's Claude Code folder, and need
+`persistSession: true`. Rebuilding from PostgreSQL keeps one source of truth
+that works the same after a restart, a move to a server, or a provider change.
+The cost: earlier turns are sent again on every message (more input tokens),
+and very old turns of a long conversation are forgotten.
+
+### 5.6 Run lifecycle and recovery (M3B)
+
+```
+            Stop                 claimed by a worker
+ pending ─────────▶ cancelled    pending ──────────────▶ running
+                                                         │  heartbeat every 1 s
+                                                         ├─▶ completed  (reply saved as a message)
+                                                         ├─▶ failed     (provider error, timeout, shutdown,
+                                                         │               or heartbeat stale for 30 s)
+                                                         └─▶ cancelled  (Stop, or conversation deleted)
+ failed / cancelled ── Retry (latest message only) ──▶ a new pending run for the same message
+```
+
+- **One run per conversation at a time.** A partial unique index allows only
+  one pending or running run per conversation.
+- **No duplicate messages.** The browser gives each message a
+  `client_message_id`; sending it again returns the first result. This also
+  covers two identical sends arriving at once.
+- **Never executed twice.** Claiming uses `FOR UPDATE SKIP LOCKED`.
+- **The browser doesn't matter.** Closing the tab cancels nothing: the run
+  belongs to the database and the worker.
+- **Worker restarts.**
+  - Pending runs simply wait and run.
+  - A run whose heartbeat is older than 30 s has lost its worker. On start,
+    and every 30 s, a worker marks such runs `failed` (`worker_stopped`).
+  - A live worker's runs are never touched, so a second worker is safe.
+- **No blind re-runs.** An interrupted run is not repeated automatically:
+  Claude may already have done (and counted) the work, and Solas can't verify
+  a result it never received. The owner decides with Retry.
+
+### 5.7 Tools and permissions model (planned, M6)
 
 Every agent has a **tool profile**:
 
@@ -423,8 +506,7 @@ not from trusting the model to ignore it.
 
 ### 6.1 Sending a message
 
-Built in M3A; see §5.4. M3B replaces polling with Server-Sent Events from
-`run_events`, so text appears while it is written.
+Built in M3A, streaming since M3B; see §5.4 to §5.6.
 
 ### 6.2 Approval (M7)
 
@@ -484,7 +566,6 @@ src/
 │  │  ├─ loading.tsx          skeleton shown while a page loads
 │  │  └─ settings/
 │  ├─ (auth)/login/           (M9)
-│  └─ api/runs/[runId]/events/route.ts   SSE (M5)
 ├─ components/
 │  ├─ ui/                     primitives: button, input, dialog, badge, kbd, skeleton, …
 │  ├─ shell/                  sidebar, top bar, breadcrumbs, mobile drawer, command menu
@@ -509,6 +590,7 @@ src/
 
 drizzle/                      generated SQL migrations (committed)          (M2A)
 scripts/agents.mts            dev-only CLI for the agent backend            (M2A)
+e2e/, playwright.config.ts    browser tests against their own database       (M3B)
 compose.yaml                  local PostgreSQL                              (M2A)
 drizzle.config.ts, vitest.config.mts, .env.example
 ```
@@ -539,7 +621,7 @@ Owner's devices ──(private network, e.g. Tailscale)──▶ Hetzner VPS
 | Unit | Vitest (since M2A) | Pure logic: validation, provider rules, host checks, error mapping |
 | Integration | Vitest + `solas_test` database (since M2A) | Agent service CRUD, constraints, persistence, database-down handling |
 | Runtime | A fake `AgentRuntime` (executor tests) and a fake SDK `query` (adapter tests) | Since M3A: instructions passed through, error mapping, refusals, timeouts, Stop, recovery, no Claude call |
-| End-to-end | Playwright (to be added) | Key flows once the MVP is stable |
+| End-to-end | Playwright (since M3B): `npm run test:e2e` builds the app and runs it on port 3100 against `solas_e2e_test`, which the tests fill directly | Conversations: navigation, reload, streaming, Markdown, rename, delete, duplicates, retry, keyboard, themes (contrast measured), mobile. No worker, so no Claude |
 | Manual | Per-milestone checklist | Both themes, keyboard only, 375px, real agent run |
 
 `src/test/global-setup.ts` creates `solas_test` if needed and applies

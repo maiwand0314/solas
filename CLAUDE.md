@@ -67,6 +67,7 @@ npm run worker       # the agent worker: runs agents (Claude). Start it next to 
 npm run lint         # ESLint
 npm run typecheck    # tsc --noEmit (run after a build or dev start; stale .next/types can mislead)
 npm test             # Vitest: unit + integration tests (needs db:up)
+npm run test:e2e     # Playwright browser tests: builds, then runs on port 3100 with its own database
 npm run build        # production build
 npm run agents -- list   # dev-only CLI for the agent backend (see scripts/agents.mts)
 ```

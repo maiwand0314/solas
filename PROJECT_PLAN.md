@@ -176,15 +176,29 @@ genuine Claude reply. It pulled forward the minimum of the old M3–M5:
 - Earlier turns are replayed as a transcript; no SDK session resume.
 - Dependency added (approved): `@anthropic-ai/claude-agent-sdk` 0.3.310.
 
-**M3B — Live output and readable replies** *(proposed)*
-Stream reply text while it is written (SDK partial messages → `run_events` →
-Server-Sent Events) instead of polling for the final answer. Render Markdown
-safely (dependency decision). Show when a usage limit resets.
-Concepts: SSE, append-only event logs, reconnecting streams, sanitizing HTML.
+**M3B — Persistent conversations, context, and streaming** *(done 2026-10-24)*
+- Conversations UI: a list beside the open conversation on wide screens,
+  rename and delete (with confirmation), timestamps, Markdown replies with
+  copyable code, and Retry for a failed or stopped reply.
+- Real streaming: SDK text deltas → `runs.partial_output` → the view polls
+  twice a second. No fake typing.
+- Context: bounded history rebuilt from PostgreSQL (last 20 messages /
+  60,000 characters). SDK session resume was evaluated and not used
+  (ARCHITECTURE §5.5).
+- Reliability:
+  - idempotent sends (`client_message_id`);
+  - worker heartbeats, and recovery that only touches runs whose worker is
+    gone;
+  - no automatic re-runs;
+  - deleting a conversation stops its reply.
+- Tests: Vitest 130 (fake providers) and Playwright 14 (own database, no
+  Claude).
+- Dependencies added (approved): `react-markdown`, `remark-gfm`, and
+  `@playwright/test` (dev).
 
 **M4 — Runs you can inspect** *(proposed)*
 A run history per agent and conversation: status, timing, tokens, errors.
-Rename and delete conversations.
+An agent's page lists its conversations.
 
 **M5 — MVP complete** *(proposed)*
 Review against the MVP success criteria: keyboard-only, 375 px, both themes,
@@ -235,8 +249,8 @@ execution for any future shell or code tools.
 | Validation library | ✓ M2A | Zod 4 |
 | Agent deletion once history exists | ✓ M3A | Cascade: deleting an agent deletes its conversations (the dialog says so). Archive can come later |
 | How the worker runs TypeScript | ✓ M3A | `tsx` (already a dev dependency), like the agents CLI |
-| Conversation continuity | ✓ M3A (revisit) | Replay stored history (last 20 messages / 60,000 characters). SDK session resume would write transcripts into `~/.claude` |
-| Test tooling | ✓ M2A | Vitest (unit + integration). Playwright for key UI flows later |
+| Conversation continuity | ✓ M3B | Rebuild bounded history from PostgreSQL (last 20 messages / 60,000 characters). SDK session resume rejected: transcripts would live in `~/.claude`, outside Solas's database and its delete button. Revisit with summaries if long conversations need more memory |
+| Test tooling | ✓ M2A, M3B | Vitest (unit + integration); Playwright browser tests since M3B (`npm run test:e2e`) |
 | Hosted runtime credentials | M10 | Re-check terms; API key by default for hosted use |
 | Hosting cost and setup | M10 | Explicit approval required |
 | Final name, logo, brand | Later | Typographic wordmark until then |

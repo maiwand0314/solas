@@ -508,3 +508,154 @@ credits.
   session resume worth writing transcripts into `~/.claude`?
 - `input_tokens` from the SDK result was 2: it counts only uncached input.
   Track cache tokens too, if usage becomes interesting.
+
+## M3B — Persistent conversations, context, and streaming (2026-10-24)
+
+**Built:** Conversations are now a place to work. An agent can have many
+of them. You can rename and delete them, and move between them from a list
+beside the open conversation. Replies appear while Claude writes them,
+rendered as Markdown. Everything survives a reload, a closed browser, and a
+worker restart. Sending twice never stores a message twice.
+
+**Concepts**
+- **How persistence works.** Every message is a row in PostgreSQL the moment
+  it is accepted. The page is only a view of those rows. Close the browser
+  and nothing is lost: the next visit reads the same rows.
+- **How messages are stored.**
+  - User and assistant messages are rows in `messages`, ordered by time.
+  - A reply is written only when it is complete. While Claude is still
+    writing, the text lives on the run (`partial_output`), not in the
+    conversation.
+  - Each user message carries a `client_message_id` chosen by the browser.
+- **How multi-turn context works.**
+  - Each run is a fresh Claude session.
+  - The worker rebuilds the conversation from the database: the last 20
+    messages, at most 60,000 characters, oldest dropped first. It sends them
+    before the new message.
+  - So "this project" is understood: the earlier "My project uses Next.js
+    and PostgreSQL" is in the prompt. The real test showed it. The second
+    reply began "For a typical Next.js + PostgreSQL project (stack per your
+    earlier message)…".
+- **Why not the SDK's session resume?** It keeps the conversation in a file
+  under `~/.claude`. Deleting a conversation in Solas wouldn't delete it,
+  and context would depend on one machine's folder. One source of truth (the
+  database) beats a second, hidden one. The cost: earlier turns are sent
+  again each time, and very long conversations forget their beginning.
+- **How instructions apply.** The agent row is read when each run starts.
+  Edit the instructions, and the next message in *any* conversation, old or
+  new, uses them. A reply already being written keeps the instructions it
+  started with.
+- **How the worker processes a conversation.**
+  1. It claims the oldest pending run.
+  2. It reloads the agent.
+  3. It rebuilds the context and calls Claude.
+  4. It saves the text every 300 ms while Claude writes.
+  5. It refreshes a heartbeat every second; the same query checks for Stop.
+  6. In one transaction, it saves the reply and marks the run completed.
+- **What happens when you close the browser.** Nothing changes for the run:
+  it belongs to the database and the worker. When you come back, the page
+  shows the run as it is now: still writing (with the text so far), done,
+  or failed.
+- **What happens when the worker crashes.** The run's heartbeat stops.
+  - After 30 s, any worker marks it `failed`: at start, and every 30 s while
+    it runs. The owner sees "The worker stopped… use Retry".
+  - It is **not** re-run automatically: Claude may already have done (and
+    counted) the work, and Solas can't verify a result it never got.
+  - Pending runs just wait and run when a worker is back.
+- **Session isolation.**
+  - Context comes only from the run's own conversation.
+  - The agent is the conversation's agent. The server also refuses a message
+    that claims a conversation belongs to a different agent.
+  - Claude itself runs in a fresh, settings-free session each time, so
+    nothing carries over between conversations except what Solas sends.
+- **How duplicate executions are prevented.** Four layers:
+  1. A client message ID: a repeated send returns the first result, even
+     two identical sends arriving at the same moment.
+  2. A partial unique index: one pending or running run per conversation.
+  3. `FOR UPDATE SKIP LOCKED` with a scalar subquery: one worker per run.
+  4. Recovery only touches runs whose heartbeat is stale, so a second worker
+     never steals a live run.
+- **Real streaming vs. fake streaming.** The SDK's `includePartialMessages`
+  gives the actual text deltas from the API. Solas saves them and the page
+  reads them. A typing animation over a finished answer would look the
+  same, and be a lie.
+- **Stick to bottom, politely.** The page follows new text only while you
+  are reading the end. Scroll up and it stays put; "Jump to latest" brings
+  you back. A real bug was found by screenshot: the end marker sat *above*
+  the sticky composer, so "the end" was 140 px short. Moving it below fixed
+  it, and a test now guards it.
+- **Testing in layers.**
+  - Vitest checks the logic with fake providers.
+  - Playwright checks the real app in a real browser, with its own database
+    and no worker.
+  - One controlled real run proves the whole chain.
+
+  Each layer catches what the others can't. Playwright found a real bug
+  too: copied code carried a trailing line break.
+
+**Files changed**
+- Database: `drizzle/0002_streaming_heartbeat_idempotency.sql`. It adds
+  three nullable columns and one unique index, and deletes nothing.
+- Engine:
+  - `runtime/types.ts` and `claude-agent-sdk.ts`: streaming;
+  - `runs/executor.ts`: heartbeat, stale recovery, saving partial output;
+  - `runs/config.ts`;
+  - `conversations/service.ts`: idempotent send, agent check, retry, rename,
+    delete;
+  - `worker/index.mts`: periodic recovery.
+- UI:
+  - `conversations/layout.tsx`: two panes;
+  - `conversation-view.tsx`;
+  - new `markdown.tsx`, `conversation-nav.tsx`, `conversation-actions.tsx`;
+  - `actions.ts`;
+  - the pages.
+- Tests:
+  - expanded `executor.test.ts`, `service.test.ts`, and the adapter tests;
+  - `e2e/` and `playwright.config.ts`;
+  - shared `src/test/global-setup.ts`.
+- `package.json`: three dependencies and `test:e2e`.
+- Docs.
+
+**How it was verified**
+- `lint`, `typecheck`, and `build` pass.
+- Vitest: 130 tests pass, three times in a row. They cover:
+  - multi-turn context (the "this project" example);
+  - isolation between conversations and between agents;
+  - latest instructions;
+  - streaming;
+  - restart and recovery, and that a live worker's run is not stolen;
+  - duplicates, including simultaneous ones;
+  - retry, rename, delete, and deleting mid-run;
+  - provider errors, timeouts, Stop, and disabled agents.
+- Playwright: 14 tests pass, three times in a row. They cover:
+  - navigation and reload, including a reply in progress;
+  - streaming display and Markdown, with copying code;
+  - keyboard-only rename, and delete with confirmation;
+  - double submit, failure and Retry, and disabled agents;
+  - composer keys and auto-scroll;
+  - light and dark themes (contrast measured at ≥ 4.5:1);
+  - mobile layout.
+- One real two-turn conversation with Research Assistant (Opus 5.5) through
+  the UI and worker:
+  - turn 1 took 6.7 s and turn 2 took 12.4 s (worker log);
+  - text visibly streamed in both turns;
+  - reply 2 used the context from turn 1;
+  - all 4 turns were there after a reload;
+  - `apiKeySource: "none"`, `tools: 0`.
+  My test script's own completion check was wrong and reported 240 s; the
+  worker log has the real timings.
+
+**Exercise**
+- Open a conversation, ask something long, and close the tab while it is
+  being written. Reopen it a minute later. What do you see, and which column
+  (`partial_output` or `messages`) did it come from?
+- Then stop the worker in the middle of a reply. How long until the UI says
+  the worker stopped, and why that long?
+
+**Questions to revisit**
+- Long conversations forget their beginning. Add a stored summary of older
+  turns, when it matters?
+- Polling at 0.5 s is fine for one owner. Is SSE (or LISTEN/NOTIFY) worth it
+  once tool calls need a live timeline?
+- Should the worker refuse to start when another worker is already running,
+  or is heartbeat safety enough?
