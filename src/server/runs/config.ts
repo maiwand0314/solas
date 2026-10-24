@@ -19,6 +19,17 @@ export const RUN_LIMITS = {
   recoveryIntervalMs: 30_000,
   /** At most this often, the reply written so far is saved for the browser. */
   progressWriteMs: 300,
+  /** Tool round trips allowed in one run, when the agent has tools. */
+  maxToolTurns: 10,
+  /** How long a tool call waits for the owner's approval before it expires. */
+  approvalTtlMs: 5 * 60_000,
+  /** How often a waiting tool call checks for the owner's decision. */
+  approvalPollMs: 500,
+  /**
+   * Claude Code's own limit per tool call. It must cover an approval wait plus
+   * the tool's run, or Claude Code would give up while the owner decides.
+   */
+  toolCallTimeoutMs: 6 * 60_000,
   /** Earlier messages included as context: at most this many… */
   historyMessages: 20,
   /** …and at most this many characters, dropping the oldest first. */

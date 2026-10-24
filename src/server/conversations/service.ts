@@ -8,10 +8,12 @@ import {
   conversations,
   messages,
   runs,
+  toolCalls,
   type AgentRow,
   type ConversationRow,
   type MessageRow,
   type RunRow,
+  type ToolCallRow,
 } from "@/server/db/schema";
 import { getAgentReadiness, providerRegistry, type ProviderRegistry } from "@/server/providers/registry";
 import { ConversationServiceError, fromDatabaseError, validationError } from "./errors";
@@ -32,6 +34,27 @@ export type RunState = Pick<
 
 export type SendResult = { conversationId: string; runId: string };
 
+/** A tool call as the conversation shows it. */
+export type ToolCallView = Pick<
+  ToolCallRow,
+  | "id"
+  | "runId"
+  | "toolId"
+  | "input"
+  | "inputSummary"
+  | "status"
+  | "requiresApproval"
+  | "approvalExpiresAt"
+  | "decidedAt"
+  | "resultSummary"
+  | "errorMessage"
+  | "createdAt"
+  | "finishedAt"
+>;
+
+/** A run's state plus its tool activity, as the live view polls it. */
+export type RunSnapshot = RunState & { toolCalls: ToolCallView[] };
+
 export type ConversationSummary = Pick<ConversationRow, "id" | "title" | "createdAt" | "updatedAt"> & {
   agentId: string;
   agentName: string;
@@ -42,6 +65,7 @@ export type ConversationThread = {
   agent: Pick<AgentRow, "id" | "name" | "role" | "enabled" | "providerId" | "modelId">;
   messages: MessageRow[];
   runs: RunState[];
+  toolCalls: ToolCallView[];
 };
 
 const runStateColumns = {
@@ -56,7 +80,24 @@ const runStateColumns = {
   finishedAt: runs.finishedAt,
 };
 
+const toolCallColumns = {
+  id: toolCalls.id,
+  runId: toolCalls.runId,
+  toolId: toolCalls.toolId,
+  input: toolCalls.input,
+  inputSummary: toolCalls.inputSummary,
+  status: toolCalls.status,
+  requiresApproval: toolCalls.requiresApproval,
+  approvalExpiresAt: toolCalls.approvalExpiresAt,
+  decidedAt: toolCalls.decidedAt,
+  resultSummary: toolCalls.resultSummary,
+  errorMessage: toolCalls.errorMessage,
+  createdAt: toolCalls.createdAt,
+  finishedAt: toolCalls.finishedAt,
+};
+
 const idSchema = z.uuid();
+const decisionSchema = z.enum(["approve", "reject"], { error: "Choose approve or reject." });
 const TITLE_LENGTH = 80;
 
 type Dependencies = {
@@ -227,7 +268,7 @@ export function createConversationService({ db, providers }: Dependencies) {
 
   async function get(id: unknown): Promise<ConversationThread> {
     const conversation = await getConversationRow(parse(idSchema, id));
-    const [agent, history, conversationRuns] = await Promise.all([
+    const [agent, history, conversationRuns, calls] = await Promise.all([
       getAgentRow(conversation.agentId),
       query(() =>
         db
@@ -243,6 +284,14 @@ export function createConversationService({ db, providers }: Dependencies) {
           .where(eq(runs.conversationId, conversation.id))
           .orderBy(asc(runs.createdAt)),
       ),
+      query(() =>
+        db
+          .select(toolCallColumns)
+          .from(toolCalls)
+          .innerJoin(runs, eq(runs.id, toolCalls.runId))
+          .where(eq(runs.conversationId, conversation.id))
+          .orderBy(asc(toolCalls.createdAt)),
+      ),
     ]);
     const { id: agentId, name, role, enabled, providerId, modelId } = agent;
     return {
@@ -250,14 +299,51 @@ export function createConversationService({ db, providers }: Dependencies) {
       agent: { id: agentId, name, role, enabled, providerId, modelId },
       messages: history,
       runs: conversationRuns,
+      toolCalls: calls,
     };
   }
 
-  async function getRun(id: unknown): Promise<RunState> {
+  async function getRun(id: unknown): Promise<RunSnapshot> {
     const runId = parse(idSchema, id);
     const [run] = await query(() => db.select(runStateColumns).from(runs).where(eq(runs.id, runId)).limit(1));
     if (!run) throw new ConversationServiceError("not_found", "This reply no longer exists.");
-    return run;
+    const calls = await query(() =>
+      db.select(toolCallColumns).from(toolCalls).where(eq(toolCalls.runId, runId)).orderBy(asc(toolCalls.createdAt)),
+    );
+    return { ...run, toolCalls: calls };
+  }
+
+  /**
+   * The owner's decision on a tool call waiting for approval. Only a call
+   * that is still waiting and not yet expired (by the database clock) can
+   * be decided; a decision applies to that one call and its exact input.
+   */
+  async function decideToolCall(id: unknown, decision: unknown): Promise<ToolCallView> {
+    const callId = parse(idSchema, id);
+    const choice = parse(decisionSchema, decision);
+    const [decided] = await query(() =>
+      db
+        .update(toolCalls)
+        .set({ status: choice === "approve" ? "approved" : "rejected", decidedAt: sql`now()` })
+        .where(
+          and(
+            eq(toolCalls.id, callId),
+            eq(toolCalls.status, "awaiting_approval"),
+            sql`${toolCalls.approvalExpiresAt} > now()`,
+          ),
+        )
+        .returning(toolCallColumns),
+    );
+    if (decided) return decided;
+
+    const [current] = await query(() => db.select(toolCallColumns).from(toolCalls).where(eq(toolCalls.id, callId)));
+    if (!current) throw new ConversationServiceError("not_found", "This request no longer exists.");
+    throw new ConversationServiceError(
+      "validation_failed",
+      current.status === "awaiting_approval" || current.status === "expired"
+        ? "This request has expired, so the action was not run."
+        : "This request was already decided.",
+    );
   }
 
   /**
@@ -314,7 +400,7 @@ export function createConversationService({ db, providers }: Dependencies) {
     }
   }
 
-  return { sendMessage, retryRun, rename, remove, list, get, getRun, cancelRun };
+  return { sendMessage, retryRun, rename, remove, list, get, getRun, cancelRun, decideToolCall };
 }
 
 function notFoundError() {

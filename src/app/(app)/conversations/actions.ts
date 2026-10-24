@@ -7,7 +7,13 @@
 import { revalidatePath } from "next/cache";
 import { toActionError, type ActionResult } from "@/server/actions/result";
 import { requireOwner } from "@/server/auth/owner";
-import { getConversationService, type RunState, type SendResult } from "@/server/conversations/service";
+import {
+  getConversationService,
+  type RunSnapshot,
+  type RunState,
+  type SendResult,
+  type ToolCallView,
+} from "@/server/conversations/service";
 
 /**
  * "all": the list and every conversation page. "list": only /conversations,
@@ -53,6 +59,14 @@ export async function cancelRun(runId: unknown): Promise<ActionResult<RunState>>
 }
 
 /** Polled by the conversation view while a reply is pending or running. */
-export async function getRunState(runId: unknown): Promise<ActionResult<RunState>> {
+export async function getRunState(runId: unknown): Promise<ActionResult<RunSnapshot>> {
   return guarded(() => getConversationService().getRun(runId), "none");
+}
+
+/**
+ * The owner approves or rejects one waiting tool call. The worker, which is
+ * waiting on that call, runs it only after "approve", with the exact input shown.
+ */
+export async function decideToolCall(callId: unknown, decision: unknown): Promise<ActionResult<ToolCallView>> {
+  return guarded(() => getConversationService().decideToolCall(callId, decision), "none");
 }

@@ -1,5 +1,6 @@
 import type { HookCallback, Options, query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import type { Logger } from "@/server/logger";
 import { buildRuntimeEnv, createClaudeAgentSdkRuntime } from "./claude-agent-sdk";
 import type { RunInput } from "./types";
@@ -12,6 +13,7 @@ const input: RunInput = {
   systemPrompt: "You are a careful research assistant.",
   prompt: "Explain supervised learning.",
   model: "claude-opus-5-5",
+  tools: [],
 };
 
 const init = {
@@ -52,7 +54,14 @@ function fakeQuery(script: unknown[] | ((options: Options) => AsyncGenerator<unk
 const silentLog: Logger = () => {};
 
 function runtimeWith(query: typeof sdkQuery, log: Logger = silentLog) {
-  return createClaudeAgentSdkRuntime({ workDir: "/tmp/solas-runtime-test", maxBudgetUsd: 1, log, query });
+  return createClaudeAgentSdkRuntime({
+    workDir: "/tmp/solas-runtime-test",
+    maxBudgetUsd: 1,
+    maxToolTurns: 10,
+    toolCallTimeoutMs: 360_000,
+    log,
+    query,
+  });
 }
 
 describe("query options", () => {
@@ -93,6 +102,65 @@ describe("query options", () => {
       { signal: new AbortController().signal },
     );
     expect(decision).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+  });
+});
+
+describe("tools", () => {
+  const clock = {
+    name: "current_time",
+    description: "Returns the time.",
+    inputShape: { timeZone: z.string().optional() },
+    invoke: async () => ({ text: "noon", isError: false }),
+  };
+  const withTools = { ...input, tools: [clock] };
+  const initWithTools = { ...init, tools: ["mcp__solas__current_time"], mcp_servers: [{ name: "solas", status: "connected" }] };
+
+  it("serves only the permitted Solas tools, through Solas's own MCP server", async () => {
+    const { query, calls } = fakeQuery([initWithTools, success]);
+    await runtimeWith(query).run(withTools, new AbortController().signal);
+    const options = calls[0].options;
+
+    expect(options.tools).toEqual([]); // still no built-in tools
+    expect(options.allowedTools).toEqual(["mcp__solas__current_time"]);
+    expect(Object.keys(options.mcpServers ?? {})).toEqual(["solas"]);
+    expect(options.mcpServers?.solas).toMatchObject({ type: "sdk", name: "solas" });
+    expect(options.permissionMode).toBe("dontAsk");
+    expect(options.maxTurns).toBe(10);
+  });
+
+  it("its hook allows the permitted tools and denies everything else", async () => {
+    const { query, calls } = fakeQuery([initWithTools, success]);
+    await runtimeWith(query).run(withTools, new AbortController().signal);
+    const hook = calls[0].options.hooks?.PreToolUse?.[0].hooks[0] as HookCallback;
+    const decide = (toolName: string) =>
+      hook({ hook_event_name: "PreToolUse", tool_name: toolName, tool_input: {} } as never, "id", {
+        signal: new AbortController().signal,
+      });
+
+    expect(await decide("mcp__solas__current_time")).toEqual({});
+    for (const forbidden of ["Bash", "Read", "WebFetch", "mcp__solas__read_workspace_file", "mcp__other__x"]) {
+      expect(await decide(forbidden)).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    }
+  });
+
+  it.each([
+    ["a built-in tool alongside", { tools: ["mcp__solas__current_time", "Bash"] }],
+    ["a missing tool", { tools: [] }],
+    ["another MCP server", { mcp_servers: [{ name: "solas" }, { name: "gmail" }] }],
+  ])("refuses a session that started with %s", async (_label, change) => {
+    const { query } = fakeQuery([{ ...initWithTools, ...change }, success]);
+    expect(await runtimeWith(query).run(withTools, new AbortController().signal)).toMatchObject({
+      status: "failed",
+      code: "unsafe_configuration",
+    });
+  });
+
+  it("without tools, offers no MCP server and keeps one turn", async () => {
+    const { query, calls } = fakeQuery([init, success]);
+    await runtimeWith(query).run(input, new AbortController().signal);
+    expect(calls[0].options.mcpServers).toEqual({});
+    expect(calls[0].options.allowedTools).toEqual([]);
+    expect(calls[0].options.maxTurns).toBe(1);
   });
 });
 

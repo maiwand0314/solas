@@ -2,7 +2,10 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { createConversationService } from "@/server/conversations/service";
 import { closeDatabase, createDatabase } from "@/server/db/client";
-import { agents, messages, runs } from "@/server/db/schema";
+import { agents, agentToolPermissions, messages, runs } from "@/server/db/schema";
+import { currentTimeTool } from "@/server/tools/builtin/current-time";
+import { createToolInvoker } from "@/server/tools/invoker";
+import { createToolRegistry } from "@/server/tools/registry";
 import type { Logger } from "@/server/logger";
 import type { OnProgress, RunInput, RunResult } from "@/server/runtime/types";
 import { createRunExecutor, type ExecutorLimits } from "./executor";
@@ -80,7 +83,12 @@ describe("executing a run", () => {
     expect(await executor.runOnce()).toBe(true);
 
     expect(inputs).toEqual([
-      { systemPrompt: buildSystemPrompt("Answer like a statistics professor."), prompt: "What is ML?", model: "fake-model" },
+      {
+        systemPrompt: buildSystemPrompt("Answer like a statistics professor."),
+        prompt: "What is ML?",
+        model: "fake-model",
+        tools: [], // no tools enabled, so none offered
+      },
     ]);
     expect(await runRow(runId)).toMatchObject({
       status: "completed",
@@ -361,6 +369,84 @@ describe("worker restarts and recovery", () => {
     expect(await restarted.recoverStaleRuns()).toBe(0);
     await restarted.runOnce();
     expect((await runRow(runId)).status).toBe("completed");
+  });
+});
+
+describe("tools in a run (worker integration)", () => {
+  const toolLimits = { approvalTtlMs: 5_000, approvalPollMs: 10 };
+  const clockRegistry = createToolRegistry([currentTimeTool]);
+  const invoker = createToolInvoker({ db, registry: clockRegistry, log: silentLog, limits: toolLimits, workspaceFor: async () => "/nonexistent" });
+
+  function executorWithTools(
+    behave: (input: RunInput, signal: AbortSignal) => Promise<RunResult>,
+    overrides: Partial<ExecutorLimits> = {},
+  ) {
+    const { runtime, inputs } = fakeRuntime(behave);
+    const executor = createRunExecutor({
+      db,
+      providers: testProviders,
+      runtimes: [runtime],
+      log: silentLog,
+      tools: invoker,
+      limits: { ...limits, ...overrides },
+    });
+    return { executor, inputs };
+  }
+
+  /** A fake model that calls current_time once and answers with the result. */
+  const askTheClock = async (input: RunInput) => {
+    const clock = input.tools.find((tool) => tool.name === "current_time");
+    if (!clock) return answer("I have no clock.");
+    const outcome = await clock.invoke({ timeZone: "UTC" });
+    return answer(outcome.isError ? `Tool failed: ${outcome.text}` : `The clock says ${outcome.text}`);
+  };
+
+  it("gives the model only the agent's tools, runs them through Solas, and saves the reply", async () => {
+    const agent = await insertAgent(db);
+    await db.insert(agentToolPermissions).values({ agentId: agent.id, toolId: "current_time", mode: "allow" });
+    const { conversationId, runId } = await conversations.sendMessage({ agentId: agent.id, content: "What time is it?" });
+    const { executor, inputs } = executorWithTools(askTheClock);
+
+    await executor.runOnce();
+    expect(inputs[0].tools.map((tool) => tool.name)).toEqual(["current_time"]);
+    expect(inputs[0].systemPrompt).toContain("only these tools: current_time");
+    const [reply] = (await conversations.get(conversationId)).messages.filter((message) => message.role === "assistant");
+    expect(reply.content).toContain('"timeZone":"UTC"');
+    expect((await conversations.getRun(runId)).toolCalls).toMatchObject([{ toolId: "current_time", status: "succeeded" }]);
+  });
+
+  it("applies a permission change from the next run on", async () => {
+    const agent = await insertAgent(db);
+    const { executor, inputs } = executorWithTools(askTheClock);
+    const { conversationId } = await conversations.sendMessage({ agentId: agent.id, content: "Time?" });
+    await executor.runOnce();
+
+    await db.insert(agentToolPermissions).values({ agentId: agent.id, toolId: "current_time", mode: "allow" });
+    await conversations.sendMessage({ conversationId, content: "Time now?" });
+    await executor.runOnce();
+
+    expect(inputs.map((input) => input.tools.length)).toEqual([0, 1]);
+  });
+
+  it("pauses the run's timeout while the owner decides, and keeps the conversation's context", async () => {
+    const agent = await insertAgent(db);
+    await db.insert(agentToolPermissions).values({ agentId: agent.id, toolId: "current_time", mode: "ask" });
+    const { conversationId } = await conversations.sendMessage({ agentId: agent.id, content: "My name is Alex." });
+    const { executor: plain } = executorWith(async () => answer("Hi Alex."));
+    await plain.runOnce();
+
+    const { runId } = await conversations.sendMessage({ conversationId, content: "What time is it?" });
+    // The run may take 150 ms, but the owner takes 400 ms to approve.
+    const { executor, inputs } = executorWithTools(askTheClock, { timeoutMs: 150 });
+    const execution = executor.runOnce();
+    let call;
+    while (!(call = (await conversations.getRun(runId)).toolCalls[0])) await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await conversations.decideToolCall(call.id, "approve");
+    await execution;
+
+    expect((await runRow(runId)).status).toBe("completed");
+    expect(inputs[0].prompt).toContain("<user>\nMy name is Alex.\n</user>");
   });
 });
 

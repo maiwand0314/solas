@@ -16,6 +16,8 @@ import { providerRegistry } from "@/server/providers/registry";
 import { RUN_LIMITS, prepareRuntimeDirectory } from "@/server/runs/config";
 import { createRunExecutor } from "@/server/runs/executor";
 import { createClaudeAgentSdkRuntime } from "@/server/runtime/claude-agent-sdk";
+import { createToolInvoker } from "@/server/tools/invoker";
+import { toolRegistry } from "@/server/tools/registry";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
@@ -31,9 +33,12 @@ const executor = createRunExecutor({
     createClaudeAgentSdkRuntime({
       workDir: prepareRuntimeDirectory(),
       maxBudgetUsd: RUN_LIMITS.maxBudgetUsd,
+      maxToolTurns: RUN_LIMITS.maxToolTurns,
+      toolCallTimeoutMs: RUN_LIMITS.toolCallTimeoutMs,
       log,
     }),
   ],
+  tools: createToolInvoker({ db, registry: toolRegistry, log, limits: RUN_LIMITS }),
   log,
 });
 

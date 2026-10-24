@@ -6,6 +6,7 @@ import { agents, conversations, messages, runs, type RunRow, type RunStatus } fr
 import { truncate, type Logger } from "@/server/logger";
 import { getAgentReadiness, type ProviderRegistry } from "@/server/providers/registry";
 import type { AgentRuntime, RunUsage } from "@/server/runtime/types";
+import type { ToolInvoker } from "@/server/tools/invoker";
 import { RUN_LIMITS } from "./config";
 import { buildPrompt, buildSystemPrompt } from "./prompt";
 
@@ -34,10 +35,12 @@ type Dependencies = {
   /** One runtime per provider ID. */
   runtimes: AgentRuntime[];
   log: Logger;
+  /** Turns an agent's permissions into runnable tools. Without it, no agent gets tools. */
+  tools?: ToolInvoker;
   limits?: ExecutorLimits;
 };
 
-export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_LIMITS }: Dependencies) {
+export function createRunExecutor({ db, providers, runtimes, log, tools, limits = RUN_LIMITS }: Dependencies) {
   const runtimeFor = new Map(runtimes.map((runtime) => [runtime.providerId, runtime]));
   // The run in progress, so a shutdown can stop it. One at a time by design.
   let stopActiveRun: ((reason: StopReason) => void) | null = null;
@@ -187,7 +190,8 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
       controller.abort();
     };
     const stillRunning = and(eq(runs.id, run.id), eq(runs.status, "running"));
-    const timer = setTimeout(() => stop("timeout"), limits.timeoutMs);
+    // The run's clock, paused while a tool call waits for the owner's approval.
+    const deadline = createDeadline(limits.timeoutMs, () => stop("timeout"));
     // Once a second: prove this worker is alive, and learn whether the owner
     // pressed Stop. No row means the run was deleted (with its conversation)
     // or taken over by recovery: either way, stop working on it.
@@ -225,8 +229,17 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
     stopActiveRun = stop;
 
     try {
+      // The agent's permitted tools, read now: a change in Agent Builder applies from this run on.
+      const runTools =
+        (await tools?.toolsForRun({
+          runId: run.id,
+          agentId: agent.id,
+          signal: controller.signal,
+          onApprovalWait: (waiting) => (waiting ? deadline.pause() : deadline.resume()),
+        })) ?? [];
+      const toolNames = runTools.map((tool) => tool.name);
       const result = await runtime.run(
-        { systemPrompt: buildSystemPrompt(agent.instructions), prompt, model: agent.modelId! },
+        { systemPrompt: buildSystemPrompt(agent.instructions, toolNames), prompt, model: agent.modelId!, tools: runTools },
         controller.signal,
         onProgress,
       );
@@ -237,7 +250,7 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
       }
       return stopped(stopReason ?? "cancelled");
     } finally {
-      clearTimeout(timer);
+      deadline.clear();
       clearInterval(heartbeat);
       clearInterval(progressWriter);
       stopActiveRun = null;
@@ -333,6 +346,30 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
 }
 
 type StopReason = "timeout" | "cancelled" | "shutdown" | "gone";
+
+/** A timeout that can pause (while the owner decides on an approval) and resume. */
+function createDeadline(ms: number, onExpire: () => void) {
+  let remaining = ms;
+  let since = Date.now();
+  let paused = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(onExpire, ms);
+  return {
+    pause() {
+      if (paused++ > 0) return;
+      clearTimeout(timer);
+      remaining -= Date.now() - since;
+    },
+    resume() {
+      if (--paused > 0) return;
+      since = Date.now();
+      timer = setTimeout(onExpire, Math.max(0, remaining));
+    },
+    clear() {
+      clearTimeout(timer);
+      timer = undefined;
+    },
+  };
+}
 
 function failed(code: string, message: string): Outcome {
   return { status: "failed", code, message };

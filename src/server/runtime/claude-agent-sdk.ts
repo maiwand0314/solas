@@ -1,6 +1,8 @@
 import "server-only";
 import {
+  createSdkMcpServer,
   query as sdkQuery,
+  tool as sdkTool,
   type HookCallback,
   type Options,
   type SDKAssistantMessageError,
@@ -9,15 +11,17 @@ import {
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { truncate, type Logger } from "@/server/logger";
-import type { AgentRuntime, OnProgress, RunErrorCode, RunInput, RunResult } from "./types";
+import type { AgentRuntime, OnProgress, RunErrorCode, RunInput, RunResult, RuntimeTool } from "./types";
 
 // The Claude adapter. It runs the official Claude Agent SDK, which starts the
 // unmodified Claude Code binary bundled with it. That binary signs in with the
 // owner's own Claude login on this Mac; Solas never sees or handles a credential.
 //
 // Everything Claude Code can do beyond answering is switched off here and then
-// checked again when the session starts (see verifySession). This milestone is
-// conversation only: no tools, no files, no shell, no MCP servers.
+// checked again when the session starts (see verifySession). Its built-in
+// tools (shell, files, web) are never available. The only tools are the ones
+// Solas passes in RunInput.tools, served by an in-process MCP server named
+// "solas" whose handlers are Solas's own permission-checked invoke functions.
 
 export const CLAUDE_PROVIDER_ID = "claude-agent-sdk";
 
@@ -46,19 +50,56 @@ export function buildRuntimeEnv(source: Record<string, string | undefined>): Rec
   };
 }
 
-/** A hook that refuses every tool call. Hooks run first and hold in every mode. */
-const denyAllTools: HookCallback = async () => ({
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "deny",
-    permissionDecisionReason: "Tools are disabled for Solas agents.",
-  },
-});
+/** The MCP server name; Claude Code calls its tools "mcp__solas__<tool>". */
+export const SOLAS_MCP_SERVER = "solas";
+export const toolNameForModel = (tool: Pick<RuntimeTool, "name">) => `mcp__${SOLAS_MCP_SERVER}__${tool.name}`;
 
-export function buildQueryOptions(
-  input: RunInput,
-  settings: { workDir: string; maxBudgetUsd: number; abortController: AbortController; stderr: (data: string) => void },
-): Options {
+/**
+ * A hook that refuses every tool call except the given names. Hooks run
+ * before Claude Code's own permission checks and hold in every mode.
+ */
+function onlyAllow(names: string[]): HookCallback {
+  const allowed = new Set(names);
+  return async (input) => {
+    if (input.hook_event_name === "PreToolUse" && allowed.has(input.tool_name)) return {};
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: "This tool is not enabled for this Solas agent.",
+      },
+    };
+  };
+}
+
+/** Serves the run's tools in-process. Each handler is Solas's invoke(), which enforces permissions. */
+function solasToolServer(tools: RuntimeTool[], timeoutMs: number) {
+  return createSdkMcpServer({
+    name: SOLAS_MCP_SERVER,
+    version: "0.1.0",
+    timeout: timeoutMs,
+    tools: tools.map((tool) =>
+      sdkTool(tool.name, tool.description, tool.inputShape, async (args) => {
+        const outcome = await tool.invoke(args);
+        return { content: [{ type: "text", text: outcome.text }], isError: outcome.isError };
+      }),
+    ),
+  });
+}
+
+export type QuerySettings = {
+  workDir: string;
+  maxBudgetUsd: number;
+  /** Turns allowed when tools are available (each tool round trip is a turn). */
+  maxToolTurns: number;
+  /** Per-call limit for Solas tools; must cover a wait for approval. */
+  toolCallTimeoutMs: number;
+  abortController: AbortController;
+  stderr: (data: string) => void;
+};
+
+export function buildQueryOptions(input: RunInput, settings: QuerySettings): Options {
+  const toolNames = input.tools.map(toolNameForModel);
   return {
     model: input.model,
     // A plain string replaces Claude Code's own system prompt entirely, so the
@@ -67,24 +108,25 @@ export function buildQueryOptions(
     // An empty directory outside the repository; nothing for the agent to find.
     cwd: settings.workDir,
     env: buildRuntimeEnv(process.env),
-    // No built-in tools at all, nothing pre-approved, and anything else is
-    // denied without asking. Never "bypassPermissions".
+    // No built-in tools at all. Only the agent's permitted Solas tools are
+    // pre-approved; anything else is denied without asking. Never "bypassPermissions".
     tools: [],
-    allowedTools: [],
+    allowedTools: toolNames,
     permissionMode: "dontAsk",
-    hooks: { PreToolUse: [{ hooks: [denyAllTools] }] },
+    hooks: { PreToolUse: [{ hooks: [onlyAllow(toolNames)] }] },
     // Ignore the owner's ~/.claude settings, CLAUDE.md, skills, and plugins,
-    // and every MCP server except the (empty) list given here.
+    // and every MCP server except Solas's own (only when there are tools).
     settingSources: [],
     strictMcpConfig: true,
-    mcpServers: {},
+    mcpServers:
+      input.tools.length > 0 ? { [SOLAS_MCP_SERVER]: solasToolServer(input.tools, settings.toolCallTimeoutMs) } : {},
     // Don't write session transcripts to ~/.claude/projects. Solas keeps its
     // own history in PostgreSQL.
     persistSession: false,
     // Stream text as Claude writes it (real deltas from the API).
     includePartialMessages: true,
-    // One answer, no tool round trips.
-    maxTurns: 1,
+    // One answer; with tools, a bounded number of tool round trips.
+    maxTurns: input.tools.length > 0 ? settings.maxToolTurns : 1,
     // A safety cap on Claude Code's own cost estimate for a single run.
     maxBudgetUsd: settings.maxBudgetUsd,
     abortController: settings.abortController,
@@ -92,15 +134,13 @@ export function buildQueryOptions(
   };
 }
 
-type Dependencies = {
-  workDir: string;
-  maxBudgetUsd: number;
+type Dependencies = Pick<QuerySettings, "workDir" | "maxBudgetUsd" | "maxToolTurns" | "toolCallTimeoutMs"> & {
   log: Logger;
   /** The SDK's query function; tests pass a fake. */
   query?: typeof sdkQuery;
 };
 
-export function createClaudeAgentSdkRuntime({ workDir, maxBudgetUsd, log, query = sdkQuery }: Dependencies): AgentRuntime {
+export function createClaudeAgentSdkRuntime({ log, query = sdkQuery, ...settings }: Dependencies): AgentRuntime {
   async function run(input: RunInput, signal: AbortSignal, onProgress?: OnProgress): Promise<RunResult> {
     if (signal.aborted) return { status: "aborted" };
 
@@ -116,7 +156,7 @@ export function createClaudeAgentSdkRuntime({ workDir, maxBudgetUsd, log, query 
 
     const session = query({
       prompt: input.prompt,
-      options: buildQueryOptions(input, { workDir, maxBudgetUsd, abortController, stderr }),
+      options: buildQueryOptions(input, { ...settings, abortController, stderr }),
     });
 
     let assistantError: SDKAssistantMessageError | undefined;
@@ -127,12 +167,12 @@ export function createClaudeAgentSdkRuntime({ workDir, maxBudgetUsd, log, query 
     try {
       for await (const message of session) {
         if (message.type === "system" && message.subtype === "init") {
-          const problem = verifySession(message, input.model);
+          const problem = verifySession(message, input.model, input.tools.map(toolNameForModel));
           // An audit line for every session: how Claude actually started.
           log("info", "runtime.session_started", {
             apiKeySource: message.apiKeySource,
             model: message.model,
-            tools: message.tools.length,
+            tools: message.tools.join(",") || "none",
             mcpServers: message.mcp_servers.length,
             permissionMode: message.permissionMode,
             claudeCodeVersion: message.claude_code_version,
@@ -198,6 +238,7 @@ type SessionProblem = { code: RunErrorCode; message: string; detail: string };
 export function verifySession(
   init: Extract<SDKMessage, { type: "system"; subtype: "init" }>,
   requestedModel: string,
+  expectedTools: string[] = [],
 ): SessionProblem | null {
   // "none" means no API key is in play: requests use the subscription login.
   if (init.apiKeySource !== "none") {
@@ -207,11 +248,16 @@ export function verifySession(
       detail: `apiKeySource=${init.apiKeySource}`,
     };
   }
-  if (init.tools.length > 0 || init.mcp_servers.length > 0 || init.permissionMode !== "dontAsk") {
+  // Exactly the tools Solas registered: no built-in tool, no extra MCP tool.
+  const sameTools =
+    init.tools.length === expectedTools.length && init.tools.every((name) => expectedTools.includes(name));
+  const servers = init.mcp_servers.map((server) => server.name);
+  const onlySolasServer = expectedTools.length === 0 ? servers.length === 0 : servers.every((name) => name === SOLAS_MCP_SERVER);
+  if (!sameTools || !onlySolasServer || init.permissionMode !== "dontAsk") {
     return {
       code: "unsafe_configuration",
       message: MESSAGES.unsafe_configuration,
-      detail: `tools=${init.tools.length} mcp=${init.mcp_servers.length} mode=${init.permissionMode}`,
+      detail: truncate(`tools=[${init.tools.join(",")}] mcp=[${servers.join(",")}] mode=${init.permissionMode}`, 300),
     };
   }
   if (init.model !== requestedModel) {

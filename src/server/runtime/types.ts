@@ -1,6 +1,25 @@
+import type { z } from "zod";
+
 // The contract between Solas and any AI provider. The executor (and through
 // it the worker) only knows these types; each provider has an adapter that
 // turns them into its own SDK calls. SDK types never leave the adapter.
+
+/**
+ * A tool the agent may call in this run, as any provider sees it. Solas
+ * builds these from the agent's permissions; `invoke` runs the full check
+ * (permission, validation, approval, limits) every time it is called.
+ */
+export type RuntimeTool = {
+  /** The tool's ID, also the name the model calls it by. */
+  name: string;
+  description: string;
+  /** The input fields, as a Zod object shape (converted to JSON Schema by the adapter). */
+  inputShape: z.ZodRawShape;
+  invoke(input: unknown): Promise<ToolCallOutcome>;
+};
+
+/** What goes back to the model: the result, or an error it can read and react to. */
+export type ToolCallOutcome = { text: string; isError: boolean };
 
 /** What one execution needs: who the agent is, what it's asked, which model. */
 export type RunInput = {
@@ -10,6 +29,8 @@ export type RunInput = {
   prompt: string;
   /** A model ID from the provider registry, e.g. "claude-opus-5-5". */
   model: string;
+  /** The only tools the model can use; empty means none at all. */
+  tools: RuntimeTool[];
 };
 
 /**
