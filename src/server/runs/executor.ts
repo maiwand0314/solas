@@ -1,12 +1,13 @@
 import "server-only";
 import { and, asc, eq, sql } from "drizzle-orm";
 import type { Database } from "@/server/db/client";
+import { classifyDatabaseError } from "@/server/db/errors";
 import { agents, conversations, messages, runs, type RunRow, type RunStatus } from "@/server/db/schema";
 import { truncate, type Logger } from "@/server/logger";
 import { getAgentReadiness, type ProviderRegistry } from "@/server/providers/registry";
 import type { AgentRuntime, RunUsage } from "@/server/runtime/types";
 import { RUN_LIMITS } from "./config";
-import { buildPrompt } from "./prompt";
+import { buildPrompt, buildSystemPrompt } from "./prompt";
 
 // The worker's side of a run: claim a pending run, load the agent from
 // PostgreSQL, call the agent's provider through the AgentRuntime interface,
@@ -40,6 +41,8 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
   const runtimeFor = new Map(runtimes.map((runtime) => [runtime.providerId, runtime]));
   // The run in progress, so a shutdown can stop it. One at a time by design.
   let stopActiveRun: ((reason: StopReason) => void) | null = null;
+  // Runs this executor is working on right now.
+  const executing = new Set<string>();
 
   /**
    * The recovery policy for interrupted runs. A run is "running" only while a
@@ -104,9 +107,37 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
     return true;
   }
 
-  async function executeRun(run: RunRow): Promise<RunStatus> {
-    const startedAt = Date.now();
+  /**
+   * Executes a claimed run once. A run handed over a second time (already
+   * executing here, or no longer "running" in the database) is skipped
+   * without calling the provider: one message, one execution. Between
+   * processes, claimNextRun already guarantees a single owner.
+   */
+  async function executeRun(run: RunRow): Promise<RunStatus | "skipped"> {
     const fields = { runId: run.id, agentId: run.agentId, conversationId: run.conversationId };
+    // Mark it before awaiting anything, so a second call in the same tick sees it.
+    if (executing.has(run.id)) return skipped(fields);
+    executing.add(run.id);
+    try {
+      if (!(await isStillRunning(run.id))) return skipped(fields);
+      return await execute(run, fields);
+    } finally {
+      executing.delete(run.id);
+    }
+  }
+
+  function skipped(fields: Record<string, string>): "skipped" {
+    log("warn", "run.skipped_duplicate", fields);
+    return "skipped";
+  }
+
+  async function isStillRunning(runId: string): Promise<boolean> {
+    const [row] = await db.select({ status: runs.status }).from(runs).where(eq(runs.id, runId)).limit(1);
+    return row?.status === "running";
+  }
+
+  async function execute(run: RunRow, fields: Record<string, string>): Promise<RunStatus> {
+    const startedAt = Date.now();
     log("info", "run.started", fields);
 
     // The latest reply text the runtime has sent, kept for a failed or stopped run.
@@ -195,7 +226,7 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
 
     try {
       const result = await runtime.run(
-        { systemPrompt: agent.instructions, prompt, model: agent.modelId! },
+        { systemPrompt: buildSystemPrompt(agent.instructions), prompt, model: agent.modelId! },
         controller.signal,
         onProgress,
       );
@@ -241,6 +272,19 @@ export function createRunExecutor({ db, providers, runtimes, log, limits = RUN_L
    * run that was deleted (with its agent or conversation) is left alone.
    */
   async function finish(run: RunRow, outcome: Outcome, partialText: string | null): Promise<boolean> {
+    try {
+      return await saveOutcome(run, outcome, partialText);
+    } catch (error) {
+      // The database refused a second reply for this run: it is already saved.
+      if (classifyDatabaseError(error).kind === "unique_violation") {
+        log("warn", "run.reply_already_saved", { runId: run.id });
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  async function saveOutcome(run: RunRow, outcome: Outcome, partialText: string | null): Promise<boolean> {
     return db.transaction(async (tx) => {
       const stillRunning = and(eq(runs.id, run.id), eq(runs.status, "running"));
       if (outcome.status === "completed") {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildPrompt, type HistoryMessage } from "./prompt";
+import { buildPrompt, buildSystemPrompt, RUNTIME_NOTE, type HistoryMessage } from "./prompt";
 
 const limits = { historyMessages: 20, historyCharacters: 1_000 };
 
@@ -40,5 +40,19 @@ describe("buildPrompt", () => {
     expect(prompt).not.toContain("message 2");
     expect(prompt).toContain("message 3");
     expect(prompt).toContain("message 4");
+  });
+});
+
+describe("buildSystemPrompt", () => {
+  it("puts the runtime note first and keeps the agent's instructions unchanged", () => {
+    const instructions = "Research topics.\nCite every claim.";
+    const prompt = buildSystemPrompt(instructions);
+    expect(prompt.startsWith(RUNTIME_NOTE)).toBe(true);
+    expect(prompt.endsWith(`\n\n${instructions}`)).toBe(true);
+  });
+
+  it("tells the truth about the runtime: no tools, and the environment is an empty sandbox", () => {
+    expect(RUNTIME_NOTE).toContain("you have no tools");
+    expect(RUNTIME_NOTE).toContain("empty sandbox");
   });
 });

@@ -2,10 +2,11 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { createConversationService } from "@/server/conversations/service";
 import { closeDatabase, createDatabase } from "@/server/db/client";
-import { agents, runs } from "@/server/db/schema";
+import { agents, messages, runs } from "@/server/db/schema";
 import type { Logger } from "@/server/logger";
 import type { OnProgress, RunInput, RunResult } from "@/server/runtime/types";
 import { createRunExecutor, type ExecutorLimits } from "./executor";
+import { buildSystemPrompt } from "./prompt";
 import { fakeRuntime, insertAgent, testProviders, untilAborted } from "./test-helpers";
 
 // Integration tests for the worker's side, against the test database, with a
@@ -78,7 +79,9 @@ describe("executing a run", () => {
 
     expect(await executor.runOnce()).toBe(true);
 
-    expect(inputs).toEqual([{ systemPrompt: "Answer like a statistics professor.", prompt: "What is ML?", model: "fake-model" }]);
+    expect(inputs).toEqual([
+      { systemPrompt: buildSystemPrompt("Answer like a statistics professor."), prompt: "What is ML?", model: "fake-model" },
+    ]);
     expect(await runRow(runId)).toMatchObject({
       status: "completed",
       modelId: "fake-model",
@@ -100,7 +103,7 @@ describe("executing a run", () => {
     const { executor, inputs } = executorWith(async () => answer("Rain…"));
 
     await executor.runOnce();
-    expect(inputs[0].systemPrompt).toBe("Write short poems.");
+    expect(inputs[0].systemPrompt).toBe(buildSystemPrompt("Write short poems."));
   });
 
   it("uses the agent's latest saved instructions, even in an existing conversation", async () => {
@@ -113,7 +116,10 @@ describe("executing a run", () => {
     await conversations.sendMessage({ conversationId, content: "Again" });
     await executor.runOnce();
 
-    expect(inputs.map((input) => input.systemPrompt)).toEqual(["Version one.", "Version two."]);
+    expect(inputs.map((input) => input.systemPrompt)).toEqual([
+      buildSystemPrompt("Version one."),
+      buildSystemPrompt("Version two."),
+    ]);
   });
 
   it("records a provider failure with its code and message, and no reply", async () => {
@@ -207,7 +213,7 @@ describe("multi-turn context", () => {
     await conversations.sendMessage({ conversationId, content: "More" });
     await executor.runOnce();
 
-    expect(inputs[2].systemPrompt).toBe("Write.");
+    expect(inputs[2].systemPrompt).toBe(buildSystemPrompt("Write."));
     expect(inputs[2].prompt).not.toContain("Researcher topic");
   });
 });
@@ -355,6 +361,131 @@ describe("worker restarts and recovery", () => {
     expect(await restarted.recoverStaleRuns()).toBe(0);
     await restarted.runOnce();
     expect((await runRow(runId)).status).toBe("completed");
+  });
+});
+
+describe("no duplicate replies (regression, M3B)", () => {
+  async function assistantReplies(conversationId: string) {
+    return (await conversations.get(conversationId)).messages.filter((message) => message.role === "assistant");
+  }
+
+  it("one message gives one execution and one saved reply", async () => {
+    const agent = await insertAgent(db);
+    const { conversationId } = await conversations.sendMessage({ agentId: agent.id, content: "Hi" });
+    const { executor, inputs } = executorWith(async () => answer("Hello"));
+
+    await executor.runOnce();
+    expect(await executor.runOnce()).toBe(false);
+    expect(inputs).toHaveLength(1);
+    expect((await assistantReplies(conversationId)).map((message) => message.content)).toEqual(["Hello"]);
+  });
+
+  it("a run delivered to the executor again is skipped, without calling the provider", async () => {
+    const agent = await insertAgent(db);
+    const { conversationId } = await conversations.sendMessage({ agentId: agent.id, content: "Hi" });
+    const { executor, inputs } = executorWith(async () => answer("Hello"));
+
+    const run = (await executor.claimNextRun())!;
+    expect(await executor.executeRun(run)).toBe("completed");
+    expect(await executor.executeRun(run)).toBe("skipped"); // a repeated completion event
+    expect(inputs).toHaveLength(1);
+    expect(await assistantReplies(conversationId)).toHaveLength(1);
+  });
+
+  it("the same claimed run given twice at once is executed once", async () => {
+    const agent = await insertAgent(db);
+    const { conversationId } = await conversations.sendMessage({ agentId: agent.id, content: "Hi" });
+    const { executor, inputs } = executorWith(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return answer("Hello");
+    });
+
+    const run = (await executor.claimNextRun())!;
+    const results = await Promise.all([executor.executeRun(run), executor.executeRun(run)]);
+    expect(results.sort()).toEqual(["completed", "skipped"]);
+    expect(inputs).toHaveLength(1);
+    expect(await assistantReplies(conversationId)).toHaveLength(1);
+  });
+
+  it("two workers racing for one pending run: one execution, one reply", async () => {
+    const agent = await insertAgent(db);
+    const { conversationId } = await conversations.sendMessage({ agentId: agent.id, content: "Hi" });
+    const workerA = executorWith(async () => answer("From A"));
+    const workerB = executorWith(async () => answer("From B"));
+
+    await Promise.all([workerA.executor.runOnce(), workerB.executor.runOnce()]);
+    expect(workerA.inputs.length + workerB.inputs.length).toBe(1);
+    expect(await assistantReplies(conversationId)).toHaveLength(1);
+  });
+
+  it("the database itself refuses a second reply for the same run", async () => {
+    const agent = await insertAgent(db);
+    const { conversationId, runId } = await conversations.sendMessage({ agentId: agent.id, content: "Hi" });
+    const { executor } = executorWith(async () => answer("Hello"));
+    await executor.runOnce();
+
+    const duplicate = await db
+      .insert(messages)
+      .values({ conversationId, role: "assistant", content: "Hello", runId })
+      .then(() => null, (error: unknown) => error);
+    expect(duplicate).not.toBeNull();
+    expect(await assistantReplies(conversationId)).toHaveLength(1);
+  });
+
+  it("a retry after a failure ends with exactly one reply for that message", async () => {
+    const agent = await insertAgent(db);
+    const { conversationId, runId } = await conversations.sendMessage({ agentId: agent.id, content: "Hi" });
+    let attempt = 0;
+    const { executor } = executorWith(async () =>
+      ++attempt === 1 ? { status: "failed", code: "provider_unavailable", message: "Busy." } : answer("Second try"),
+    );
+    await executor.runOnce();
+    await conversations.retryRun(runId);
+    await executor.runOnce();
+
+    const thread = await conversations.get(conversationId);
+    expect(thread.messages.map((message) => message.content)).toEqual(["Hi", "Second try"]);
+    expect(thread.runs.map((run) => run.status)).toEqual(["failed", "completed"]);
+  });
+
+  it("after a worker restart, a recovered run never gains a reply, and pending runs get exactly one", async () => {
+    const agent = await insertAgent(db);
+    const stuck = await conversations.sendMessage({ agentId: agent.id, content: "Interrupted" });
+    await db
+      .update(runs)
+      .set({ status: "running", heartbeatAt: sql`now() - interval '5 minutes'` })
+      .where(eq(runs.id, stuck.runId));
+    const waiting = await conversations.sendMessage({ agentId: agent.id, content: "Waiting" });
+    const { executor: restarted } = executorWith(async () => answer("Answer"));
+
+    await restarted.recoverStaleRuns();
+    while (await restarted.runOnce());
+    expect(await assistantReplies(stuck.conversationId)).toHaveLength(0);
+    expect(await assistantReplies(waiting.conversationId)).toHaveLength(1);
+  });
+
+  it("several turns in one conversation: each message has one reply, and the history repeats nothing", async () => {
+    const agent = await insertAgent(db);
+    const { executor, inputs } = executorWith(async (input) => answer(`Reply ${input.prompt.slice(-1)}`));
+    const { conversationId } = await conversations.sendMessage({ agentId: agent.id, content: "Turn 1" });
+    await executor.runOnce();
+    for (const turn of [2, 3]) {
+      await conversations.sendMessage({ conversationId, content: `Turn ${turn}` });
+      await executor.runOnce();
+    }
+
+    const thread = await conversations.get(conversationId);
+    expect(thread.messages.map((message) => message.content)).toEqual([
+      "Turn 1",
+      "Reply 1",
+      "Turn 2",
+      "Reply 2",
+      "Turn 3",
+      "Reply 3",
+    ]);
+    const lastPrompt = inputs[2].prompt;
+    expect(lastPrompt.match(/Reply 1/g)).toHaveLength(1);
+    expect(lastPrompt.match(/Reply 2/g)).toHaveLength(1);
   });
 });
 
