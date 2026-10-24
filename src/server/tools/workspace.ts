@@ -22,6 +22,13 @@ export function agentWorkspaceDir(agentId: string, root = workspacesRoot()): str
   return path.join(root, agentId);
 }
 
+/** The workspace path as the owner would type it, with "~" for the home folder. */
+export function displayWorkspacePath(agentId: string | null, root = workspacesRoot()): string {
+  const full = agentId ? agentWorkspaceDir(agentId, root) : path.join(root, "<agent-id>");
+  const home = os.homedir();
+  return full.startsWith(home + path.sep) ? `~${full.slice(home.length)}` : full;
+}
+
 /**
  * Creates the workspace if needed, after checking that its root is a
  * dedicated directory: not the filesystem root, not the home directory, and

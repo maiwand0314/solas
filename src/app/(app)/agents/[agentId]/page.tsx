@@ -3,7 +3,10 @@ import { Suspense } from "react";
 import { AgentDetails } from "@/components/agents/agent-details";
 import { LoadError } from "@/components/load-error";
 import { AgentDetailsSkeleton } from "@/components/agents/agent-skeletons";
+import { getAgentToolsForOwner } from "@/server/agents/queries";
 import { describeModelSelection, providerRegistry } from "@/server/providers/registry";
+import { toolRegistry } from "@/server/tools/registry";
+import { displayWorkspacePath } from "@/server/tools/workspace";
 import { loadAgent } from "./load-agent";
 
 export const metadata: Metadata = {
@@ -23,7 +26,14 @@ async function AgentPageContent({ params }: Pick<PageProps<"/agents/[agentId]">,
   const { agentId } = await params;
   const result = await loadAgent(agentId);
   if ("error" in result) return <LoadError error={result.error} />;
+  const settings = await getAgentToolsForOwner(result.agent.id);
+  const tools = settings.map((setting) => ({ ...toolRegistry.get(setting.toolId)!, mode: setting.mode }));
   return (
-    <AgentDetails agent={result.agent} modelLabel={describeModelSelection(providerRegistry, result.agent)} />
+    <AgentDetails
+      agent={result.agent}
+      modelLabel={describeModelSelection(providerRegistry, result.agent)}
+      tools={tools.map(({ id, name, risk, approval, capability, mode }) => ({ id, name, risk, approval, capability, mode }))}
+      workspacePath={displayWorkspacePath(result.agent.id)}
+    />
   );
 }

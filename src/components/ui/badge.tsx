@@ -1,11 +1,13 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
-type BadgeTone = "neutral" | "success";
+type BadgeTone = "neutral" | "success" | "warning" | "danger";
 
 const dotClasses: Record<BadgeTone, string> = {
   neutral: "bg-subtle",
   success: "bg-success",
+  warning: "bg-warning",
+  danger: "bg-danger",
 };
 
 /** Small status label. The dot adds color, the text carries the meaning. */

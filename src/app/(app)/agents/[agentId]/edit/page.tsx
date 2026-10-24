@@ -5,7 +5,10 @@ import { LoadError } from "@/components/load-error";
 import { AgentDetailsSkeleton } from "@/components/agents/agent-skeletons";
 import { BackLink } from "@/components/agents/back-link";
 import { PageHeader } from "@/components/ui/page-header";
+import { getAgentToolsForOwner } from "@/server/agents/queries";
 import { providerRegistry } from "@/server/providers/registry";
+import { toolRegistry } from "@/server/tools/registry";
+import { displayWorkspacePath } from "@/server/tools/workspace";
 import { loadAgent } from "../load-agent";
 
 export const metadata: Metadata = {
@@ -25,6 +28,7 @@ async function EditAgentContent({ params }: Pick<PageProps<"/agents/[agentId]/ed
   const result = await loadAgent(agentId);
   if ("error" in result) return <LoadError error={result.error} />;
   const { agent } = result;
+  const toolSettings = await getAgentToolsForOwner(agent.id);
   return (
     <>
       <BackLink href={`/agents/${agent.id}`}>{agent.name}</BackLink>
@@ -36,6 +40,9 @@ async function EditAgentContent({ params }: Pick<PageProps<"/agents/[agentId]/ed
         mode="edit"
         agent={agent}
         providers={providerRegistry.list()}
+        tools={toolRegistry.catalog()}
+        toolSettings={toolSettings}
+        workspacePath={displayWorkspacePath(agent.id)}
       />
     </>
   );

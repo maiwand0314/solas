@@ -17,15 +17,25 @@ import {
   createAgentSchema,
   updateAgentSchema,
   validateAgentInput,
+  type AgentToolSetting,
   type FieldErrors,
 } from "@/lib/agents/validation";
 import type { Agent } from "@/server/agents/service";
 import type { ProviderDefinition } from "@/server/providers/registry";
+import type { ToolCatalogEntry } from "@/server/tools/types";
+import { ToolPermissionsFields } from "./tool-permissions-fields";
 import { useUnsavedChangesGuard } from "./use-unsaved-changes";
 
 type AgentFormProps = {
   providers: readonly ProviderDefinition[];
-} & ({ mode: "create"; agent?: undefined } | { mode: "edit"; agent: Agent });
+  /** Every tool Solas has, as plain data. */
+  tools: ToolCatalogEntry[];
+  /** Where the agent's workspace is (edit) or will be (create), for display. */
+  workspacePath: string;
+} & (
+  | { mode: "create"; agent?: undefined; toolSettings?: undefined }
+  | { mode: "edit"; agent: Agent; toolSettings: AgentToolSetting[] }
+);
 
 /** What the inputs hold. Selects use "" for "not configured". */
 type FormValues = {
@@ -36,6 +46,8 @@ type FormValues = {
   providerId: string;
   modelId: string;
   enabled: boolean;
+  /** Enabled tools only, kept in catalog order so comparisons are stable. */
+  tools: AgentToolSetting[];
 };
 
 const EMPTY_VALUES: FormValues = {
@@ -46,12 +58,13 @@ const EMPTY_VALUES: FormValues = {
   providerId: "",
   modelId: "",
   enabled: true,
+  tools: [],
 };
 
 // Error focus order follows the form's visual order.
-const FIELD_ORDER = ["name", "role", "description", "instructions", "providerId", "modelId"] as const;
+const FIELD_ORDER = ["name", "role", "description", "instructions", "providerId", "modelId", "tools"] as const;
 
-function valuesFromAgent(agent: Agent): FormValues {
+function valuesFromAgent(agent: Agent, tools: AgentToolSetting[]): FormValues {
   return {
     name: agent.name,
     role: agent.role,
@@ -60,6 +73,7 @@ function valuesFromAgent(agent: Agent): FormValues {
     providerId: agent.providerId ?? "",
     modelId: agent.modelId ?? "",
     enabled: agent.enabled,
+    tools,
   };
 }
 
@@ -73,6 +87,7 @@ function toInput(values: FormValues) {
     providerId: values.providerId || null,
     modelId: values.modelId || null,
     enabled: values.enabled,
+    tools: values.tools,
   };
 }
 
@@ -81,7 +96,9 @@ type AgentInput = ReturnType<typeof toInput>;
 /** Only the fields that differ, so an edit never rewrites what you didn't touch. */
 function changedFields(next: AgentInput, initial: AgentInput): Partial<AgentInput> {
   return Object.fromEntries(
-    Object.entries(next).filter(([key, value]) => value !== initial[key as keyof AgentInput]),
+    Object.entries(next).filter(
+      ([key, value]) => JSON.stringify(value) !== JSON.stringify(initial[key as keyof AgentInput]),
+    ),
   );
 }
 
@@ -93,13 +110,13 @@ function changedFields(next: AgentInput, initial: AgentInput): Partial<AgentInpu
  * and saves → on success, go to the agent's page; on failure, show the
  * server's field errors next to the inputs.
  */
-export function AgentForm({ mode, agent, providers }: AgentFormProps) {
+export function AgentForm({ mode, agent, providers, tools, toolSettings, workspacePath }: AgentFormProps) {
   const router = useRouter();
   // Unique per form instance: Next.js keeps recently visited pages mounted
   // (hidden) for instant back navigation, so fixed ids could appear twice.
   const idPrefix = useId();
   const fieldId = (field: string) => `${idPrefix}-${field}`;
-  const [initial] = useState<FormValues>(() => (agent ? valuesFromAgent(agent) : EMPTY_VALUES));
+  const [initial] = useState<FormValues>(() => (agent ? valuesFromAgent(agent, toolSettings ?? []) : EMPTY_VALUES));
   const [values, setValues] = useState<FormValues>(initial);
   const [errors, setErrors] = useState<FieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
@@ -254,6 +271,20 @@ export function AgentForm({ mode, agent, providers }: AgentFormProps) {
             setField("providerId", providerId);
             setField("modelId", modelId);
           }}
+        />
+      </FormSection>
+
+      <FormSection
+        title="Tools & permissions"
+        description="What the agent may do beyond replying. Every tool is off until you turn it on, and Solas checks these permissions on every call."
+      >
+        <ToolPermissionsFields
+          catalog={tools}
+          value={values.tools}
+          onChange={(next) => setField("tools", next)}
+          error={errorFor("tools")}
+          errorId={fieldId("tools")}
+          workspacePath={workspacePath}
         />
       </FormSection>
 

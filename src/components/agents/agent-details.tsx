@@ -3,6 +3,7 @@ import { Callout } from "@/components/ui/callout";
 import { PageHeader } from "@/components/ui/page-header";
 import { RelativeTime } from "@/components/ui/relative-time";
 import type { Agent } from "@/server/agents/service";
+import type { ToolCatalogEntry } from "@/server/tools/types";
 import { AgentHeaderActions, DeleteAgentSection } from "./agent-detail-actions";
 import { AgentEnabledSwitch } from "./agent-enabled-switch";
 import { AgentStatusBadge } from "./agent-status-badge";
@@ -12,6 +13,9 @@ type AgentDetailsProps = {
   agent: Agent;
   /** "Provider · Model", or null when no model is configured. */
   modelLabel: string | null;
+  /** The agent's enabled tools, in registry order. */
+  tools: (Pick<ToolCatalogEntry, "id" | "name" | "risk" | "approval" | "capability"> & { mode: "allow" | "ask" })[];
+  workspacePath: string;
 };
 
 /**
@@ -22,7 +26,7 @@ type AgentDetailsProps = {
  * schedules, memory) each get their own section here, between "AI model"
  * and "Status", without changing the sections around them.
  */
-export function AgentDetails({ agent, modelLabel }: AgentDetailsProps) {
+export function AgentDetails({ agent, modelLabel, tools, workspacePath }: AgentDetailsProps) {
   const ref = { id: agent.id, name: agent.name };
   return (
     <>
@@ -61,6 +65,33 @@ export function AgentDetails({ agent, modelLabel }: AgentDetailsProps) {
           </div>
         </DetailSection>
 
+        <DetailSection title="Tools" description="Checked by Solas on every call.">
+          {tools.length === 0 ? (
+            <p className="text-muted">No tools. This agent can only reply with text.</p>
+          ) : (
+            <div className="flex flex-col gap-3">
+              <ul className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-surface">
+                {tools.map((tool) => (
+                  <li key={tool.id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-3">
+                    <span className="font-medium">{tool.name}</span>
+                    <span className="text-sm text-muted">
+                      {tool.mode === "ask" || tool.approval === "required" ? "Asks you first" : "Runs automatically"}
+                      {" · "}
+                      {RISK_LABELS[tool.risk]}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              {tools.some((tool) => tool.capability === "workspace-read") && (
+                <p className="text-sm text-muted">
+                  Workspace folder (read-only):{" "}
+                  <code className="font-mono text-[0.8125rem] break-all text-foreground">{workspacePath}</code>
+                </p>
+              )}
+            </div>
+          )}
+        </DetailSection>
+
         <DetailSection title="Status" description="A setting, not a run state.">
           {/* key: reset the optimistic state when the saved value changes */}
           <AgentEnabledSwitch key={String(agent.enabled)} agent={agent} />
@@ -88,6 +119,12 @@ export function AgentDetails({ agent, modelLabel }: AgentDetailsProps) {
     </>
   );
 }
+
+const RISK_LABELS: Record<ToolCatalogEntry["risk"], string> = {
+  low: "Low risk",
+  medium: "Medium risk",
+  high: "High risk",
+};
 
 function DetailSection({
   title,
