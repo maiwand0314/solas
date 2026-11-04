@@ -14,6 +14,8 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
+// Relative and type-only: drizzle-kit loads this file without the app's path aliases.
+import type { Schedule } from "../../lib/automations/schedule";
 
 // The database schema, written in TypeScript. drizzle-kit compares this file
 // with the migrations in /drizzle and generates SQL for the difference.
@@ -173,6 +175,55 @@ export const teamMembers = pgTable(
   ],
 );
 
+/**
+ * An automation (M6A): an agent, task instructions, and a schedule. When a
+ * run is due, the worker's scheduler creates an ordinary task from it (see
+ * automation_occurrences), so scheduled work goes through the same queue,
+ * permissions, and approvals as any task. Deleting the agent deletes its
+ * automations, like its tasks.
+ */
+export const automations = pgTable(
+  "automations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    /** What the agent is asked to do each run: becomes the task's instructions. */
+    instructions: text("instructions").notNull(),
+    /** When it runs (see src/lib/automations/schedule.ts), validated in code like providers and tools. */
+    schedule: jsonb("schedule").$type<Schedule>().notNull(),
+    /** IANA time zone the schedule's times are in. */
+    timeZone: text("time_zone").notNull().default("Europe/Oslo"),
+    /** False while paused: nothing is scheduled. */
+    enabled: boolean("enabled").notNull().default(true),
+    /** When the schedule was last set; "every N hours" counts from here. */
+    scheduleAnchorAt: timestamp("schedule_anchor_at", { withTimezone: true }).notNull().defaultNow(),
+    /**
+     * The next run, or null when nothing is scheduled (paused, or a one-time
+     * run that has happened or was missed). The scheduler looks only at this.
+     */
+    nextRunAt: timestamp("next_run_at", { withTimezone: true }),
+    /** The scheduled time of the last run that started a task. */
+    lastRunAt: timestamp("last_run_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => sql`now()`),
+  },
+  (table) => [
+    uniqueIndex("automations_name_lower_unique").on(sql`lower(${table.name})`),
+    check("automations_name_not_blank", sql`length(trim(${table.name})) > 0`),
+    check("automations_paused_has_no_next_run", sql`${table.enabled} or ${table.nextRunAt} is null`),
+    // The scheduler asks "which active automations are due?"
+    index("automations_due_idx").on(table.nextRunAt).where(sql`${table.enabled} and ${table.nextRunAt} is not null`),
+    index("automations_agent_id_idx").on(table.agentId),
+  ],
+);
+
 export const TASK_STATUSES = [
   "queued",
   "running",
@@ -216,6 +267,11 @@ export const tasks = pgTable(
      * membership changes don't move it. Deleting the team keeps the task.
      */
     teamId: uuid("team_id").references(() => teams.id, { onDelete: "set null" }),
+    /**
+     * The automation that created this task (M6A), if any. Deleting the
+     * automation keeps the task and its history.
+     */
+    automationId: uuid("automation_id").references(() => automations.id, { onDelete: "set null" }),
     /** The agent's final answer, saved when an attempt completes. */
     result: text("result"),
     /** Stable code and owner-safe message; set when the task failed or was interrupted. */
@@ -252,10 +308,68 @@ export const tasks = pgTable(
     check("tasks_depth_valid", sql`${table.depth} >= 0 and (${table.depth} = 0) = (${table.parentTaskId} is null)`),
     index("tasks_parent_task_id_idx").on(table.parentTaskId),
     index("tasks_team_id_idx").on(table.teamId),
+    index("tasks_automation_id_idx").on(table.automationId),
     check("tasks_auto_retries_left_valid", sql`${table.autoRetriesLeft} between 0 and 5`),
     uniqueIndex("tasks_client_request_id_unique").on(table.clientRequestId),
     index("tasks_updated_at_idx").on(table.updatedAt),
     index("tasks_agent_id_idx").on(table.agentId),
+  ],
+);
+
+export const OCCURRENCE_STATUSES = ["started", "missed", "skipped"] as const;
+export type OccurrenceStatus = (typeof OCCURRENCE_STATUSES)[number];
+
+/** Why a due run didn't start a task. */
+export const OCCURRENCE_SKIP_REASONS = [
+  "overlap",
+  "agent_unavailable",
+  "usage_limit",
+  "concurrency_limit",
+  "daily_limit",
+] as const;
+export type OccurrenceSkipReason = (typeof OCCURRENCE_SKIP_REASONS)[number];
+
+/**
+ * One run of an automation (M6A): its history, including runs that didn't
+ * start. Its identity is (automation, scheduled time), enforced by a unique
+ * index, so two schedulers handling the same due run can't both record it,
+ * and only the one that does creates the task. Messages are written by Solas.
+ */
+export const automationOccurrences = pgTable(
+  "automation_occurrences",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    automationId: uuid("automation_id")
+      .notNull()
+      .references(() => automations.id, { onDelete: "cascade" }),
+    /** The run's scheduled time (for "Run now", the moment it was asked for). */
+    scheduledFor: timestamp("scheduled_for", { withTimezone: true }).notNull(),
+    /** "schedule": from the schedule. "manual": the owner's Run now. */
+    trigger: text("trigger", { enum: ["schedule", "manual"] }).notNull().default("schedule"),
+    /** "started": a task was created. "missed": too late to start. "skipped": a safeguard stopped it. */
+    status: text("status", { enum: OCCURRENCE_STATUSES }).notNull(),
+    reason: text("reason", { enum: OCCURRENCE_SKIP_REASONS }),
+    /** For "missed": how many runs this row stands for (one row per period of downtime). */
+    missedCount: integer("missed_count").notNull().default(0),
+    message: text("message").notNull(),
+    /** The task it created. Kept as history if the task is deleted with its agent. */
+    taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("automation_occurrences_once_per_time").on(table.automationId, table.scheduledFor),
+    index("automation_occurrences_automation_idx").on(table.automationId, table.createdAt),
+    uniqueIndex("automation_occurrences_task_id_unique").on(table.taskId),
+    check("automation_occurrences_status_valid", sql`${table.status} in ('started', 'missed', 'skipped')`),
+    check("automation_occurrences_trigger_valid", sql`${table.trigger} in ('schedule', 'manual')`),
+    check(
+      "automation_occurrences_reason_matches",
+      sql`(${table.status} = 'skipped') = (${table.reason} is not null)`,
+    ),
+    check(
+      "automation_occurrences_reason_valid",
+      sql`${table.reason} is null or ${table.reason} in ('overlap', 'agent_unavailable', 'usage_limit', 'concurrency_limit', 'daily_limit')`,
+    ),
   ],
 );
 
@@ -468,6 +582,9 @@ export type TaskEventData = {
   childTaskId?: string;
   parentTaskId?: string;
   delegationId?: string;
+  /** Automations (M6A): the automation and the run that created the task. */
+  automationId?: string;
+  occurrenceId?: string;
 };
 
 /**
@@ -550,3 +667,5 @@ export type TaskEventRow = typeof taskEvents.$inferSelect;
 export type TaskDelegationRow = typeof taskDelegations.$inferSelect;
 export type TeamRow = typeof teams.$inferSelect;
 export type TeamMemberRow = typeof teamMembers.$inferSelect;
+export type AutomationRow = typeof automations.$inferSelect;
+export type AutomationOccurrenceRow = typeof automationOccurrences.$inferSelect;
