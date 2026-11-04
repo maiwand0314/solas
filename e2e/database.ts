@@ -25,11 +25,39 @@ export const {
   taskDelegations,
   teams,
   teamMembers,
+  automations,
+  automationOccurrences,
 } = schema;
 
 export async function resetDatabase() {
   await db.delete(teams); // cascades to team membership
-  await db.delete(agents); // cascades to conversations, messages, tasks, and runs
+  await db.delete(agents); // cascades to conversations, messages, tasks, runs, and automations
+}
+
+/** An automation as the service would save it (the scheduler never runs in these tests). */
+export async function createAutomation(agentId: string, overrides: Partial<typeof automations.$inferInsert> = {}) {
+  const [automation] = await db
+    .insert(automations)
+    .values({
+      name: "Daily AI Research Briefing",
+      agentId,
+      instructions: "Summarize the latest developments in AI and software engineering.",
+      schedule: { kind: "daily", time: "08:00" },
+      timeZone: "Europe/Oslo",
+      nextRunAt: new Date(Date.now() + 60 * 60_000),
+      ...overrides,
+    })
+    .returning();
+  return automation;
+}
+
+/** One entry in an automation's history, optionally with the task it started. */
+export async function addOccurrence(
+  automationId: string,
+  fields: Omit<typeof automationOccurrences.$inferInsert, "automationId">,
+) {
+  const [occurrence] = await db.insert(automationOccurrences).values({ automationId, ...fields }).returning();
+  return occurrence;
 }
 
 export async function createAgent(overrides: Partial<typeof agents.$inferInsert> = {}) {
