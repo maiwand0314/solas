@@ -32,6 +32,8 @@ export const createTaskSchema = z.strictObject({
   title: taskTitleSchema,
   instructions: taskInstructionsSchema,
   clientRequestId: z.uuid({ error: "Invalid request ID." }).optional(),
+  /** Optional (M5B): the team this task is for. The agent must be a member. */
+  teamId: z.uuid({ error: "Choose a team from the list." }).nullable().optional(),
 });
 
 export type CreateTaskInput = z.input<typeof createTaskSchema>;

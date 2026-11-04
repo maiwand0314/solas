@@ -118,6 +118,8 @@ export async function delegate(
         instructions: childInstructions(parentAgent?.name ?? "Another agent", request),
         parentTaskId,
         depth: parent.depth + 1,
+        // Part of the same piece of work: it stays with the parent's team (if any).
+        teamId: parent.teamId,
         autoRetriesLeft: autoRetries,
       })
       .returning({ id: tasks.id });

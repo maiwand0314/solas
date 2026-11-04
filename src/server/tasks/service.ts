@@ -11,6 +11,8 @@ import {
   taskDelegations,
   taskEvents,
   tasks,
+  teamMembers,
+  teams,
   toolCalls,
   type AgentRow,
   type RunRow,
@@ -40,6 +42,8 @@ export type TaskSummary = Pick<
   agentName: string;
   /** For a delegated task: the agent of the task that delegated it. */
   delegatedBy: string | null;
+  /** The team the task was given to (M5B), if any. */
+  team: { id: string; name: string } | null;
 };
 
 /** One attempt as the task page shows it: its state, never worker internals. */
@@ -108,9 +112,11 @@ export type TaskDetail = {
   toolCalls: TaskToolCall[];
   parent: TaskParentView | null;
   delegations: TaskDelegationView[];
+  /** The team the task was given to (M5B), if it still exists. */
+  team: { id: string; name: string } | null;
 };
 
-export type TaskListQuery = { filter?: TaskFilterId; search?: string };
+export type TaskListQuery = { filter?: TaskFilterId; search?: string; teamId?: string };
 
 const attemptColumns = {
   id: runs.id,
@@ -166,20 +172,21 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
    * a second later. Safe to repeat with the same `clientRequestId`.
    */
   async function create(input: unknown): Promise<{ taskId: string }> {
-    const { agentId, title, instructions, clientRequestId } = parse(createTaskSchema, input);
+    const { agentId, title, instructions, clientRequestId, teamId } = parse(createTaskSchema, input);
     if (clientRequestId) {
       const existing = await findCreated(clientRequestId);
       if (existing) return existing;
     }
     const agent = await getAgentRow(agentId);
     assertAgentCanRun(agent);
+    if (teamId) await assertTeamMember(teamId, agentId);
 
     try {
       return await query(() =>
         db.transaction(async (tx) => {
           const [task] = await tx
             .insert(tasks)
-            .values({ agentId, title, instructions, clientRequestId, autoRetriesLeft: limits.taskAutoRetries })
+            .values({ agentId, title, instructions, clientRequestId, teamId: teamId ?? null, autoRetriesLeft: limits.taskAutoRetries })
             .returning({ id: tasks.id });
           const [run] = await tx.insert(runs).values({ taskId: task.id, agentId, attempt: 1 }).returning({ id: runs.id });
           await recordTaskEvent(tx, { taskId: task.id, type: "created", message: `You created this task for ${agent.name}.` });
@@ -211,9 +218,13 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
   }
 
   /** Tasks, most recently active first, optionally filtered by status group and text. */
-  async function list({ filter = "all", search = "" }: TaskListQuery = {}): Promise<TaskSummary[]> {
+  async function list({ filter = "all", search = "", teamId }: TaskListQuery = {}): Promise<TaskSummary[]> {
     const statuses = TASK_FILTERS.find((entry) => entry.id === filter)?.statuses ?? null;
-    const conditions = [searchCondition(search), statuses ? inArray(tasks.status, [...statuses]) : undefined];
+    const conditions = [
+      searchCondition(search),
+      statuses ? inArray(tasks.status, [...statuses]) : undefined,
+      teamCondition(teamId),
+    ];
     return query(() =>
       db
         .select({
@@ -228,25 +239,49 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
           agentId: agents.id,
           agentName: agents.name,
           delegatedBy: parentAgents.name,
+          teamId: teams.id,
+          teamName: teams.name,
         })
         .from(tasks)
         .innerJoin(agents, eq(agents.id, tasks.agentId))
         .leftJoin(parentTasks, eq(parentTasks.id, tasks.parentTaskId))
         .leftJoin(parentAgents, eq(parentAgents.id, parentTasks.agentId))
+        .leftJoin(teams, eq(teams.id, tasks.teamId))
         .where(and(...conditions))
         .orderBy(desc(tasks.updatedAt))
         .limit(LIST_LIMIT),
+    ).then((rows) =>
+      rows.map(({ teamId: id, teamName, ...row }) => ({ ...row, team: id && teamName ? { id, name: teamName } : null })),
     );
   }
 
+  /** Tasks given to one team (an explicit link, set when the task was created). */
+  function teamCondition(teamId: string | undefined): SQL | undefined {
+    return teamId && idSchema.safeParse(teamId).success ? eq(tasks.teamId, teamId) : undefined;
+  }
+
+  /** A task can be given to a team only through one of its members. */
+  async function assertTeamMember(teamId: string, agentId: string) {
+    const [member] = await query(() =>
+      db
+        .select({ agentId: teamMembers.agentId })
+        .from(teamMembers)
+        .where(and(eq(teamMembers.teamId, teamId), eq(teamMembers.agentId, agentId))),
+    );
+    if (!member) {
+      const message = "This agent isn’t a member of the chosen team.";
+      throw new TaskServiceError("validation_failed", message, { teamId: [message] });
+    }
+  }
+
   /** How many tasks each filter would show (for the same search), for the filter bar. */
-  async function countByFilter(search = ""): Promise<Record<TaskFilterId, number>> {
+  async function countByFilter(search = "", teamId?: string): Promise<Record<TaskFilterId, number>> {
     const rows = await query(() =>
       db
         .select({ status: tasks.status, count: count() })
         .from(tasks)
         .innerJoin(agents, eq(agents.id, tasks.agentId))
-        .where(searchCondition(search))
+        .where(and(searchCondition(search), teamCondition(teamId)))
         .groupBy(tasks.status),
     );
     const byStatus = new Map(rows.map((row) => [row.status, row.count]));
@@ -295,7 +330,7 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
           .orderBy(asc(toolCalls.createdAt)),
       ),
     ]);
-    const [parent, delegations] = await Promise.all([parentOf(task), delegationsOf(task.id)]);
+    const [parent, delegations, team] = await Promise.all([parentOf(task), delegationsOf(task.id), teamOf(task)]);
     const { id: agentId, name, enabled, providerId, modelId } = agent;
     return {
       task,
@@ -305,7 +340,14 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
       toolCalls: calls,
       parent,
       delegations,
+      team,
     };
+  }
+
+  async function teamOf(task: TaskRow): Promise<{ id: string; name: string } | null> {
+    if (!task.teamId) return null;
+    const [team] = await query(() => db.select({ id: teams.id, name: teams.name }).from(teams).where(eq(teams.id, task.teamId!)));
+    return team ?? null;
   }
 
   async function parentOf(task: TaskRow): Promise<TaskParentView | null> {

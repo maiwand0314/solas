@@ -8,7 +8,7 @@ import { getTaskService, type TaskDetail, type TaskListQuery, type TaskSummary }
 export async function listTasksForOwner(query: TaskListQuery) {
   await requireOwner();
   const service = getTaskService();
-  const [tasks, counts] = await Promise.all([service.list(query), service.countByFilter(query.search)]);
+  const [tasks, counts] = await Promise.all([service.list(query), service.countByFilter(query.search, query.teamId)]);
   return { tasks, counts } satisfies { tasks: TaskSummary[]; counts: Record<string, number> };
 }
 
