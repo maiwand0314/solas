@@ -11,6 +11,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { PageHeader } from "@/components/ui/page-header";
 import { parseTaskFilter, TASK_FILTERS } from "@/lib/tasks/status";
 import { listTasksForOwner } from "@/server/tasks/queries";
+import { listTeamOptionsForOwner } from "@/server/teams/queries";
 
 export const metadata: Metadata = {
   title: "Tasks",
@@ -45,17 +46,21 @@ async function StoredTasks({ searchParams }: Pick<PageProps<"/tasks">, "searchPa
   const params = await searchParams;
   const filter = parseTaskFilter(firstValue(params.status));
   const search = (firstValue(params.q) ?? "").trim().slice(0, 200);
+  const teamParam = firstValue(params.team);
 
   let data;
+  let team: { id: string; name: string } | undefined;
   try {
-    data = await listTasksForOwner({ filter, search });
+    const teams = await listTeamOptionsForOwner();
+    team = teams.find((option) => option.id === teamParam);
+    data = await listTasksForOwner({ filter, search, teamId: team?.id });
   } catch (error) {
     unstable_rethrow(error);
     return <LoadError error={error} subject="tasks" />;
   }
   const { tasks, counts } = data;
 
-  if (counts.all === 0 && !search) {
+  if (counts.all === 0 && !search && !team) {
     return (
       <EmptyState
         icon={TasksIcon}
@@ -74,7 +79,18 @@ async function StoredTasks({ searchParams }: Pick<PageProps<"/tasks">, "searchPa
   return (
     <section aria-label="Tasks">
       <LiveRefresh active={active} intervalMs={2_000} />
-      <TaskToolbar filter={filter} search={search} counts={counts} />
+      {team && (
+        <p className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted">
+          Showing tasks given to{" "}
+          <Link href={`/teams/${team.id}`} className="font-medium text-foreground underline-offset-2 hover:underline">
+            {team.name}
+          </Link>
+          <Link href={tasksHref(filter, search)} className={buttonClassName({ size: "sm", variant: "ghost" })}>
+            Show all tasks
+          </Link>
+        </p>
+      )}
+      <TaskToolbar filter={filter} search={search} counts={counts} teamId={team?.id} />
       <p aria-live="polite" className="sr-only">
         {tasks.length} {tasks.length === 1 ? "task" : "tasks"} shown
       </p>

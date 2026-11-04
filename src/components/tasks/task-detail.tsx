@@ -70,7 +70,15 @@ export function TaskDetail({ detail, toolInfo }: { detail: TaskDetailData; toolI
             Assigned to{" "}
             <Link href={`/agents/${agent.id}`} className="text-foreground underline-offset-2 hover:underline">
               {agent.name}
-            </Link>{" "}
+            </Link>
+            {detail.team && (
+              <>
+                {" "}· Team{" "}
+                <Link href={`/teams/${detail.team.id}`} className="text-foreground underline-offset-2 hover:underline">
+                  {detail.team.name}
+                </Link>
+              </>
+            )}{" "}
             · Created <RelativeTime date={task.createdAt} />
           </>
         }

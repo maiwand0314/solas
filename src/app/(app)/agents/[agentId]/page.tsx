@@ -5,6 +5,7 @@ import { LoadError } from "@/components/load-error";
 import { AgentDetailsSkeleton } from "@/components/agents/agent-skeletons";
 import { getAgentDelegationTargetsForOwner, getAgentToolsForOwner } from "@/server/agents/queries";
 import { describeModelSelection, providerRegistry } from "@/server/providers/registry";
+import { getAgentTeamsForOwner } from "@/server/teams/queries";
 import { toolRegistry } from "@/server/tools/registry";
 import { displayWorkspacePath } from "@/server/tools/workspace";
 import { loadAgent } from "./load-agent";
@@ -26,9 +27,10 @@ async function AgentPageContent({ params }: Pick<PageProps<"/agents/[agentId]">,
   const { agentId } = await params;
   const result = await loadAgent(agentId);
   if ("error" in result) return <LoadError error={result.error} />;
-  const [settings, delegationTargets] = await Promise.all([
+  const [settings, delegationTargets, teams] = await Promise.all([
     getAgentToolsForOwner(result.agent.id),
     getAgentDelegationTargetsForOwner(result.agent.id),
+    getAgentTeamsForOwner(result.agent.id),
   ]);
   const tools = settings.map((setting) => ({ ...toolRegistry.get(setting.toolId)!, mode: setting.mode }));
   return (
@@ -38,6 +40,7 @@ async function AgentPageContent({ params }: Pick<PageProps<"/agents/[agentId]">,
       tools={tools.map(({ id, name, risk, approval, capability, mode }) => ({ id, name, risk, approval, capability, mode }))}
       workspacePath={displayWorkspacePath(result.agent.id)}
       delegationTargets={delegationTargets}
+      teams={teams}
     />
   );
 }

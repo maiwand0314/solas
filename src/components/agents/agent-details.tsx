@@ -19,6 +19,8 @@ type AgentDetailsProps = {
   workspacePath: string;
   /** Agents this one may delegate to; empty when delegation is off. */
   delegationTargets: DelegationTarget[];
+  /** Teams the agent belongs to, with its role in each. */
+  teams: { id: string; name: string; role: "coordinator" | "member" }[];
 };
 
 /**
@@ -29,7 +31,7 @@ type AgentDetailsProps = {
  * schedules, memory) each get their own section here, between "AI model"
  * and "Status", without changing the sections around them.
  */
-export function AgentDetails({ agent, modelLabel, tools, workspacePath, delegationTargets }: AgentDetailsProps) {
+export function AgentDetails({ agent, modelLabel, tools, workspacePath, delegationTargets, teams }: AgentDetailsProps) {
   const ref = { id: agent.id, name: agent.name };
   return (
     <>
@@ -115,6 +117,23 @@ export function AgentDetails({ agent, modelLabel, tools, workspacePath, delegati
                 ))}
               </ul>
             </div>
+          )}
+        </DetailSection>
+
+        <DetailSection title="Teams">
+          {teams.length === 0 ? (
+            <p className="text-muted">Not in a team.</p>
+          ) : (
+            <ul className="flex flex-col gap-1.5">
+              {teams.map((team) => (
+                <li key={team.id} className="flex flex-wrap items-baseline gap-x-2">
+                  <Link href={`/teams/${team.id}`} className="font-medium underline-offset-2 hover:underline">
+                    {team.name}
+                  </Link>
+                  <span className="text-sm text-muted">{team.role === "coordinator" ? "Coordinator" : "Member"}</span>
+                </li>
+              ))}
+            </ul>
           )}
         </DetailSection>
 

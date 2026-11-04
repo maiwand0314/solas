@@ -11,8 +11,9 @@ import { TaskActions } from "./task-actions";
 import { TaskStatusBadge } from "./task-status-badge";
 
 /** The Tasks URL for a filter and search, leaving out defaults. */
-export function tasksHref(filter: TaskFilterId, search: string): string {
+export function tasksHref(filter: TaskFilterId, search: string, teamId?: string): string {
   const params = new URLSearchParams();
+  if (teamId) params.set("team", teamId);
   if (filter !== "all") params.set("status", filter);
   if (search) params.set("q", search);
   const query = params.toString();
@@ -28,10 +29,13 @@ export function TaskToolbar({
   filter,
   search,
   counts,
+  teamId,
 }: {
   filter: TaskFilterId;
   search: string;
   counts: Record<TaskFilterId, number>;
+  /** Set when the list shows one team's tasks; kept by every filter and search. */
+  teamId?: string;
 }) {
   return (
     <div className="mb-4 flex flex-col gap-3">
@@ -49,6 +53,7 @@ export function TaskToolbar({
           className="pl-8"
         />
         {filter !== "all" && <input type="hidden" name="status" value={filter} />}
+        {teamId && <input type="hidden" name="team" value={teamId} />}
       </Form>
       <nav aria-label="Filter tasks by status">
         <ul className="flex flex-wrap gap-1">
@@ -57,7 +62,7 @@ export function TaskToolbar({
             return (
               <li key={entry.id}>
                 <Link
-                  href={tasksHref(entry.id, search)}
+                  href={tasksHref(entry.id, search, teamId)}
                   aria-current={current ? "page" : undefined}
                   className={cn(
                     "inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-sm transition-colors duration-100",
@@ -110,6 +115,7 @@ export function TaskList({ tasks }: { tasks: TaskSummary[] }) {
               <p className="mt-0.5 truncate text-sm text-muted">
                 {task.agentName}
                 {task.delegatedBy && <span className="text-subtle"> · delegated by {task.delegatedBy}</span>}
+                {task.team && <span className="text-subtle"> · {task.team.name}</span>}
               </p>
               <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-subtle md:hidden">
                 <TaskStatusBadge status={task.status} cancelling={cancelling} />

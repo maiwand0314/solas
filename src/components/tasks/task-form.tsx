@@ -26,8 +26,11 @@ export type TaskAgentOption = {
   tools: string[];
 };
 
-type Values = { agentId: string; title: string; instructions: string };
-const FIELD_ORDER = ["agentId", "title", "instructions"] as const;
+/** A team a task can be given to, with the agents who may take its tasks. */
+export type TaskTeamOption = { id: string; name: string; memberIds: string[] };
+
+type Values = { teamId: string; agentId: string; title: string; instructions: string };
+const FIELD_ORDER = ["teamId", "agentId", "title", "instructions"] as const;
 
 /**
  * The New task form. Validates in the browser with the server's own schema,
@@ -36,11 +39,20 @@ const FIELD_ORDER = ["agentId", "title", "instructions"] as const;
  * server creates the task once. The agent runs with its saved instructions,
  * model, and tool permissions: a task can't grant it anything more.
  */
-export function TaskForm({ agents }: { agents: TaskAgentOption[] }) {
+export function TaskForm({
+  agents,
+  teams = [],
+  initialTeamId,
+}: {
+  agents: TaskAgentOption[];
+  teams?: TaskTeamOption[];
+  initialTeamId?: string;
+}) {
   const router = useRouter();
   const idPrefix = useId();
   const fieldId = (field: string) => `${idPrefix}-${field}`;
   const [values, setValues] = useState<Values>({
+    teamId: teams.some((team) => team.id === initialTeamId) ? initialTeamId! : "",
     agentId: agents.length === 1 ? agents[0].id : "",
     title: "",
     instructions: "",
@@ -53,7 +65,10 @@ export function TaskForm({ agents }: { agents: TaskAgentOption[] }) {
 
   const dirty = values.title.trim() !== "" || values.instructions.trim() !== "";
   useUnsavedChangesGuard(dirty && !submitted);
-  const selected = agents.find((agent) => agent.id === values.agentId);
+  // With a team chosen, only its members can take the task.
+  const team = teams.find((option) => option.id === values.teamId);
+  const choosable = team ? agents.filter((agent) => team.memberIds.includes(agent.id)) : agents;
+  const selected = choosable.find((agent) => agent.id === values.agentId);
 
   function setField(field: keyof Values, value: string) {
     setValues((current) => ({ ...current, [field]: value }));
@@ -71,7 +86,7 @@ export function TaskForm({ agents }: { agents: TaskAgentOption[] }) {
   function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (pending || submitted) return;
-    const check = createTaskSchema.safeParse(values);
+    const check = createTaskSchema.safeParse({ ...values, teamId: values.teamId || null });
     if (!check.success) {
       const fieldErrors: FieldErrors = {};
       for (const issue of check.error.issues) {
@@ -108,6 +123,34 @@ export function TaskForm({ agents }: { agents: TaskAgentOption[] }) {
 
   return (
     <form onSubmit={onSubmit} noValidate aria-busy={pending} className="flex max-w-2xl flex-col gap-6">
+      {teams.length > 0 && (
+        <Field
+          id={fieldId("teamId")}
+          label="Team"
+          hint="Optional. The task shows up on the team’s page; only its members can take it."
+          error={errorFor("teamId")}
+        >
+          <Select
+            name="teamId"
+            {...fieldAria(fieldId("teamId"), { hint: true, error: errorFor("teamId") })}
+            value={values.teamId}
+            onChange={(event) => {
+              const next = teams.find((option) => option.id === event.target.value);
+              setField("teamId", event.target.value);
+              // An agent outside the chosen team can't take its task.
+              if (next && !next.memberIds.includes(values.agentId)) setField("agentId", "");
+            }}
+          >
+            <option value="">No team</option>
+            {teams.map((option) => (
+              <option key={option.id} value={option.id}>
+                {option.name}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      )}
+
       <Field
         id={fieldId("agentId")}
         label="Agent"
@@ -134,7 +177,7 @@ export function TaskForm({ agents }: { agents: TaskAgentOption[] }) {
           <option value="" disabled>
             Choose an agent
           </option>
-          {agents.map((agent) => (
+          {choosable.map((agent) => (
             <option key={agent.id} value={agent.id}>
               {agent.role ? `${agent.name} — ${agent.role}` : agent.name}
             </option>
