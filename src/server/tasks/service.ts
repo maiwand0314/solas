@@ -7,6 +7,7 @@ import { createTaskSchema } from "@/lib/tasks/validation";
 import { getDatabase, type Database } from "@/server/db/client";
 import {
   agents,
+  automations,
   runs,
   taskDelegations,
   taskEvents,
@@ -45,6 +46,8 @@ export type TaskSummary = Pick<
   delegatedBy: string | null;
   /** The team the task was given to (M5B), if any. */
   team: { id: string; name: string } | null;
+  /** The automation that created the task (M6A), if any. */
+  automation: { id: string; name: string } | null;
 };
 
 /** One attempt as the task page shows it: its state, never worker internals. */
@@ -115,6 +118,8 @@ export type TaskDetail = {
   delegations: TaskDelegationView[];
   /** The team the task was given to (M5B), if it still exists. */
   team: { id: string; name: string } | null;
+  /** The automation that created it (M6A), if it still exists. */
+  automation: { id: string; name: string } | null;
 };
 
 export type TaskListQuery = { filter?: TaskFilterId; search?: string; teamId?: string };
@@ -238,17 +243,24 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
           delegatedBy: parentAgents.name,
           teamId: teams.id,
           teamName: teams.name,
+          automationId: automations.id,
+          automationName: automations.name,
         })
         .from(tasks)
         .innerJoin(agents, eq(agents.id, tasks.agentId))
         .leftJoin(parentTasks, eq(parentTasks.id, tasks.parentTaskId))
         .leftJoin(parentAgents, eq(parentAgents.id, parentTasks.agentId))
         .leftJoin(teams, eq(teams.id, tasks.teamId))
+        .leftJoin(automations, eq(automations.id, tasks.automationId))
         .where(and(...conditions))
         .orderBy(desc(tasks.updatedAt))
         .limit(LIST_LIMIT),
     ).then((rows) =>
-      rows.map(({ teamId: id, teamName, ...row }) => ({ ...row, team: id && teamName ? { id, name: teamName } : null })),
+      rows.map(({ teamId: id, teamName, automationId, automationName, ...row }) => ({
+        ...row,
+        team: id && teamName ? { id, name: teamName } : null,
+        automation: automationId && automationName ? { id: automationId, name: automationName } : null,
+      })),
     );
   }
 
@@ -327,7 +339,12 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
           .orderBy(asc(toolCalls.createdAt)),
       ),
     ]);
-    const [parent, delegations, team] = await Promise.all([parentOf(task), delegationsOf(task.id), teamOf(task)]);
+    const [parent, delegations, team, automation] = await Promise.all([
+      parentOf(task),
+      delegationsOf(task.id),
+      teamOf(task),
+      automationOf(task),
+    ]);
     const { id: agentId, name, enabled, providerId, modelId } = agent;
     return {
       task,
@@ -338,7 +355,16 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
       parent,
       delegations,
       team,
+      automation,
     };
+  }
+
+  async function automationOf(task: TaskRow): Promise<{ id: string; name: string } | null> {
+    if (!task.automationId) return null;
+    const [automation] = await query(() =>
+      db.select({ id: automations.id, name: automations.name }).from(automations).where(eq(automations.id, task.automationId!)),
+    );
+    return automation ?? null;
   }
 
   async function teamOf(task: TaskRow): Promise<{ id: string; name: string } | null> {

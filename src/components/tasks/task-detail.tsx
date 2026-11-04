@@ -78,6 +78,17 @@ export function TaskDetail({ detail, toolInfo }: { detail: TaskDetailData; toolI
                   {detail.team.name}
                 </Link>
               </>
+            )}
+            {detail.automation && (
+              <>
+                {" "}· From automation{" "}
+                <Link
+                  href={`/automations/${detail.automation.id}`}
+                  className="text-foreground underline-offset-2 hover:underline"
+                >
+                  {detail.automation.name}
+                </Link>
+              </>
             )}{" "}
             · Created <RelativeTime date={task.createdAt} />
           </>
