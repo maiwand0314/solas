@@ -8,12 +8,18 @@ import { findActiveNavItem } from "./nav-items";
 type Crumb = { label: string; href?: string };
 
 /** Labels for pages below a section, matched against the rest of the path. */
+const SUBPAGE_LABELS: Record<string, { new: string; item: string }> = {
+  "/agents": { new: "New agent", item: "Details" },
+  "/conversations": { new: "New conversation", item: "Conversation" },
+  "/tasks": { new: "New task", item: "Task" },
+};
+
 function subpageLabel(section: string, rest: string[]): string | null {
   if (rest.length === 0) return null;
-  const isConversations = section === "/conversations";
-  if (rest[0] === "new") return isConversations ? "New conversation" : "New agent";
+  const labels = SUBPAGE_LABELS[section] ?? { new: "New", item: "Details" };
+  if (rest[0] === "new") return labels.new;
   if (rest[1] === "edit") return "Edit";
-  return isConversations ? "Conversation" : "Details";
+  return labels.item;
 }
 
 function crumbsFor(pathname: string): Crumb[] {

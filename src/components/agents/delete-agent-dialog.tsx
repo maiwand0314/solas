@@ -58,8 +58,8 @@ export function DeleteAgentDialog({ agent, open, onOpenChange, onDeleted }: Dele
           Delete “{agent.name}”?
         </h2>
         <p id={descriptionId} className="mt-2 text-muted">
-          This permanently deletes the agent, its configuration, and all of its conversations. It
-          can’t be undone.
+          This permanently deletes the agent, its configuration, and all of its conversations and
+          tasks. Anything it is working on stops. It can’t be undone.
         </p>
         {error && (
           <Callout tone="danger" role="alert" className="mt-4">

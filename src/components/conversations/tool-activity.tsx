@@ -96,7 +96,7 @@ function ToolCallLine({ call, toolInfo }: { call: ToolCallView; toolInfo: ToolIn
   );
 }
 
-function ApprovalCard({
+export function ApprovalCard({
   call,
   toolInfo,
   agentName,

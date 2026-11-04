@@ -2,6 +2,7 @@ import { Callout } from "@/components/ui/callout";
 import { AgentServiceError } from "@/server/agents/errors";
 import { OwnerAccessError } from "@/server/auth/owner";
 import { ConversationServiceError } from "@/server/conversations/errors";
+import { TaskServiceError } from "@/server/tasks/errors";
 import { RetryButton } from "./retry-button";
 
 /**
@@ -9,7 +10,9 @@ import { RetryButton } from "./retry-button";
  * message and a way forward; anything else is logged on the server and shown
  * generically, without internal details.
  */
-export function LoadError({ error, subject = "agents" }: { error: unknown; subject?: "agents" | "conversations" }) {
+const SUBJECT_LABELS = { agents: "Agents", conversations: "Conversations", tasks: "Tasks" } as const;
+
+export function LoadError({ error, subject = "agents" }: { error: unknown; subject?: keyof typeof SUBJECT_LABELS }) {
   if (error instanceof OwnerAccessError) {
     return (
       <Callout tone="danger" title="Access denied">
@@ -18,7 +21,7 @@ export function LoadError({ error, subject = "agents" }: { error: unknown; subje
     );
   }
   if (
-    (error instanceof AgentServiceError || error instanceof ConversationServiceError) &&
+    (error instanceof AgentServiceError || error instanceof ConversationServiceError || error instanceof TaskServiceError) &&
     error.code === "database_unavailable"
   ) {
     return (
@@ -30,7 +33,7 @@ export function LoadError({ error, subject = "agents" }: { error: unknown; subje
   console.error(`[solas] failed to load ${subject}:`, error);
   return (
     <Callout tone="danger" title="Something went wrong" actions={<RetryButton />}>
-      {subject === "agents" ? "Agents" : "Conversations"} couldn’t be loaded. Check the server log for details.
+      {SUBJECT_LABELS[subject]} couldn’t be loaded. Check the server log for details.
     </Callout>
   );
 }

@@ -1,10 +1,12 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
-type BadgeTone = "neutral" | "success" | "warning" | "danger";
+type BadgeTone = "neutral" | "active" | "success" | "warning" | "danger";
 
 const dotClasses: Record<BadgeTone, string> = {
   neutral: "bg-subtle",
+  // Something is happening right now (e.g. a running task). The pulse stops under reduced motion.
+  active: "bg-accent motion-safe:animate-pulse",
   success: "bg-success",
   warning: "bg-warning",
   danger: "bg-danger",

@@ -8,7 +8,6 @@ import {
   useOptimistic,
   useRef,
   useState,
-  useSyncExternalStore,
   useTransition,
   type FormEvent,
   type KeyboardEvent,
@@ -18,6 +17,7 @@ import { SendIcon, StopIcon } from "@/components/icons";
 import { Button, buttonClassName } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
 import { RelativeTime } from "@/components/ui/relative-time";
+import { useNow } from "@/components/use-now";
 import { MESSAGE_MAX_LENGTH, messageContentSchema } from "@/lib/conversations/validation";
 import type { RunSnapshot, RunState, ToolCallView } from "@/server/conversations/service";
 import { Markdown } from "./markdown";
@@ -105,7 +105,9 @@ export function ConversationView({ agent, conversationId, messages, runs, toolCa
 
   // The latest run per message (a retry adds a newer one), with live state on top.
   const runByMessage = new Map<string, RunState>();
-  for (const run of runs) runByMessage.set(run.userMessageId, run.id === liveRun?.id ? liveRun : run);
+  for (const run of runs) {
+    if (run.userMessageId) runByMessage.set(run.userMessageId, run.id === liveRun?.id ? liveRun : run);
+  }
 
   // Tool calls per run; the live run's come from the latest poll.
   const callsByRun = new Map<string, ToolCallView[]>();
@@ -556,21 +558,4 @@ function useStickToBottom(contentKey: string) {
   }
 
   return { endRef, atBottom, scrollToEnd };
-}
-
-function subscribeEverySecond(onTick: () => void) {
-  const timer = window.setInterval(onTick, 1_000);
-  return () => window.clearInterval(timer);
-}
-const subscribeNever = () => () => {};
-// Rounded so repeated reads within a second return the same value.
-const currentSecond = () => Math.floor(Date.now() / 1_000) * 1_000;
-
-/**
- * The current time, updated every second while `ticking`, for elapsed times.
- * null on the server and during hydration: the server's clock isn't the
- * browser's, and showing two different times would break hydration.
- */
-function useNow(ticking: boolean): number | null {
-  return useSyncExternalStore(ticking ? subscribeEverySecond : subscribeNever, currentSecond, () => null);
 }
