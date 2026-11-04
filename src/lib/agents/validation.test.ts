@@ -17,6 +17,7 @@ describe("createAgentSchema", () => {
       modelId: null,
       enabled: true,
       tools: [], // every agent starts with no tools
+      delegateTo: [], // and can't delegate
     });
   });
 

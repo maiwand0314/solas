@@ -55,6 +55,18 @@ const toolSettings = z
 
 export type AgentToolSetting = z.output<typeof toolSettings>[number];
 
+/** The most agents one agent may delegate to (M5A). Mirrors DELEGATION_LIMITS on the server. */
+export const MAX_DELEGATION_TARGETS = 20;
+
+/**
+ * Which agents this agent may delegate tasks to. Empty means delegation is
+ * off. The agent service checks that each one exists and isn't the agent itself.
+ */
+const delegationTargets = z
+  .array(z.uuid({ error: "Choose agents from the list." }), { error: "Delegation targets must be a list." })
+  .max(MAX_DELEGATION_TARGETS, { error: `An agent can delegate to at most ${MAX_DELEGATION_TARGETS} agents.` })
+  .refine((ids) => new Set(ids).size === ids.length, { error: "An agent is listed twice." });
+
 const fields = {
   name: requiredText("Name", AGENT_LIMITS.name),
   role: requiredText("Role", AGENT_LIMITS.role),
@@ -64,6 +76,7 @@ const fields = {
   modelId: identifier("Model"),
   enabled: z.boolean({ error: "Enabled must be true or false." }),
   tools: toolSettings,
+  delegateTo: delegationTargets,
 };
 
 export const createAgentSchema = z.strictObject({
@@ -75,6 +88,7 @@ export const createAgentSchema = z.strictObject({
   modelId: fields.modelId.default(null),
   enabled: fields.enabled.default(true),
   tools: fields.tools.default([]),
+  delegateTo: fields.delegateTo.default([]),
 });
 
 export const updateAgentSchema = z
@@ -87,6 +101,7 @@ export const updateAgentSchema = z
     modelId: fields.modelId.optional(),
     enabled: fields.enabled.optional(),
     tools: fields.tools.optional(),
+    delegateTo: fields.delegateTo.optional(),
   })
   .refine((changes) => Object.keys(changes).length > 0, { error: "Nothing to update." });
 

@@ -1,9 +1,9 @@
 import "server-only";
-import { eq, sql } from "drizzle-orm";
+import { asc, eq, inArray, sql } from "drizzle-orm";
 import type { z } from "zod";
 import { getDatabase, type Database } from "@/server/db/client";
-import { agents, agentToolPermissions, type AgentRow } from "@/server/db/schema";
-import { toolRegistry, type ToolRegistry } from "@/server/tools/registry";
+import { agentDelegationTargets, agents, agentToolPermissions, type AgentRow } from "@/server/db/schema";
+import { isPermissionTool, toolRegistry, type ToolRegistry } from "@/server/tools/registry";
 import {
   checkModelSelection,
   providerRegistry,
@@ -20,6 +20,9 @@ import {
 import { AgentServiceError, fromDatabaseError, notFoundError, validationError } from "./errors";
 
 export type Agent = AgentRow;
+
+/** An agent this agent may delegate to, as Agent Builder and the agent page show it. */
+export type DelegationTarget = Pick<AgentRow, "id" | "name" | "role" | "enabled">;
 
 type Dependencies = {
   db: Database;
@@ -50,17 +53,36 @@ export function createAgentService({ db, providers, tools = toolRegistry }: Depe
   }
 
   async function create(input: unknown): Promise<Agent> {
-    const { tools: toolSettings, ...values } = parse(createAgentSchema, input);
+    const { tools: toolSettings, delegateTo, ...values } = parse(createAgentSchema, input);
     assertModelSelection(values.providerId, values.modelId);
     assertToolSettings(toolSettings);
+    await assertDelegationTargets(null, delegateTo);
     return query(() =>
       db.transaction(async (tx) => {
         const [agent] = await tx.insert(agents).values(values).returning();
         if (toolSettings.length > 0) {
           await tx.insert(agentToolPermissions).values(toolSettings.map((tool) => ({ agentId: agent.id, ...tool })));
         }
+        if (delegateTo.length > 0) {
+          await tx
+            .insert(agentDelegationTargets)
+            .values(delegateTo.map((targetAgentId) => ({ agentId: agent.id, targetAgentId })));
+        }
         return agent;
       }),
+    );
+  }
+
+  /** The agents this agent may delegate to, by name. Empty: delegation is off. */
+  async function getDelegationTargets(id: unknown): Promise<DelegationTarget[]> {
+    const agentId = parse(agentIdSchema, id);
+    return query(() =>
+      db
+        .select({ id: agents.id, name: agents.name, role: agents.role, enabled: agents.enabled })
+        .from(agentDelegationTargets)
+        .innerJoin(agents, eq(agents.id, agentDelegationTargets.targetAgentId))
+        .where(eq(agentDelegationTargets.agentId, agentId))
+        .orderBy(asc(sql`lower(${agents.name})`)),
     );
   }
 
@@ -81,8 +103,9 @@ export function createAgentService({ db, providers, tools = toolRegistry }: Depe
 
   async function update(id: unknown, input: unknown): Promise<Agent> {
     const agentId = parse(agentIdSchema, id);
-    const { tools: toolSettings, ...changes } = parse(updateAgentSchema, input);
+    const { tools: toolSettings, delegateTo, ...changes } = parse(updateAgentSchema, input);
     if (toolSettings) assertToolSettings(toolSettings);
+    if (delegateTo) await assertDelegationTargets(agentId, delegateTo);
 
     // The provider/model rule applies to the row as it will be after the
     // update, so fill in whichever half isn't changing from the current row.
@@ -108,6 +131,13 @@ export function createAgentService({ db, providers, tools = toolRegistry }: Depe
           await tx.delete(agentToolPermissions).where(eq(agentToolPermissions.agentId, agentId));
           if (toolSettings.length > 0) {
             await tx.insert(agentToolPermissions).values(toolSettings.map((tool) => ({ agentId, ...tool })));
+          }
+        }
+        // Like tools: applies from the next run on (the worker reads targets per run and per call).
+        if (updated.length > 0 && delegateTo) {
+          await tx.delete(agentDelegationTargets).where(eq(agentDelegationTargets.agentId, agentId));
+          if (delegateTo.length > 0) {
+            await tx.insert(agentDelegationTargets).values(delegateTo.map((targetAgentId) => ({ agentId, targetAgentId })));
           }
         }
         return updated;
@@ -138,6 +168,7 @@ export function createAgentService({ db, providers, tools = toolRegistry }: Depe
   async function duplicate(id: unknown): Promise<Agent> {
     const source = await get(id);
     const sourceTools = await getTools(source.id);
+    const sourceTargets = await getDelegationTargets(source.id);
     // Keep the model only while it's still selectable; otherwise start unconfigured.
     const keepModel = checkModelSelection(providers, source.providerId, source.modelId) === null;
 
@@ -152,6 +183,7 @@ export function createAgentService({ db, providers, tools = toolRegistry }: Depe
           modelId: keepModel ? source.modelId : null,
           enabled: false,
           tools: sourceTools,
+          delegateTo: sourceTargets.map((target) => target.id),
         });
       } catch (error) {
         if (error instanceof AgentServiceError && error.code === "name_taken") continue;
@@ -175,13 +207,25 @@ export function createAgentService({ db, providers, tools = toolRegistry }: Depe
   function assertToolSettings(settings: AgentToolSetting[]) {
     for (const setting of settings) {
       const tool = tools.get(setting.toolId);
-      const message = !tool
+      // Delegation is granted through delegation targets, never as a tool switch.
+      const message = !tool || !isPermissionTool(tool)
         ? `Unknown tool “${setting.toolId}”.`
         : tool.approval === "required" && setting.mode !== "ask"
           ? `${tool.name} always needs your approval.`
           : null;
       if (message) throw new AgentServiceError("validation_failed", message, { tools: [message] });
     }
+  }
+
+  /** Every target must be an existing agent, and never the agent itself. */
+  async function assertDelegationTargets(agentId: string | null, targetIds: string[]) {
+    const fail = (message: string) => {
+      throw new AgentServiceError("validation_failed", message, { delegateTo: [message] });
+    };
+    if (agentId && targetIds.includes(agentId)) fail("An agent can’t delegate to itself.");
+    if (targetIds.length === 0) return;
+    const found = await query(() => db.select({ id: agents.id }).from(agents).where(inArray(agents.id, targetIds)));
+    if (found.length !== targetIds.length) fail("One of the chosen agents no longer exists. Reload and choose again.");
   }
 
   function assertModelSelection(providerId: string | null, modelId: string | null) {
@@ -193,7 +237,7 @@ export function createAgentService({ db, providers, tools = toolRegistry }: Depe
     }
   }
 
-  return { list, get, getTools, create, update, remove, setEnabled, duplicate };
+  return { list, get, getTools, getDelegationTargets, create, update, remove, setEnabled, duplicate };
 }
 
 const MAX_COPY_ATTEMPTS = 20;
