@@ -124,6 +124,7 @@ export const TASK_STATUSES = [
   "queued",
   "running",
   "awaiting_approval",
+  "waiting_on_delegate",
   "completed",
   "failed",
   "cancelled",
@@ -149,6 +150,13 @@ export const tasks = pgTable(
     title: text("title").notNull(),
     instructions: text("instructions").notNull(),
     status: text("status", { enum: TASK_STATUSES }).notNull().default("queued"),
+    /**
+     * Set on a task another agent delegated (M5A): the task it serves. Its
+     * result goes back to that task. A function reference: tasks points at itself.
+     */
+    parentTaskId: uuid("parent_task_id").references((): AnyPgColumn => tasks.id, { onDelete: "cascade" }),
+    /** 0 for a task the owner created, 1 for a delegated one. Delegation stops at a configured depth. */
+    depth: integer("depth").notNull().default(0),
     /** The agent's final answer, saved when an attempt completes. */
     result: text("result"),
     /** Stable code and owner-safe message; set when the task failed or was interrupted. */
@@ -179,9 +187,11 @@ export const tasks = pgTable(
   (table) => [
     check(
       "tasks_status_valid",
-      sql`${table.status} in ('queued', 'running', 'awaiting_approval', 'completed', 'failed', 'cancelled', 'interrupted')`,
+      sql`${table.status} in ('queued', 'running', 'awaiting_approval', 'waiting_on_delegate', 'completed', 'failed', 'cancelled', 'interrupted')`,
     ),
     check("tasks_title_not_blank", sql`length(trim(${table.title})) > 0`),
+    check("tasks_depth_valid", sql`${table.depth} >= 0 and (${table.depth} = 0) = (${table.parentTaskId} is null)`),
+    index("tasks_parent_task_id_idx").on(table.parentTaskId),
     check("tasks_auto_retries_left_valid", sql`${table.autoRetriesLeft} between 0 and 5`),
     uniqueIndex("tasks_client_request_id_unique").on(table.clientRequestId),
     index("tasks_updated_at_idx").on(table.updatedAt),
@@ -210,6 +220,11 @@ export const runs = pgTable(
     taskId: uuid("task_id").references(() => tasks.id, { onDelete: "cascade" }),
     /** Which attempt at the task this is, from 1. Always 1 for conversation runs. */
     attempt: integer("attempt").notNull().default(1),
+    /**
+     * "work": a normal run. "continue" (M5A): a task's follow-up run after its
+     * delegated task finished, given that result instead of the delegation tool.
+     */
+    purpose: text("purpose", { enum: ["work", "continue"] }).notNull().default("work"),
     /** The worker that claimed it: whose heartbeat keeps it alive. */
     workerId: text("worker_id"),
     /** A scheduled retry isn't claimed before this time (backoff). */
@@ -255,6 +270,79 @@ export const runs = pgTable(
     // The worker looks for the oldest pending run.
     index("runs_status_created_at_idx").on(table.status, table.createdAt),
     index("runs_task_id_idx").on(table.taskId),
+    check("runs_purpose_valid", sql`${table.purpose} in ('work', 'continue')`),
+  ],
+);
+
+/**
+ * Which agents an agent may delegate tasks to (M5A). Like tool permissions:
+ * a row exists only for an allowed target, so delegation is off until the
+ * owner chooses targets. Deleting either agent removes the row.
+ */
+export const agentDelegationTargets = pgTable(
+  "agent_delegation_targets",
+  {
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    targetAgentId: uuid("target_agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.agentId, table.targetAgentId] }),
+    check("agent_delegation_targets_not_self", sql`${table.agentId} <> ${table.targetAgentId}`),
+  ],
+);
+
+export const DELEGATION_STATUSES = ["waiting", "completed", "failed", "cancelled"] as const;
+export type DelegationStatus = (typeof DELEGATION_STATUSES)[number];
+
+/**
+ * One delegation (M5A): a parent task's agent asked another agent to do a
+ * subtask, which became a child task. Records the request (exactly what was
+ * sent), its status, and whether the result reached the parent. The child's
+ * result itself stays on the child task.
+ */
+export const taskDelegations = pgTable(
+  "task_delegations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    parentTaskId: uuid("parent_task_id")
+      .notNull()
+      .references(() => tasks.id, { onDelete: "cascade" }),
+    /** The parent's run that asked for it. */
+    parentRunId: uuid("parent_run_id").references(() => runs.id, { onDelete: "set null" }),
+    parentAgentId: uuid("parent_agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    targetAgentId: uuid("target_agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    childTaskId: uuid("child_task_id")
+      .notNull()
+      .references(() => tasks.id, { onDelete: "cascade" }),
+    /** Exactly what the parent sent: the only information the child gets. */
+    taskDescription: text("task_description").notNull(),
+    expectedOutput: text("expected_output"),
+    /** Identifies a repeated request (same target and words), so a retry reuses the child. */
+    requestHash: text("request_hash").notNull(),
+    /** "waiting" until the child task completes, fails, or is cancelled. */
+    status: text("status", { enum: DELEGATION_STATUSES }).notNull().default("waiting"),
+    /** What the parent wrote before it delegated, given back to it with the result. */
+    parentNotes: text("parent_notes"),
+    /** When the result (or failure) was handed to the parent agent. */
+    resultDeliveredAt: timestamp("result_delivered_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("task_delegations_child_task_id_unique").on(table.childTaskId),
+    uniqueIndex("task_delegations_request_unique").on(table.parentTaskId, table.requestHash),
+    index("task_delegations_parent_task_id_idx").on(table.parentTaskId),
+    check("task_delegations_status_valid", sql`${table.status} in ('waiting', 'completed', 'failed', 'cancelled')`),
+    check("task_delegations_not_self", sql`${table.parentAgentId} <> ${table.targetAgentId}`),
   ],
 );
 
@@ -278,6 +366,10 @@ export const TASK_EVENT_TYPES = [
   "cancelled",
   "interrupted",
   "retry_scheduled",
+  "delegated",
+  "waiting_on_delegate",
+  "delegate_finished",
+  "continuation_queued",
 ] as const;
 export type TaskEventType = (typeof TASK_EVENT_TYPES)[number];
 
@@ -312,6 +404,10 @@ export type TaskEventData = {
   code?: string;
   /** For a scheduled retry: when it may start (ISO). */
   notBefore?: string;
+  /** Delegation (M5A): the other task involved. */
+  childTaskId?: string;
+  parentTaskId?: string;
+  delegationId?: string;
 };
 
 /**
@@ -391,3 +487,4 @@ export type MessageRow = typeof messages.$inferSelect;
 export type RunRow = typeof runs.$inferSelect;
 export type TaskRow = typeof tasks.$inferSelect;
 export type TaskEventRow = typeof taskEvents.$inferSelect;
+export type TaskDelegationRow = typeof taskDelegations.$inferSelect;

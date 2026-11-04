@@ -43,6 +43,13 @@
       "when": 1793749711004,
       "tag": "0005_tasks_and_task_events",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793752750349,
+      "tag": "0006_delegation",
+      "breakpoints": true
     }
   ]
 }
