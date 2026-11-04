@@ -285,10 +285,31 @@ The first real collaboration between agents, built on the M4B task system:
   Builder) and finished with the child's report.
 - No new dependencies.
 
-**M5B — Team management** *(proposed)*
-A team page: which agent may delegate to which (a small graph, not a
-canvas), per-team limits, and delegation history across tasks. Possibly
-several children per task, or depth two, once the costs are visible.
+**M5B — Teams** *(done 2026-11-04)*
+- **Teams:** create, edit, delete (with confirmation), list with search and
+  an agent filter, and a team page. Deleting a team keeps its agents, tasks,
+  and history.
+- **Roles:** `team_members.role` is "coordinator" or "member"; one
+  coordinator per team (partial unique index), always a member. The role is
+  a label, not a permission.
+- **Delegation inside a team:** the team page edits each member's M5A
+  delegation targets within the team; targets outside it are shown and
+  kept. Membership grants nothing; the backend checks explicit targets on
+  every delegation, with the M5A limits unchanged.
+- **Team tasks:** `tasks.team_id`, chosen when a task is created (its agent
+  must be a member); delegated tasks inherit it; later membership changes
+  don't move it. The team page shows its tasks and recent events; Tasks
+  filters by team.
+- **Navigation:** Teams in the sidebar; agent pages list their teams.
+- **Tests:** Vitest 284, Playwright 52 (the demo team is created through
+  the UI in the isolated e2e database).
+- No new dependencies.
+
+**M5C — Team-level insight** *(proposed)*
+Delegation history across a team's tasks (who delegated what, outcomes,
+time), per-team limits on concurrent tasks, and archiving teams instead of
+deleting them. Several children per task, or depth two, only once the
+costs are visible.
 
 **M4 — Runs you can inspect** *(proposed)*
 A run history per agent and conversation: status, timing, tokens, errors.
@@ -341,6 +362,7 @@ execution for any future shell or code tools.
 | Test tooling | ✓ M2A, M3B | Vitest (unit + integration); Playwright browser tests since M3B (`npm run test:e2e`) |
 | Background task execution | ✓ M4B | Tasks are runs with `task_id`: one queue, one worker, one runtime. Retries are automatic only after a lost worker or provider outage, once, when safe; otherwise "interrupted" for the owner |
 | How a parent waits for its child | ✓ M5A | Durable state, not an open process: the parent's run ends, the task waits as `waiting_on_delegate`, and a follow-up run gets a bounded reconstruction. SDK session resume stays unused (transcripts outside PostgreSQL) |
+| How tasks belong to teams | ✓ M5B | An explicit `tasks.team_id`, chosen at creation through a member, inherited by delegated tasks, never derived from membership; set null when the team is deleted |
 | Delegation limits | ✓ M5A | Depth 1, one child per task, targets chosen per agent; config in `DELEGATION_LIMITS` |
 | Live updates for tasks | ✓ M4B | Re-render from PostgreSQL every second while active (`router.refresh()`); SSE from `task_events` stays the upgrade path |
 | Resuming an approval after a worker restart | Later | Needs a resumable provider session; SDK resume was rejected in M3B (transcripts outside PostgreSQL). Until then: interrupted + Retry asks again |

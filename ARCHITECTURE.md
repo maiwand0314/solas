@@ -69,6 +69,7 @@ Four ideas to hold on to:
 | **Approvals** | Tool calls that need approval wait for the owner's decision in the conversation | `src/server/tools/invoker.ts`, `src/server/conversations/` | M4A |
 | **Tasks** | One-off assignments the worker runs in the background; each attempt is a run. State machine, retry policy, timeline | `src/server/tasks/` | M4B |
 | **Delegation** | One agent's task hands a subtask to another agent as a linked child task; permissions, limits, waiting, and follow-up | `src/server/tasks/delegation.ts`, `cancel.ts`, `src/server/tools/builtin/delegate.ts` | M5A |
+| **Teams** | Named groups of agents with a coordinator; a view onto delegation permissions and team tasks | `src/server/teams/`, `src/app/(app)/teams/` | M5B |
 | **Schedules** | Recurring triggers that create tasks | `src/server/tasks/` (later) | M8 |
 | **Authentication** | Single owner. Login page, database sessions, checks in every data-access function | `src/server/auth/`, `src/proxy.ts` | M9 |
 | **Deployment** | One VPS: web, worker, PostgreSQL, reverse proxy; private network access | `deploy/` (later) | M10 |
@@ -141,11 +142,19 @@ runs (M3A, built; extended in M4B)
 tasks (M4B, built — see §5.8)
   id, agent_id → agents (cascade), title, instructions,
   parent_task_id → tasks (M5A; set on a delegated task), depth (M5A; 0 or 1),
+  team_id → teams (M5B; set null when the team is deleted),
   status ('queued' | 'running' | 'awaiting_approval' | 'waiting_on_delegate' (M5A) |
           'completed' | 'failed' | 'cancelled' | 'interrupted'),
   result, error_code, error_message, cancel_requested_at,
   auto_retries_left, client_request_id (unique; idempotent create),
   created_at, updated_at, started_at, finished_at
+
+teams (M5B, built — see §5.10)
+  id, name (unique regardless of case), description, created_at, updated_at
+
+team_members (M5B, built)
+  team_id → teams, agent_id → agents (both cascade), role ('coordinator' | 'member'), created_at
+  primary key (team_id, agent_id); at most one coordinator per team (partial unique index)
 
 agent_delegation_targets (M5A, built — see §5.9)
   agent_id → agents, target_agent_id → agents (both cascade), created_at
@@ -855,6 +864,61 @@ on the target graph before it is allowed.
 | `src/components/agents/delegation-fields.tsx` | Agent Builder's Delegation section |
 | `src/components/tasks/task-detail.tsx` | Delegation card, "Delegated by" banner |
 
+### 5.10 Teams (built in M5B)
+
+A **team** is a named group of agents the owner uses to organise
+collaboration. It is deliberately thin: it doesn't run anything and grants
+nothing. It brings three things together on one page: who is in the group,
+who may delegate to whom (the M5A permissions), and the work given to it.
+
+**Storage.** `teams` (name, description) and `team_members` (team, agent,
+role). The primary key makes a duplicate membership impossible. The
+**coordinator** is the member whose role is "coordinator"; a partial unique
+index allows one per team, so a coordinator is always a member and there is
+no separate column to keep in sync. Deleting an agent removes its
+membership rows (and with them a coordinator role); deleting a team removes
+its rows and nothing else.
+
+**Membership and roles.** The team form sends the members as a set and an
+optional coordinator; the service validates both (agents exist, coordinator
+among the members), replaces the set in one transaction, and demotes before
+it promotes so the "one coordinator" index holds at every step. The
+coordinator role is a label for the owner and the team page. It gives no
+permission and changes no rule.
+
+**Delegation inside a team.** There is still exactly one source of truth:
+`agent_delegation_targets`. The team page edits a member's targets **within
+the team** (`setDelegation`): targets that are team members are replaced;
+targets outside the team are left alone and shown with a link to the
+agent's own settings. The service checks that both sides are members, never
+self, and the per-agent limit. Joining a team grants nothing; leaving one
+removes nothing. The delegation tool checks the explicit target on every
+call, with the M5A limits unchanged (one child per task, depth one).
+
+**Tasks and teams.** `tasks.team_id` is set only when the owner chooses a
+team in the New task form, and only through one of its members (checked by
+the task service). A delegated task inherits its parent's team, since it is
+part of the same work. The link is never derived from membership: an agent
+in two teams doesn't put its tasks in both, and later membership changes
+don't move old tasks. Deleting a team sets the link to null; the task, its
+runs, and its events stay. The team page lists the team's tasks and the
+newest events on them, read from `task_events`; Tasks filters by `?team=`.
+
+**Extending it later.** Per-team limits (concurrent tasks, delegation budget)
+would be columns on `teams` read by the worker; archiving would be an
+`archived_at` column instead of delete, keeping task links; a team-level
+delegation history is a query over `task_delegations` joined to team tasks.
+None of these needs a change to the task engine.
+
+**Files.**
+
+| File | Responsibility |
+| --- | --- |
+| `src/server/teams/service.ts` | Teams, membership, coordinator, delegation within a team, team view |
+| `src/lib/teams/validation.ts` | Shared input rules (coordinator must be a member) |
+| `src/server/tasks/service.ts` | Team link on create (membership check), filter by team |
+| `src/components/teams/` | List, form, team page, delegation editor, delete dialog |
+
 ## 6. Request flows
 
 ### 6.1 Sending a message
@@ -920,6 +984,7 @@ src/
 │  │  ├─ agents/ …            list, new, [agentId]
 │  │  ├─ conversations/ …     list, [conversationId]
 │  │  ├─ tasks/ …             list, new, [taskId] (M4B)
+│  │  ├─ teams/ …             list, new, [teamId], edit (M5B)
 │  │  ├─ automations/ …       schedules (M8)
 │  │  ├─ loading.tsx          skeleton shown while a page loads
 │  │  └─ settings/
@@ -942,6 +1007,7 @@ src/
 │  ├─ logger.ts               JSON-line logs, scalar fields only            (M3A)
 │  ├─ tools/                  registry, builtin/ tools, workspace, invoker  (M4A)
 │  ├─ tasks/                  lifecycle, service, execution, events (M4B); delegation, cancel (M5A)
+│  ├─ teams/                  service, queries, errors                      (M5B)
 ├─ test/                      Vitest global setup (test database)           (M2A)
 ├─ worker/index.mts          worker entry point and job loop               (M3A)
 └─ proxy.ts                   (M9)

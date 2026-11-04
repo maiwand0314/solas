@@ -1297,3 +1297,128 @@ tested).
   a `mode` column, return it from `permissionFor` in the invoker, and the
   existing approval flow does the rest. Write one test where a rejected
   delegation creates no child task.
+
+## M5B — Teams (2026-11-04)
+
+**Built:** A Teams section. You can group agents into teams, give a team a
+coordinator, and see on one page who is in it, what each member can do,
+who may delegate to whom, the team's tasks, and recent activity on them.
+Delegation between members is set right there, and it is still the same
+explicit M5A permission. A task can be given to a team when you create it.
+
+**Concepts**
+1. **How teams are stored.**
+   - `teams` holds the name and description.
+   - `team_members` holds one row per agent per team, with a role. The
+     primary key `(team_id, agent_id)` makes a duplicate membership
+     impossible.
+   - Foreign keys with cascade mean deleting a team or an agent removes
+     only the membership rows.
+2. **How membership works.** The form sends the members as a set. The
+   service checks that the agents exist, then replaces the set in one
+   transaction: it removes the missing rows and adds the new ones (`ON
+   CONFLICT DO NOTHING` keeps the existing rows as they are).
+3. **How coordinators are assigned.** There's no `coordinator_id` column.
+   The coordinator is the member whose role is "coordinator", and a
+   *partial unique index* (`unique (team_id) where role = 'coordinator'`)
+   allows one per team. So a coordinator is always a member, and removing
+   the member removes the role. When the coordinator changes, the service
+   demotes everyone first and then promotes the new one, so the index holds
+   at every step. The role is a label: it grants no permission.
+4. **How delegation permissions are enforced.** There is still one source
+   of truth, `agent_delegation_targets`. The team page edits a member's
+   targets within the team and leaves targets outside the team alone. Being
+   in a team or coordinating it gives nothing. The delegation tool checks
+   the explicit target on every call, with the M5A limits unchanged.
+5. **How tasks are associated with teams.**
+   - `tasks.team_id` is set only when you choose a team for a new task, and
+     only through one of its members.
+   - A delegated task inherits its parent's team.
+   - The link is never derived from membership, so later changes don't
+     rewrite history.
+   - Deleting the team sets the link to null; the task stays.
+6. **How to extend it later.**
+   - Per-team limits: columns on `teams`, read by the worker.
+   - Archiving: an `archived_at` column instead of delete.
+   - Team-level delegation history: a query joining `task_delegations` to
+     the team's tasks.
+   - None of these needs a change to the task engine.
+
+**Lessons**
+- **Let the schema make the invalid state impossible.** "The coordinator
+  must be a member" could be a check in code that someone forgets. As a
+  role on the membership row with a partial unique index, it can't be wrong
+  at all.
+- **One source of truth for permissions.** It was tempting to store team
+  delegation separately. Editing the same `agent_delegation_targets` from
+  the team page means the agent page, the team page, and the worker can
+  never disagree.
+- **Explicit beats derived for history.** Deriving a task's team from
+  current membership would rewrite the past every time membership changes.
+  A link chosen at creation stays true.
+- **Locators can be too eager.** `getByLabel("Team")` matched "Teams" in the
+  navigation. Name-based selectors (`select[name="teamId"]`) are more
+  precise for fields.
+
+**Limitations (honest list)**
+- **Deleting a team removes the link from its tasks.** They stay, but no
+  longer show which team they were for. Archiving would keep it (later).
+- **The team task list shows the newest 20 tasks and 15 events.** Tasks
+  filtered by team shows them all.
+- **No team-level limits yet.** The M5A limits apply per task.
+- **The coordinator is only a label.** It doesn't route work or approve
+  anything.
+
+**Files changed**
+- New:
+  - `src/server/teams/` (service, queries, errors, tests) and
+    `src/lib/teams/validation.ts`;
+  - `src/app/(app)/teams/` (list, new, team page, edit, actions,
+    not-found, error);
+  - `src/components/teams/` (list, form, team page, delegation editor,
+    delete dialog);
+  - `e2e/teams.spec.ts`.
+- Database: `drizzle/0007_teams.sql`. It adds two tables and
+  `tasks.team_id`, and deletes nothing.
+- Changed:
+  - schema;
+  - task validation, service, and queries (team link and filter);
+  - delegation (children inherit the team);
+  - New task form and page (Team field), Tasks page and list (team filter
+    and label), task page (team link);
+  - agent page (its teams);
+  - navigation, icons, breadcrumbs, action errors, load errors;
+  - e2e helpers.
+
+**How it was verified**
+- `lint`, `typecheck`, and `build` pass.
+- Vitest: 284 tests pass. 13 new tests cover:
+  - creating, validation (name, unique name, unknown agents, coordinator
+    not a member, duplicates), and updating members and the coordinator;
+  - the database refusing duplicates and a second coordinator;
+  - deleting a team (agents, tasks, and runs stay) and deleting an agent
+    (membership and coordinator role go);
+  - member status and capabilities, including disabled and unconfigured
+    agents;
+  - membership granting no delegation, with the backend refusing it;
+  - setting targets within a team while keeping outside ones, and the
+    refusals;
+  - task links (only through members, never via membership), history kept
+    when membership changes, and delegated tasks keeping the team.
+  - All M5A delegation tests still pass.
+- Playwright: 52 tests pass (7 new). They cover:
+  - the demo, through the UI in the isolated e2e database: "Solas
+    Development Team" with Project Manager (coordinator), Developer, and
+    Research Assistant; delegation set with the keyboard; a team task
+    shown on the team page, in its activity, and in the team's task list;
+  - editing, deleting (agents and tasks kept), search and filter, agent
+    pages, and agent deletion;
+  - disabled members;
+  - a 375 px phone in light and dark.
+- No demo team was created in your own database, and no AI task was run.
+
+**Exercise**
+- Add an "Archive" action for teams. Give `teams` an `archived_at` column,
+  hide archived teams from the list (with a "Show archived" toggle), and
+  keep their task links. Write one test showing an archived team's task
+  still shows its team.
