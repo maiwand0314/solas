@@ -23,9 +23,12 @@ export const {
   tasks,
   taskEvents,
   taskDelegations,
+  teams,
+  teamMembers,
 } = schema;
 
 export async function resetDatabase() {
+  await db.delete(teams); // cascades to team membership
   await db.delete(agents); // cascades to conversations, messages, tasks, and runs
 }
 

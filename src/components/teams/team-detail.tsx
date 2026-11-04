@@ -102,7 +102,7 @@ export function TeamDetail({ detail }: { detail: TeamDetailData }) {
                 <li key={task.id} className="relative flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 hover:bg-surface-hover/60">
                   <Link
                     href={`/tasks/${task.id}`}
-                    className="min-w-0 flex-1 truncate font-medium after:absolute after:inset-0 after:content-['']"
+                    className="min-w-0 basis-full truncate font-medium after:absolute after:inset-0 after:content-[''] sm:flex-1 sm:basis-auto"
                   >
                     {task.title}
                   </Link>
