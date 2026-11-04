@@ -50,6 +50,13 @@
       "when": 1793752750349,
       "tag": "0006_delegation",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1793756302691,
+      "tag": "0007_teams",
+      "breakpoints": true
     }
   ]
 }

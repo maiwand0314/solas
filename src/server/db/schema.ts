@@ -120,6 +120,59 @@ export const messages = pgTable(
 export const RUN_STATUSES = ["pending", "running", "completed", "failed", "cancelled"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
+/**
+ * A team of agents (M5B): a named group the owner uses to organise agents
+ * that work together. Membership and roles are in team_members. A team
+ * grants nothing by itself: delegation still needs explicit targets.
+ */
+export const teams = pgTable(
+  "teams",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => sql`now()`),
+  },
+  (table) => [
+    uniqueIndex("teams_name_lower_unique").on(sql`lower(${table.name})`),
+    check("teams_name_not_blank", sql`length(trim(${table.name})) > 0`),
+  ],
+);
+
+export const TEAM_ROLES = ["coordinator", "member"] as const;
+export type TeamRole = (typeof TEAM_ROLES)[number];
+
+/**
+ * Which agents belong to which team, and in which role. One row per agent
+ * per team (the primary key prevents duplicates). The coordinator is simply
+ * the member whose role is "coordinator", so a coordinator is always a member,
+ * and at most one per team (partial unique index). Deleting a team or an
+ * agent removes its rows; the agents and tasks themselves stay.
+ */
+export const teamMembers = pgTable(
+  "team_members",
+  {
+    teamId: uuid("team_id")
+      .notNull()
+      .references(() => teams.id, { onDelete: "cascade" }),
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    role: text("role", { enum: TEAM_ROLES }).notNull().default("member"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.teamId, table.agentId] }),
+    uniqueIndex("team_members_one_coordinator").on(table.teamId).where(sql`${table.role} = 'coordinator'`),
+    index("team_members_agent_id_idx").on(table.agentId),
+    check("team_members_role_valid", sql`${table.role} in ('coordinator', 'member')`),
+  ],
+);
+
 export const TASK_STATUSES = [
   "queued",
   "running",
@@ -157,6 +210,12 @@ export const tasks = pgTable(
     parentTaskId: uuid("parent_task_id").references((): AnyPgColumn => tasks.id, { onDelete: "cascade" }),
     /** 0 for a task the owner created, 1 for a delegated one. Delegation stops at a configured depth. */
     depth: integer("depth").notNull().default(0),
+    /**
+     * The team this task was given to (M5B), chosen when it's created (a
+     * delegated task inherits its parent's). Fixed afterwards: later
+     * membership changes don't move it. Deleting the team keeps the task.
+     */
+    teamId: uuid("team_id").references(() => teams.id, { onDelete: "set null" }),
     /** The agent's final answer, saved when an attempt completes. */
     result: text("result"),
     /** Stable code and owner-safe message; set when the task failed or was interrupted. */
@@ -192,6 +251,7 @@ export const tasks = pgTable(
     check("tasks_title_not_blank", sql`length(trim(${table.title})) > 0`),
     check("tasks_depth_valid", sql`${table.depth} >= 0 and (${table.depth} = 0) = (${table.parentTaskId} is null)`),
     index("tasks_parent_task_id_idx").on(table.parentTaskId),
+    index("tasks_team_id_idx").on(table.teamId),
     check("tasks_auto_retries_left_valid", sql`${table.autoRetriesLeft} between 0 and 5`),
     uniqueIndex("tasks_client_request_id_unique").on(table.clientRequestId),
     index("tasks_updated_at_idx").on(table.updatedAt),
@@ -488,3 +548,5 @@ export type RunRow = typeof runs.$inferSelect;
 export type TaskRow = typeof tasks.$inferSelect;
 export type TaskEventRow = typeof taskEvents.$inferSelect;
 export type TaskDelegationRow = typeof taskDelegations.$inferSelect;
+export type TeamRow = typeof teams.$inferSelect;
+export type TeamMemberRow = typeof teamMembers.$inferSelect;
