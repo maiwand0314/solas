@@ -12,7 +12,18 @@ import * as schema from "../src/server/db/schema";
 // connections close themselves, and the worker process ends after the run.
 const client = postgres(e2eDatabaseUrl(), { max: 2, idle_timeout: 1, onnotice: () => {} });
 export const db = drizzle({ client, schema });
-export const { agents, agentToolPermissions, conversations, messages, runs, toolCalls, tasks, taskEvents } = schema;
+export const {
+  agents,
+  agentToolPermissions,
+  agentDelegationTargets,
+  conversations,
+  messages,
+  runs,
+  toolCalls,
+  tasks,
+  taskEvents,
+  taskDelegations,
+} = schema;
 
 export async function resetDatabase() {
   await db.delete(agents); // cascades to conversations, messages, tasks, and runs
@@ -156,4 +167,36 @@ export async function runsOfTask(taskId: string) {
 
 export async function addTaskEvent(taskId: string, runId: string, type: schema.TaskEventType, message: string) {
   await db.insert(taskEvents).values({ taskId, runId, type, message });
+}
+
+/**
+ * A delegation as the worker leaves it: a child task (with one attempt) for
+ * `targetAgentId`, linked to the parent task.
+ */
+export async function createDelegation(
+  parent: { id: string; agentId: string; title: string },
+  targetAgentId: string,
+  { child = {}, delegation = {} }: { child?: SeedTask; delegation?: Partial<typeof taskDelegations.$inferInsert> } = {},
+) {
+  const created = await createTask(targetAgentId, {
+    title: "Turn the findings into a short report",
+    instructions: "Turn these findings into a short report: A is fast, B is safe.",
+    parentTaskId: parent.id,
+    depth: 1,
+    ...child,
+  });
+  const [link] = await db
+    .insert(taskDelegations)
+    .values({
+      parentTaskId: parent.id,
+      parentAgentId: parent.agentId,
+      targetAgentId,
+      childTaskId: created.task.id,
+      taskDescription: "Turn these findings into a short report: A is fast, B is safe.",
+      expectedOutput: "Three bullet points",
+      requestHash: crypto.randomUUID(),
+      ...delegation,
+    })
+    .returning();
+  return { ...created, delegation: link };
 }
