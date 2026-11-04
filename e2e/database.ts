@@ -12,10 +12,10 @@ import * as schema from "../src/server/db/schema";
 // connections close themselves, and the worker process ends after the run.
 const client = postgres(e2eDatabaseUrl(), { max: 2, idle_timeout: 1, onnotice: () => {} });
 export const db = drizzle({ client, schema });
-export const { agents, agentToolPermissions, conversations, messages, runs, toolCalls } = schema;
+export const { agents, agentToolPermissions, conversations, messages, runs, toolCalls, tasks, taskEvents } = schema;
 
 export async function resetDatabase() {
-  await db.delete(agents); // cascades to conversations, messages, and runs
+  await db.delete(agents); // cascades to conversations, messages, tasks, and runs
 }
 
 export async function createAgent(overrides: Partial<typeof agents.$inferInsert> = {}) {
@@ -84,7 +84,7 @@ export async function messagesOf(conversationId: string) {
 export async function completeRun(runId: string, text: string) {
   await db.transaction(async (tx) => {
     const [run] = await tx.select().from(runs).where(eq(runs.id, runId));
-    await tx.insert(messages).values({ conversationId: run.conversationId, role: "assistant", content: text, runId });
+    await tx.insert(messages).values({ conversationId: run.conversationId!, role: "assistant", content: text, runId });
     await tx.update(runs).set({ status: "completed", partialOutput: null, finishedAt: new Date() }).where(eq(runs.id, runId));
   });
 }
@@ -120,4 +120,40 @@ export async function createToolCall(runId: string, overrides: Partial<typeof to
 export async function toolCallById(id: string) {
   const [call] = await db.select().from(toolCalls).where(eq(toolCalls.id, id));
   return call;
+}
+
+type SeedTask = Partial<typeof tasks.$inferInsert> & {
+  /** The latest attempt's state; pending unless overridden. */
+  run?: Partial<typeof runs.$inferInsert>;
+  /** Timeline entries, oldest first. */
+  events?: { type: schema.TaskEventType; message: string }[];
+};
+
+/** A task with one attempt, in whatever state a test needs, as the web app and worker would leave it. */
+export async function createTask(agentId: string, { run: runFields, events = [], ...fields }: SeedTask = {}) {
+  const [task] = await db
+    .insert(tasks)
+    .values({ agentId, title: "Research AI Agent Architectures", instructions: "Compare three kinds of AI systems.", ...fields })
+    .returning();
+  const [run] = await db.insert(runs).values({ taskId: task.id, agentId, attempt: 1, ...runFields }).returning();
+  const timeline = [
+    { type: "created" as const, message: "You created this task." },
+    { type: "queued" as const, message: "Queued as attempt 1. It starts when the worker picks it up." },
+    ...events,
+  ];
+  for (const event of timeline) await db.insert(taskEvents).values({ taskId: task.id, runId: run.id, ...event });
+  return { task, run };
+}
+
+export async function taskById(id: string) {
+  const [task] = await db.select().from(tasks).where(eq(tasks.id, id));
+  return task;
+}
+
+export async function runsOfTask(taskId: string) {
+  return db.select().from(runs).where(eq(runs.taskId, taskId)).orderBy(runs.attempt);
+}
+
+export async function addTaskEvent(taskId: string, runId: string, type: schema.TaskEventType, message: string) {
+  await db.insert(taskEvents).values({ taskId, runId, type, message });
 }
