@@ -95,7 +95,7 @@ the background.
 ### Out of scope for the MVP (planned later)
 
 - Tools beyond plain conversation, and the approval flow (M6–M7; foundation in M4A)
-- Schedules (M8; one-off tasks arrived in M4B)
+- Schedules (done in M6A; one-off tasks arrived in M4B)
 - Authentication (M9) — required before any network exposure
 - Deployment / phone access (M10)
 - Integrations, notifications, multi-agent collaboration (M11+)
@@ -326,9 +326,37 @@ Remaining: writing tools inside the workspace (with approval), more Solas
 tools, approvals that survive a worker restart, and a per-agent audit view.
 Shell stays disabled.
 
-**M8 — Schedules** *(one-off tasks done in M4B)*
-Schedules (cron-like) that create tasks, with run history, pause / resume, and
-budgets per agent.
+**M6A — Scheduled tasks and automations** *(done 2026-11-04)*
+- **Automations:** create, edit, pause / resume, delete (with confirmation),
+  and Run now (confirmed). An agent, task instructions, and a schedule:
+  once, every N minutes or hours, daily, weekly on chosen days, or monthly.
+  Time zone per automation (default Europe/Oslo), daylight saving handled
+  with `Intl`, no new dependency.
+- **Scheduler in the worker:** every 15 s, due automations are locked with
+  `FOR UPDATE SKIP LOCKED`; each run is an occurrence, unique per
+  automation and scheduled time, and creates an ordinary task in the
+  existing queue (`tasks.automation_id`) in the same transaction.
+- **Policy:** no overlapping runs; missed runs are skipped and recorded,
+  never caught up; a missed one-time run is shown with Run now or a new
+  time; scheduled runs pause for an hour after a Claude usage limit.
+- **Safeguards (`AUTOMATION_LIMITS`):** interval of at least an hour, at
+  most 10 active automations, 24 runs a day, 2 automation tasks at once.
+  Permissions, approvals, workspaces, timeouts, and retries are the task
+  engine's own.
+- **UI:** Automations list (state, agent, schedule, next run, last result),
+  detail (schedule, upcoming runs, latest result, history linked to tasks),
+  a form with a live preview; tasks link back to their automation.
+- **Tests:** Vitest 331, Playwright 61, and one controlled real run (a
+  short-lived one-time automation on Haiku). The demo automation was
+  created in the isolated e2e database.
+- No new dependencies.
+
+**M6B — Automation follow-through** *(proposed)*
+Knowing what happened without watching the page: an in-app inbox (or
+local notification) for failed and missed runs and for approvals waiting
+on a scheduled task; per-automation run limits; optionally giving an
+automation's tasks to a team. Before any VPS: run the worker under a
+process manager so schedules survive reboots.
 
 ### Phase 3 — Away from the laptop
 
@@ -362,6 +390,8 @@ execution for any future shell or code tools.
 | Test tooling | ✓ M2A, M3B | Vitest (unit + integration); Playwright browser tests since M3B (`npm run test:e2e`) |
 | Background task execution | ✓ M4B | Tasks are runs with `task_id`: one queue, one worker, one runtime. Retries are automatic only after a lost worker or provider outage, once, when safe; otherwise "interrupted" for the owner |
 | How a parent waits for its child | ✓ M5A | Durable state, not an open process: the parent's run ends, the task waits as `waiting_on_delegate`, and a follow-up run gets a bounded reconstruction. SDK session resume stays unused (transcripts outside PostgreSQL) |
+| How scheduled runs start | ✓ M6A | The worker's scheduler creates ordinary tasks; a run's identity is (automation, scheduled time) with a unique index; no second queue |
+| Missed scheduled runs | ✓ M6A | Skipped and recorded (one row per gap), never caught up; a run up to 10 minutes late still starts; a missed one-time run waits for the owner |
 | How tasks belong to teams | ✓ M5B | An explicit `tasks.team_id`, chosen at creation through a member, inherited by delegated tasks, never derived from membership; set null when the team is deleted |
 | Delegation limits | ✓ M5A | Depth 1, one child per task, targets chosen per agent; config in `DELEGATION_LIMITS` |
 | Live updates for tasks | ✓ M4B | Re-render from PostgreSQL every second while active (`router.refresh()`); SSE from `task_events` stays the upgrade path |

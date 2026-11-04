@@ -143,6 +143,7 @@ tasks (M4B, built — see §5.8)
   id, agent_id → agents (cascade), title, instructions,
   parent_task_id → tasks (M5A; set on a delegated task), depth (M5A; 0 or 1),
   team_id → teams (M5B; set null when the team is deleted),
+  automation_id → automations (M6A; set null when the automation is deleted),
   status ('queued' | 'running' | 'awaiting_approval' | 'waiting_on_delegate' (M5A) |
           'completed' | 'failed' | 'cancelled' | 'interrupted'),
   result, error_code, error_message, cancel_requested_at,
@@ -182,7 +183,19 @@ tool_calls (M4A, built; also the approval record)
   requires_approval, approval_expires_at, decided_at,
   result_summary, error_message, created_at, finished_at
 
-schedules (M8)    id, agent_id, task template, cron, timezone, enabled, next_run_at, …
+automations (M6A, built — see §5.11)
+  id, name (unique regardless of case), description, agent_id → agents (cascade),
+  instructions, schedule (jsonb: once | interval | daily | weekly | monthly),
+  time_zone (IANA, default Europe/Oslo), enabled, schedule_anchor_at,
+  next_run_at (null while paused or when nothing is left), last_run_at,
+  created_at, updated_at
+  check: a paused automation has no next run
+
+automation_occurrences (M6A, built)
+  id, automation_id → automations (cascade), scheduled_for, trigger ('schedule' | 'manual'),
+  status ('started' | 'missed' | 'skipped'), reason (why skipped), missed_count,
+  message (written by Solas), task_id → tasks (unique; set null), created_at
+  unique (automation_id, scheduled_for): the deterministic identity of a run
 sessions (M9)     id, token_hash, expires_at, user_agent, created_at
 ```
 
@@ -919,6 +932,139 @@ None of these needs a change to the task engine.
 | `src/server/tasks/service.ts` | Team link on create (membership check), filter by team |
 | `src/components/teams/` | List, form, team page, delegation editor, delete dialog |
 
+### 5.11 Automations and the scheduler (built in M6A)
+
+An **automation** is an agent, task instructions, and a schedule. It never
+runs anything itself: when a run is due, the worker's scheduler creates an
+ordinary task, and the task goes through the same queue, permissions,
+approvals, timeouts, and retry policy as one the owner created (§5.8).
+
+**Schedules.** Five kinds, stored as JSON and validated in code
+(`src/lib/automations/`): once at a date and time; every N minutes or hours;
+daily at a time; weekly on chosen days; monthly on a day (the last day in
+shorter months). Times of day are **wall-clock times in the automation's
+time zone** (IANA, default `Europe/Oslo`), converted with the platform's
+time zone data (`Intl`), no library:
+
+- 08:00 stays 08:00 Oslo time across daylight saving changes;
+- a time that doesn't exist (02:30 on the spring-forward night) runs at
+  03:30, shifted by the gap;
+- a time that happens twice (02:30 on the fall-back night) runs once, the
+  first time.
+
+An interval is elapsed time from when the schedule was set
+(`schedule_anchor_at`), so it isn't affected by daylight saving and doesn't
+drift with the scheduler's polling.
+
+**The scheduler.** It runs inside the worker (`createScheduler`), every 15
+seconds, after crash recovery. Each check:
+
+```
+SELECT due automations: enabled AND next_run_at <= now()          (database clock)
+for each, in its own transaction:
+  SELECT … FOR UPDATE SKIP LOCKED      another worker skips it instead of waiting
+  planDueRuns(schedule, next_run_at, now):
+     every run due by now; only the latest may start, and only if it is at
+     most 10 minutes late; all others are "missed"
+  INSERT occurrence 'missed' (one row for the whole gap, with missed_count)
+  safeguards (checkCanStart) → INSERT occurrence 'started' … ON CONFLICT DO NOTHING
+                               → only if inserted: task + attempt 1 + events
+                             or INSERT occurrence 'skipped' with the reason
+  UPDATE next_run_at = the next run after now
+```
+
+**Why there are no duplicates.** Three layers, each enough on its own:
+
+1. the row lock with `SKIP LOCKED`: one transaction handles an automation at
+   a time, and the `next_run_at <= now` condition is checked again under the
+   lock;
+2. the occurrence's identity is `(automation_id, scheduled_for)` with a
+   unique index; the task is created only if this transaction inserted the
+   occurrence row, in the same transaction;
+3. `next_run_at` moves on in that transaction, so a later check doesn't see
+   the run as due.
+
+Tests run five schedulers at once over the same due automations (exactly
+one task each), and wind `next_run_at` back by hand (no second task).
+
+**Safeguards.** `checkCanStart` runs inside the transaction, under a
+transaction-scoped advisory lock (`pg_advisory_xact_lock`) so two workers
+can't both pass the counts. In order:
+
+| Check | Default | When it fails |
+| --- | --- | --- |
+| The agent is enabled and has a model | — | Skipped (`agent_unavailable`) |
+| The automation's previous task has finished | no overlap | Skipped (`overlap`) |
+| No Claude usage-limit error recently | 60 min cooldown | Skipped (`usage_limit`) |
+| Automation tasks queued or running, across all automations | 2 | Skipped (`concurrency_limit`) |
+| Automation tasks created in the last 24 hours | 24 | Skipped (`daily_limit`) |
+
+Saving also checks: at most 10 active automations, an interval of at least
+an hour, and the active schedules' worst-case runs per day within 24. All
+values live in `AUTOMATION_LIMITS` (`src/lib/automations/limits.ts`). The
+execution timeout (10 minutes), automatic retries (once, only when provably
+safe; never after a usage limit), tool permissions, and approvals are the
+task engine's own, unchanged.
+
+**Missed runs.** Runs that couldn't start within 10 minutes of their time
+(the worker was stopped, or the database unreachable) are **skipped and
+recorded, never caught up**: after a week of downtime, an hourly automation
+gets one "missed 168 runs" row, not 168 tasks. If the worker comes back
+within the grace period, the latest run still starts. A **missed one-time
+run** is recorded, the automation shows "Missed", and a callout offers Run
+now or a new time; it never starts late on its own.
+
+**Pause, resume, edit.** Pause clears `next_run_at` (a check constraint
+ensures a paused automation has none). Resume counts the next run from now,
+so nothing missed while paused is caught up. Editing the name or
+instructions keeps the planned run; a new schedule or time zone recalculates
+it. A one-time run in the past is refused. Pausing or deleting doesn't stop
+a task already running: it is cancelled from its task page.
+
+**Run now.** The owner's explicit start (after a confirmation, since it is a
+real Claude run): a `manual` occurrence at the current time, with the same
+safeguards. It's also how a missed one-time run is handled.
+
+**When the worker stops.** Nothing is lost and nothing piles up. Schedules
+and `next_run_at` are in PostgreSQL. A task the scheduler created is a
+pending run like any other; an attempt cut off mid-run is recovered by the
+task engine (retried once if safe, otherwise interrupted). On restart,
+recovery runs first, then the scheduler handles what is due, missed, or
+next.
+
+**Permissions.** The scheduler only creates tasks. The task runs as its
+agent, with the agent's own tools read fresh at the start of the run,
+inside its workspace, with every tool call checked by the invoker. A tool
+in "ask" mode waits for the owner; an unattended 08:00 run whose approval
+nobody gives expires after 5 minutes and the tool never runs.
+
+**Reliable 24/7 operation needs:**
+
+- the worker running all the time, restarted on failure by a process
+  manager (systemd on a VPS; `launchd` or a terminal on this Mac). A
+  sleeping laptop misses runs;
+- PostgreSQL with backups, on the same host or reachable from it;
+- one or more workers: extra workers are safe (the locks above), but each
+  counts against the Claude plan;
+- a correct system clock (NTP). The scheduler uses the database clock;
+- a decision on unattended Claude use on a server (§5.1 and M10): runs
+  without the owner present make the credential question stricter;
+- later: notifications for failures, missed runs, and approvals waiting,
+  since nobody is watching the page at 08:00.
+
+**Files.**
+
+| File | Responsibility |
+| --- | --- |
+| `src/lib/automations/schedule.ts` | Next run, time zones, daylight saving, what's due or missed, descriptions |
+| `src/lib/automations/validation.ts`, `limits.ts` | Shared input rules and the safeguards |
+| `src/server/automations/scheduler.ts` | The worker's scheduler: lock, plan, record, start, advance |
+| `src/server/automations/start.ts` | Safeguards and starting a run (shared with Run now) |
+| `src/server/automations/service.ts` | Create, edit, pause/resume, delete, Run now, views |
+| `src/server/tasks/create.ts` | Task + first attempt + events, shared by the task service and automations |
+| `src/server/runs/worker-loop.ts`, `src/worker/index.mts` | The scheduler's place in the worker loop |
+| `src/components/automations/` | List, form with preview, detail with history, controls |
+
 ## 6. Request flows
 
 ### 6.1 Sending a message
@@ -946,12 +1092,16 @@ waits. If the worker stops during a wait, the request is withdrawn
 usual; a task becomes "interrupted", and Retry starts a new attempt that asks
 again (§5.8). Resuming a session after a restart is a later refinement.
 
-### 6.3 Scheduled task (M8)
+### 6.3 Scheduled task (built in M6A)
 
 ```
-Worker scheduler tick → schedules where next_run_at <= now and enabled
-  → create a task (as createTask does: task + attempt 1) → advance next_run_at
-  → normal task flow (§5.8); result visible under Tasks
+Owner saves an automation → next_run_at computed (time zone aware); nothing runs yet
+Worker, every 15 s → due automations, each locked with FOR UPDATE SKIP LOCKED
+  → missed runs recorded · the latest due run checked by the safeguards
+  → occurrence (unique per automation and time) + task + attempt 1, in one transaction
+  → next_run_at moves on
+Worker run loop → claims the task's run like any other → normal task flow (§5.8)
+Browser → the automation's history links each run to its task
 ```
 
 ## 7. Security model
@@ -970,6 +1120,7 @@ Worker scheduler tick → schedules where next_run_at <= now and enabled
 | Authentication | Single owner (M9) before any network exposure; checks in the data layer, not only in Proxy |
 | Mutations | Server Actions (origin-checked) and Route Handlers (validate `Origin` and body) |
 | Abuse and cost | Budgets per run, one concurrent run by default (at most 3), no automatic retry after a usage limit, bounded retries otherwise, rate limits (M9) |
+| Scheduled work (M6A) | Automations only create tasks, so permissions, approvals, workspaces, and timeouts apply unchanged; caps on active automations, runs per day, and concurrent automation tasks; minimum interval of an hour; no overlap; no catch-up after downtime; scheduled runs pause after a usage limit |
 | Deployment | Security review checklist and owner approval before M10; private access preferred |
 
 ## 8. Folder structure (target)
@@ -985,7 +1136,7 @@ src/
 │  │  ├─ conversations/ …     list, [conversationId]
 │  │  ├─ tasks/ …             list, new, [taskId] (M4B)
 │  │  ├─ teams/ …             list, new, [teamId], edit (M5B)
-│  │  ├─ automations/ …       schedules (M8)
+│  │  ├─ automations/ …       list, new, [automationId], edit (M6A)
 │  │  ├─ loading.tsx          skeleton shown while a page loads
 │  │  └─ settings/
 │  ├─ (auth)/login/           (M9)
@@ -1008,6 +1159,7 @@ src/
 │  ├─ tools/                  registry, builtin/ tools, workspace, invoker  (M4A)
 │  ├─ tasks/                  lifecycle, service, execution, events (M4B); delegation, cancel (M5A)
 │  ├─ teams/                  service, queries, errors                      (M5B)
+│  ├─ automations/            scheduler, start, service, queries, errors    (M6A)
 ├─ test/                      Vitest global setup (test database)           (M2A)
 ├─ worker/index.mts          worker entry point and job loop               (M3A)
 └─ proxy.ts                   (M9)

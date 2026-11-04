@@ -1422,3 +1422,159 @@ explicit M5A permission. A task can be given to a team when you create it.
   hide archived teams from the list (with a "Show archived" toggle), and
   keep their task links. Write one test showing an archived team's task
   still shows its team.
+
+## M6A — Scheduled tasks and automations (2026-11-04)
+
+**Built:** An Automations section. You choose an agent, the task it should
+do, and when (once, every few hours, daily, weekly, or monthly, in a time
+zone), and the worker starts each run as an ordinary task. Every run, also
+the ones that were missed or skipped, is in the automation's history, and
+each started run opens its task.
+
+**Concepts**
+1. **How the scheduler works.** It lives in the worker, next to crash
+   recovery, and checks PostgreSQL every 15 seconds for active automations
+   whose `next_run_at` has come. Each one is handled in its own
+   transaction: lock it, work out what is due, record it, start at most one
+   task, move `next_run_at` on. The scheduler never calls Claude; it only
+   creates tasks, which the same worker loop then claims like any other.
+2. **How tasks are created automatically.** `insertTaskWithFirstRun`
+   (`src/server/tasks/create.ts`) is now the one way a task starts: the
+   task service uses it for your tasks, and the scheduler for automation
+   runs. Same queue, same first attempt, same timeline. The task carries
+   `automation_id`, so the task page links back.
+3. **How database locking prevents duplicates.**
+   - `SELECT … FOR UPDATE SKIP LOCKED` on the automation row: a second
+     worker skips it instead of waiting, and the "is it due?" condition is
+     checked again under the lock.
+   - A run's identity is `(automation_id, scheduled_for)`, with a unique
+     index. The task is created only if this transaction inserted that row
+     (`ON CONFLICT DO NOTHING … RETURNING`), in the same transaction.
+   - `next_run_at` moves on in that transaction, so the run isn't due again.
+   - The safeguard counts (concurrent and daily caps) run under a
+     transaction-scoped advisory lock, so two workers can't both squeeze
+     past them.
+4. **How time zones and daylight saving are handled.** Times of day are
+   wall-clock times in the automation's zone, converted with `Intl` (the
+   platform's time zone data), no library. To find the instant for "08:00
+   in Oslo on a date", look at the zone's offset a day before and after,
+   and keep the candidates that really show 08:00: two in a fall-back hour
+   (the first wins), none in a spring-forward gap (move forward by the gap).
+   Intervals are elapsed time from when the schedule was set, so daylight
+   saving doesn't touch them.
+5. **How missed runs are handled.** Of all runs due by now, only the
+   latest may start, and only if it is at most 10 minutes late. The others
+   are recorded as one "missed" row (with a count), never caught up: a week
+   of downtime gives one history line, not a burst of Claude runs. A missed
+   one-time run never starts late on its own; the page offers Run now or a
+   new time.
+6. **What happens when the worker stops.** Nothing runs and nothing is
+   lost. Schedules live in PostgreSQL. When the worker starts again,
+   recovery settles interrupted attempts first (the task engine's own
+   policy), then the scheduler records what was missed and plans the next
+   run.
+7. **How scheduling respects permissions.** It can't bypass anything,
+   because it only creates tasks. The task runs as its agent, with the
+   agent's tools read fresh, inside its workspace, every call checked by
+   the invoker, approvals waiting for you (and expiring if nobody answers),
+   the same timeout, and the same retry policy (never after a usage limit).
+   On top, automations add caps: an hour minimum interval, 10 active, 24
+   runs a day, 2 at once, no overlap, and an hour's pause after a usage
+   limit.
+8. **What 24/7 hosting needs.** A worker that is always running and
+   restarted on failure (systemd on a VPS); PostgreSQL with backups; a
+   correct clock; and a decision about unattended Claude use on a server.
+   A sleeping laptop simply misses runs, and the history says so.
+
+**Lessons**
+- **Make the identity the guarantee.** "Don't run twice" as a rule in code
+  needs every path to remember it. As a unique `(automation, time)` pair,
+  the database refuses the second run whoever tries.
+- **Decide the catch-up policy up front.** The obvious loop ("while
+  next_run_at <= now: run it") is exactly the one that fires 168 runs after
+  a week away. Planning all due runs first and starting at most one made
+  the policy explicit and testable.
+- **Inject the clock.** A controlled clock in the tests made daylight
+  saving, downtime, and grace periods instant and exact, instead of
+  waiting or mocking `Date`.
+- **Server and client must format the same way.** `Intl` writes "Sat, 28
+  Feb" in one runtime and "Sat 28 Feb" in another; building the text from
+  `formatToParts` keeps them identical (and avoids hydration mismatches).
+- **A function from a `"use client"` file can't run on the server.** The
+  edit page needed `valuesFromSchedule`, so the form helpers moved to
+  `src/lib/`.
+
+**Limitations (honest list)**
+- **Runs need the worker.** Nothing runs while it (or the laptop) is off;
+  those runs are recorded as missed.
+- **Skipped runs aren't retried.** A run skipped for overlap, a cap, or a
+  usage limit waits for the next scheduled time.
+- **Approvals at night expire.** An unattended run whose tool asks for
+  approval waits 5 minutes, then the tool doesn't run. There are no
+  notifications yet.
+- **Deleting an automation removes its history.** Its tasks stay, without
+  the link.
+- **The caps are global and in code.** No per-automation limits, and
+  changing them means editing `AUTOMATION_LIMITS`.
+- **No team assignment** for automation tasks yet.
+
+**Files changed**
+- New:
+  - `src/lib/automations/` (schedule math, validation, limits, form values,
+    tests);
+  - `src/server/automations/` (scheduler, start, service, queries, errors,
+    tests);
+  - `src/server/tasks/create.ts`;
+  - `src/app/(app)/automations/` (list, new, detail, edit, actions,
+    not-found, error);
+  - `src/components/automations/` (list, form, detail, badges, controls);
+  - `e2e/automations.spec.ts`.
+- Database: `drizzle/0008_automations.sql`. It adds two tables and
+  `tasks.automation_id`, and deletes nothing.
+- Changed: schema; task service (shared create, automation link); worker
+  loop and entry (the scheduler); task list and page (automation link);
+  breadcrumbs, action errors, load errors; e2e helpers.
+
+**How it was verified**
+- `lint`, `typecheck`, and `build` pass.
+- Vitest: 331 tests pass (47 new):
+  - 21 unit tests of the schedule math: Oslo and New York, both daylight
+    saving changes, the gap and the repeated hour, weekly on the local day,
+    monthly on the 31st and leap years, intervals, due and missed runs;
+  - 26 integration tests against PostgreSQL: create (the demo automation),
+    validation, caps, edit, pause and resume, delete; one-time and
+    recurring runs; summer time; missed runs with no catch-up; a restart
+    within the grace period; a missed one-time run and Run now; paused
+    automations; disabled agents; overlap; concurrency and daily caps; five
+    schedulers racing; a wound-back `next_run_at`; execution through the
+    real executor; a refused tool; an approval that expires; a usage limit
+    (no retry, then a pause); and a worker lost mid-run.
+- Playwright: 61 tests pass (9 new): the demo through the UI, validation,
+  edit/pause/resume, history linked to tasks and back, Run now, a missed
+  one-time run, delete, and phone and tablet widths in both themes.
+- One controlled real run in the development database, after the
+  automated tests passed:
+  - a short-lived one-time automation ("M6A test – scheduled run check")
+    for the Haiku test agent, due at 16:50 Oslo time, with a trivial
+    instruction that asked for no research;
+  - the real worker's scheduler started it at 16:50:04 (one occurrence,
+    one task, linked to the automation); the task completed in about 5
+    seconds (47 output tokens) with five timeline events;
+  - later checks created nothing more, and `next_run_at` was empty;
+  - the automation was then deleted; its task stays in Tasks as evidence.
+- The demo automation (Daily AI Research Briefing, every day at 08:00,
+  Europe/Oslo, Research Assistant) was created and checked in the isolated
+  test databases only, not in your own database, so it won't start real
+  runs by itself.
+
+**Exercise**
+- Add "Skip next run": a button that records the next occurrence as
+  skipped (reason `owner`) and moves `next_run_at` to the run after it.
+  Write a test that the skipped run creates no task and the one after it
+  does.
+
+**Questions to revisit**
+- Should a skipped run (overlap, cap) try again a few minutes later
+  instead of waiting for the next time?
+- Where should notifications for missed runs and waiting approvals live:
+  in the app, or on the phone?
