@@ -255,11 +255,46 @@ Pulled forward from M8 (tasks; schedules stay in M8):
   survive a worker restart need a resumable session; until then an
   interrupted attempt asks again on Retry, see ARCHITECTURE §5.8.)
 
+**M5A — Multi-agent delegation** *(done 2026-11-04)*
+The first real collaboration between agents, built on the M4B task system:
+- **Delegation tool:** `delegate_to_agent` in the tool registry, offered only
+  in a task's own work run, at depth 0, to an agent with delegation targets.
+  The backend checks permission, target (exists, enabled, has a model, not
+  itself), depth, and budget, then creates the child task once, however
+  often the request is repeated (`request_hash`).
+- **Model:** a child is an ordinary task (`parent_task_id`, `depth = 1`);
+  `task_delegations` records what was sent, the status, and whether the
+  result reached the parent. One child per task, depth one, no cycles.
+- **No deadlock:** the parent's run ends after it delegates; the task waits
+  as `waiting_on_delegate` without a worker slot; when the child finishes, a
+  follow-up run (`purpose = 'continue'`) gets a bounded reconstruction: the
+  task, the parent's notes, the request, and the child's result. SDK session
+  resume stays unused (M3B).
+- **Failures:** cancelling a parent cancels its child; a failed or cancelled
+  child lets the parent finish with that knowledge; an interrupted child
+  keeps the parent waiting until the owner retries or cancels it. Children
+  left behind by a crash are stopped by the recovery sweep.
+- **Permissions:** `agent_delegation_targets`, off by default, set in a new
+  Delegation section of Agent Builder and shown on the agent page. The
+  child uses only its own tools and approvals; the parent gains nothing.
+- **UI:** a Delegation card on the parent task (who, what was sent, the
+  child's status, approvals, and result), a "Delegated by" banner on the
+  child, and "delegated by" in the list.
+- **Tests:** Vitest 271, Playwright 45, and a real run: Research Assistant
+  (Opus 5.5) delegated to Writing Assistant (Haiku 5.5, made in Agent
+  Builder) and finished with the child's report.
+- No new dependencies.
+
+**M5B — Team management** *(proposed)*
+A team page: which agent may delegate to which (a small graph, not a
+canvas), per-team limits, and delegation history across tasks. Possibly
+several children per task, or depth two, once the costs are visible.
+
 **M4 — Runs you can inspect** *(proposed)*
 A run history per agent and conversation: status, timing, tokens, errors.
 An agent's page lists its conversations.
 
-**M5 — MVP complete** *(proposed)*
+**MVP review** *(proposed)*
 Review against the MVP success criteria: keyboard-only, 375 px, both themes,
 long conversations (context strategy re-evaluated), failure drills.
 
@@ -305,6 +340,8 @@ execution for any future shell or code tools.
 | Conversation continuity | ✓ M3B | Rebuild bounded history from PostgreSQL (last 20 messages / 60,000 characters). SDK session resume rejected: transcripts would live in `~/.claude`, outside Solas's database and its delete button. Revisit with summaries if long conversations need more memory |
 | Test tooling | ✓ M2A, M3B | Vitest (unit + integration); Playwright browser tests since M3B (`npm run test:e2e`) |
 | Background task execution | ✓ M4B | Tasks are runs with `task_id`: one queue, one worker, one runtime. Retries are automatic only after a lost worker or provider outage, once, when safe; otherwise "interrupted" for the owner |
+| How a parent waits for its child | ✓ M5A | Durable state, not an open process: the parent's run ends, the task waits as `waiting_on_delegate`, and a follow-up run gets a bounded reconstruction. SDK session resume stays unused (transcripts outside PostgreSQL) |
+| Delegation limits | ✓ M5A | Depth 1, one child per task, targets chosen per agent; config in `DELEGATION_LIMITS` |
 | Live updates for tasks | ✓ M4B | Re-render from PostgreSQL every second while active (`router.refresh()`); SSE from `task_events` stays the upgrade path |
 | Resuming an approval after a worker restart | Later | Needs a resumable provider session; SDK resume was rejected in M3B (transcripts outside PostgreSQL). Until then: interrupted + Retry asks again |
 | Hosted runtime credentials | M10 | Re-check terms; API key by default for hosted use. Unattended tasks on a server make this decision stricter, not looser |

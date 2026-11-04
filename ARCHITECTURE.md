@@ -68,6 +68,7 @@ Four ideas to hold on to:
 | **Tools and permissions** | Tool registry, per-agent permissions, workspaces, and the enforcement layer every call goes through | `src/server/tools/` | M4A |
 | **Approvals** | Tool calls that need approval wait for the owner's decision in the conversation | `src/server/tools/invoker.ts`, `src/server/conversations/` | M4A |
 | **Tasks** | One-off assignments the worker runs in the background; each attempt is a run. State machine, retry policy, timeline | `src/server/tasks/` | M4B |
+| **Delegation** | One agent's task hands a subtask to another agent as a linked child task; permissions, limits, waiting, and follow-up | `src/server/tasks/delegation.ts`, `cancel.ts`, `src/server/tools/builtin/delegate.ts` | M5A |
 | **Schedules** | Recurring triggers that create tasks | `src/server/tasks/` (later) | M8 |
 | **Authentication** | Single owner. Login page, database sessions, checks in every data-access function | `src/server/auth/`, `src/proxy.ts` | M9 |
 | **Deployment** | One VPS: web, worker, PostgreSQL, reverse proxy; private network access | `deploy/` (later) | M10 |
@@ -127,6 +128,7 @@ runs (M3A, built; extended in M4B)
   task_id → tasks (M4B; a task run: one attempt at the task);
     a check constraint requires exactly one of the two
   attempt (M4B; 1, 2, … per task), worker_id (M4B; who claimed it),
+  purpose (M5A; 'work', or 'continue' for a follow-up after a delegation),
   not_before (M4B; a scheduled retry isn't claimed before this),
   status ('pending' | 'running' | 'completed' | 'failed' | 'cancelled'),
   model_id (recorded at start), error_code, error_message,
@@ -138,11 +140,23 @@ runs (M3A, built; extended in M4B)
 
 tasks (M4B, built — see §5.8)
   id, agent_id → agents (cascade), title, instructions,
-  status ('queued' | 'running' | 'awaiting_approval' | 'completed' |
-          'failed' | 'cancelled' | 'interrupted'),
+  parent_task_id → tasks (M5A; set on a delegated task), depth (M5A; 0 or 1),
+  status ('queued' | 'running' | 'awaiting_approval' | 'waiting_on_delegate' (M5A) |
+          'completed' | 'failed' | 'cancelled' | 'interrupted'),
   result, error_code, error_message, cancel_requested_at,
   auto_retries_left, client_request_id (unique; idempotent create),
   created_at, updated_at, started_at, finished_at
+
+agent_delegation_targets (M5A, built — see §5.9)
+  agent_id → agents, target_agent_id → agents (both cascade), created_at
+  primary key (agent_id, target_agent_id); never the agent itself; no row = off
+
+task_delegations (M5A, built)
+  id, parent_task_id → tasks, parent_run_id → runs, parent_agent_id, target_agent_id,
+  child_task_id → tasks (unique), task_description, expected_output,
+  request_hash (unique per parent: a repeated request reuses the child),
+  status ('waiting' | 'completed' | 'failed' | 'cancelled'), parent_notes,
+  result_delivered_at, created_at, completed_at
 
 task_events (M4B, built)
   id (sequential identity), task_id → tasks (cascade), run_id → runs,
@@ -532,6 +546,7 @@ The tools in M4A:
 | `current_time` | Date and time in a validated IANA time zone | Low | Runs automatically |
 | `list_workspace_files` | Lists one folder of the agent's workspace | Low | Runs automatically |
 | `read_workspace_file` | Reads one UTF-8 text file (≤ 256 KB) from the workspace | Medium | Runs automatically (owner's choice; "Ask me first" per agent) |
+| `delegate_to_agent` (M5A) | Hands one subtask to another agent as a child task | Medium | Granted by delegation targets, not a tool switch; only in a task's work run (§5.9) |
 
 **Workspaces.** One folder per agent: `~/Solas/workspaces/<agent-id>`
 (`SOLAS_WORKSPACES_DIR` overrides the root). The root must be a dedicated
@@ -721,6 +736,125 @@ and two workers can share one database safely (SKIP LOCKED, leases). On a
 VPS, web and worker become two services; what changes is the credential
 (M10) and real authentication (M9), not the task design.
 
+### 5.9 Delegation between agents (built in M5A)
+
+**Multi-agent orchestration** here means one agent handing a piece of its
+task to another agent and using the result. Solas does it with the task
+system it already has: the subtask is a normal task (a **child**) linked to
+the original (its **parent**). There is no second engine and no agent-to-
+agent chat; agents communicate only through persisted tasks and results.
+
+```
+ Owner ──task──▶ Research Assistant (parent, depth 0)
+                   │ work run: analyses, then calls delegate_to_agent
+                   │   backend: may it? target ok? depth? budget? same request?
+                   │   ──▶ child task for Writing Assistant (depth 1, queued)
+                   └ run ends ──▶ parent: waiting_on_delegate (holds no worker slot)
+                 Writing Assistant runs the child as itself ──▶ result saved
+                   ──▶ delegation completed ──▶ parent: queued, run purpose "continue"
+                 Research Assistant's follow-up run:
+                   task + its notes + the request + the child's result ──▶ final result
+```
+
+**How it differs from an ordinary task.** The child is created by the
+backend (on the parent agent's request), not by the owner; it carries
+`parent_task_id` and `depth = 1`; its instructions are exactly what the
+parent sent plus one line saying where it came from; its result goes back
+to the parent instead of only to the owner. Otherwise it is queued,
+claimed, run, retried, and cancelled like any task.
+
+**Storage.** `tasks.parent_task_id` gives the hierarchy; `task_delegations`
+records the request (target, description, expected output, the parent's
+run), its status, the parent's notes from before it delegated, and when the
+result was handed over. The child's result stays on the child task.
+
+**The tool and its checks** (`delegate()` in `delegation.ts`, one
+transaction with the parent task locked):
+1. the run is a task's work run (not a conversation, not a follow-up), and
+   the task is still running;
+2. the task's depth is below `DELEGATION_LIMITS.maxDepth` (1): a child can't
+   delegate, so cycles are impossible;
+3. the target isn't the agent itself, and there is a row in
+   `agent_delegation_targets` for this pair;
+4. the target exists, is enabled, and has a model;
+5. the same request (same target and words, `request_hash`) returns the
+   existing child: a retried run never creates a duplicate;
+6. at most `maxChildrenPerTask` (1) waiting or completed children; a second,
+   different request gets the first child back;
+7. only then: child task, its first run, the delegation row, and events, all
+   together.
+
+The model's request is just input; none of these rules can be changed by
+what it writes. The invoker offers the tool only in runs allowed to delegate
+and lists the enabled targets (ID, name, role) in its description.
+
+**Waiting without a deadlock.** A parent never waits inside a worker slot.
+Its run ends normally after delegating; the run's end looks at the task's
+delegations: still waiting → `waiting_on_delegate`; already finished (two
+workers) → queue the follow-up at once. When the child completes, fails, or
+is cancelled, the same transaction queues the parent's follow-up. With
+`SOLAS_WORKER_CONCURRENCY=1`, the order is simply parent, child, parent.
+
+**Resuming the parent.** The Agent SDK can resume a session, but only from a
+transcript Claude Code writes under `~/.claude` (`persistSession`), which
+M3B rejected. So the follow-up is a fresh session with a bounded
+reconstruction (`buildContinuationPrompt`): the task, the parent's notes
+(newest 8,000 characters), what it asked for, and the child's result (first
+20,000 characters) or why there is none. The result is marked as material
+from another agent, not instructions. Solas doesn't claim the parent
+"remembers"; it is told.
+
+**Failures and retries.**
+
+| Event | Effect |
+| --- | --- |
+| Child completed | Parent's follow-up run with the result |
+| Child failed (incl. usage limit, timeout) | Parent's follow-up run is told why; it finishes itself or explains. The child isn't retried automatically for a usage limit (§5.8) |
+| Child cancelled by the owner | Parent continues without it |
+| Child interrupted | Parent keeps waiting; the owner retries or cancels the child |
+| Parent cancelled, failed, or interrupted | Its waiting child is cancelled (queued: at once; running: through the worker) |
+| Parent's work run lost after delegating | Retried as usual (delegating is idempotent); the retry gets the same child back |
+| Worker restart | Nothing is in memory: the parent waits in PostgreSQL, the child is queued or recovered like any task |
+
+The parent's side never locks the child's rows in its own transaction:
+children are stopped right after it (`stopOrphanedChildren` in `cancel.ts`),
+in the child's lock order, and the worker's recovery timer repeats that
+sweep, so a crash between the two steps still stops the child.
+
+**Isolation and least privilege.** The child gets only the request text,
+never the parent's instructions, the owner's task, conversations, or
+workspace. It runs with its own instructions, model, tools, approvals, and
+workspace (`~/Solas/workspaces/<child-agent-id>`). The parent gains none of
+the child's tools; the follow-up run has the parent's own tools and no
+delegation tool. A child's approval requests show on its own page and on the
+parent's, and are decided the same way (§6.2).
+
+**Limits** (`DELEGATION_LIMITS` in `src/server/runs/config.ts`): depth 1, one
+child per task, 20 targets per agent, request ≤ 8,000 characters, expected
+output ≤ 2,000. Each delegation costs at least two more Claude calls (child
+and follow-up); the existing per-run limits (time, turns, budget,
+concurrency) apply to each.
+
+**Toward larger teams.** Depth, children per task, and targets are data and
+configuration, not code paths: a team page (M5B) can edit the target graph;
+more children per task need only a higher limit and a follow-up prompt that
+lists several results (it already loops); depth two would need cycle checks
+on the target graph before it is allowed.
+
+**Files.**
+
+| File | Responsibility |
+| --- | --- |
+| `src/server/tools/builtin/delegate.ts` | The tool: schema, limits, and a call into the backend |
+| `src/server/tasks/delegation.ts` | All rules, child creation, waiting, follow-up queueing, continuation data |
+| `src/server/tasks/cancel.ts` | One cancel path for owner and worker; stopping orphaned children |
+| `src/server/tasks/execution.ts` | Hooks into the attempt lifecycle (parent waits, child reports back) |
+| `src/server/tools/invoker.ts` | Offers the tool only in allowed runs; checks permission per call |
+| `src/server/runs/executor.ts`, `prompt.ts` | Work vs. follow-up runs; `buildContinuationPrompt` |
+| `src/server/agents/service.ts`, `src/lib/agents/validation.ts` | Delegation targets: validation and storage |
+| `src/components/agents/delegation-fields.tsx` | Agent Builder's Delegation section |
+| `src/components/tasks/task-detail.tsx` | Delegation card, "Delegated by" banner |
+
 ## 6. Request flows
 
 ### 6.1 Sending a message
@@ -807,7 +941,7 @@ src/
 │  ├─ runtime/                AgentRuntime types, claude-agent-sdk adapter  (M3A)
 │  ├─ logger.ts               JSON-line logs, scalar fields only            (M3A)
 │  ├─ tools/                  registry, builtin/ tools, workspace, invoker  (M4A)
-│  ├─ tasks/                  lifecycle, service, execution, events         (M4B)
+│  ├─ tasks/                  lifecycle, service, execution, events (M4B); delegation, cancel (M5A)
 ├─ test/                      Vitest global setup (test database)           (M2A)
 ├─ worker/index.mts          worker entry point and job loop               (M3A)
 └─ proxy.ts                   (M9)

@@ -1109,3 +1109,191 @@ claim race is tested with two executors on one database).
   one where a crash with 0 retries ends as "interrupted", one where 2 retries
   allow a second automatic attempt. Hint: `decideAfterFailure` doesn't need
   to change.
+
+## M5A — Multi-agent delegation (2026-11-04)
+
+**Built:** Agents can now work together. In Agent Builder you allow an agent
+to delegate to chosen agents. In a task, that agent can hand one subtask to
+one of them with the `delegate_to_agent` tool. Solas checks the request,
+creates a linked child task, and runs it as the other agent. When it's done,
+the first agent gets the result in a follow-up run and finishes the task.
+The task page shows the whole chain: who delegated what to whom, the
+child's status and result, and the parent's final result.
+
+**Concepts**
+1. **Multi-agent orchestration** means several agents contributing to one
+   piece of work, with something deciding who does what and how results
+   flow back. In Solas the "something" is plain data: tasks linked as parent
+   and child, and rules in the backend. There's no orchestration framework
+   and no agents chatting freely.
+2. **Delegation vs. an ordinary task.** A delegated task is created by the
+   backend at an agent's request, not by you. It carries `parent_task_id`
+   and `depth = 1`, gets only the words its parent sent, and its result goes
+   back to the parent. Everything else (queue, worker, retries, cancel,
+   approvals) is the same task machinery as M4B.
+3. **How parent and child are stored.** `tasks.parent_task_id` is the
+   hierarchy. `task_delegations` is the record of the request: target, exact
+   text sent, expected output, status, the parent's notes, and when the
+   result was handed over. The result itself stays on the child task.
+4. **Agents communicate through persisted results.** The parent never talks
+   to the child. It writes a request (stored); the child writes a result
+   (stored); the parent's follow-up run reads both. Every step can be
+   inspected and survives restarts.
+5. **How the worker schedules the child.** The child is just another
+   pending run in `runs`. The worker claims it like any other, oldest
+   first, so a child created by a parent is picked up as soon as a slot is
+   free.
+6. **How deadlocks are prevented.** A parent that "waits" inside a worker
+   slot would block its own child when there's only one slot. So waiting is
+   a state, not a process: the parent's run ends, the task becomes
+   `waiting_on_delegate`, and the child takes the free slot. When the child
+   finishes, the same transaction queues the parent's follow-up run. Lock
+   order (task run → task → parent task → delegation rows) is the same
+   everywhere, and the parent's side never locks a child's rows, so two
+   transactions can't wait on each other either.
+7. **How delegation permissions work.**
+   - Off by default: no row in `agent_delegation_targets`, no tool.
+   - The tool is only offered in a task's own work run, at depth 0, and
+     lists the enabled targets.
+   - Each call is checked again in one transaction: the target row exists,
+     it isn't the agent itself, the target is enabled with a model, the
+     depth and budget hold, and the same request returns the same child.
+   - The model's text can't change any of this; it only fills in the
+     request.
+8. **How failures and retries are handled.**
+   - A child that fails or is cancelled lets the parent finish with that
+     knowledge.
+   - An interrupted child keeps the parent waiting until you retry or
+     cancel it.
+   - Cancelling a parent cancels its child.
+   - A lost parent run is retried as in M4B (delegating is idempotent).
+   - A usage limit is never retried automatically, in parent or child.
+9. **How context is isolated.** The child gets only the request text: not
+   the parent's instructions, not your original task, not conversations or
+   files. It works with its own instructions, model, tools, approvals, and
+   workspace. The parent doesn't gain the child's tools, and its follow-up
+   run can't delegate again. The child's result is shown to the parent as
+   material from another agent, not as instructions.
+10. **Toward larger teams.** Depth, children per task, and targets are
+    configuration and rows, not code paths. A team page (M5B) can edit the
+    target graph. More children per task need a higher limit, and the
+    follow-up prompt already handles a list. Depth two would first need
+    cycle checks on the graph.
+
+**Lessons**
+- **"Waiting" should be data.** The tempting design keeps the parent's
+  Claude session open until the child is done. That ties up a worker slot,
+  dies with the process, and deadlocks with one worker. A state in a row,
+  plus a follow-up run, does none of that.
+- **Resumption is reconstruction, and that's fine if it's honest.** The
+  provider can't resume a session Solas didn't let it save. The follow-up
+  gets a bounded, explicit summary instead, and the prompt says so.
+- **Two orders, one outcome.** With two workers, the child can finish before
+  the parent's run ends. Both paths (parent ends first, child ends first)
+  were written and tested, so the result is the same either way.
+- **Disabled targets shouldn't even be offered.** Listing only enabled
+  targets keeps the model from planning around an agent it can't use. The
+  backend still refuses one if asked directly.
+- **Test fakes need the same care as real code.** Two failures came from
+  test runtimes: one waited for an abort that had already happened, and one
+  released a waiting parent before the child's result was saved.
+
+**Security and reliability limitations (honest list)**
+- **One child per task, depth one.** That's deliberate for M5A, not a
+  general orchestration system.
+- **The parent decides what to share.** Solas passes only the request text,
+  but if the parent copies sensitive material into it, the child sees that
+  material. The request is shown on the task page.
+- **A child's result is untrusted input** to the parent (prompt injection
+  between agents). It's labelled as material, and the parent's own
+  permissions still apply, but a determined result could mislead the parent.
+- **The follow-up is a new session.** The parent remembers only what is in
+  its notes and the result.
+- **No timeout for waiting itself.** A parent waits as long as its child is
+  queued or interrupted. Each child attempt has its own time limit, and you
+  can always cancel.
+- **Cost:** a delegation means at least three Claude calls (parent work,
+  child, parent follow-up).
+
+**Files changed**
+- New:
+  - `src/server/tasks/delegation.ts` (rules, child creation, waiting,
+    follow-up) and `src/server/tasks/cancel.ts` (one cancel path; stopping
+    orphaned children);
+  - `src/server/tools/builtin/delegate.ts` (the tool);
+  - `src/components/agents/delegation-fields.tsx` (Agent Builder section);
+  - tests: `src/server/tasks/delegation.test.ts` and
+    `e2e/delegation.spec.ts`.
+- Database: `drizzle/0006_delegation.sql`. It adds two tables and three
+  columns (`tasks.parent_task_id`, `tasks.depth`, `runs.purpose`), and a
+  task status, `waiting_on_delegate`. It deletes nothing.
+- Changed:
+  - schema; lifecycle (new transitions);
+  - execution (parent waits, child reports back, retries keep purpose);
+  - executor (work vs. follow-up runs, child cleanup) and prompt
+    (`buildContinuationPrompt`); config (`DELEGATION_LIMITS`);
+  - task service (cancel cascade, child retry rule, parent and children in
+    the detail, "delegated by" in the list);
+  - tool types (`grantedBy`, `delegate`), registry (the tool, kept out of
+    the switches), and invoker (offers and checks it; only file tools get a
+    workspace);
+  - agent validation, service, and queries (`delegateTo`);
+  - agent form, details, and new/edit pages;
+  - task detail and list; task status labels and filters;
+  - e2e helpers, test helpers, and existing tests (new limits field).
+
+**How it was verified**
+- `lint`, `typecheck`, and `build` pass.
+- Vitest: 271 tests pass, twice in a row; the delegation file passed eight
+  runs in a row. 23 new tests cover:
+  - the full flow, step by step: relationships, the child's isolated prompt,
+    the parent's follow-up prompt, the final result, and the timeline;
+  - one worker (no deadlock), and two workers (the child finishes first);
+  - no targets, an unknown or disabled target, self, depth and cycles,
+    budget, and duplicate requests across a cut-off run;
+  - conversations never delegating, and tools kept to each agent;
+  - child failure and usage limit;
+  - cancelling the parent (queued or running child) and cancelling the
+    child;
+  - an interrupted child, then Retry;
+  - approvals in the child (visible on the parent; rejected never runs);
+  - worker restart and orphaned children;
+  - detail and list views, and agent service targets.
+- Playwright: 45 tests pass (7 new). They cover:
+  - Agent Builder delegation (keyboard, off by default, validation, save,
+    turn off);
+  - the parent and child pages following the worker, with navigation both
+    ways;
+  - a child approval decided from the parent;
+  - parent cancel cascading to the child;
+  - list labels;
+  - a 375 px phone in light and dark.
+- Real run with Claude (dev app, real worker):
+  - "Writing Assistant" was created in Agent Builder (Haiku 5.5).
+  - Your "Research Assistant" (Opus 5.5) was set to delegate to it, in the
+    Delegation section.
+  - Task: "Analyze the differences between a chatbot, a tool-using AI
+    agent, and a multi-agent system. Ask the Writing Assistant to turn your
+    findings into a concise structured report, then return the final
+    result."
+  - Research Assistant's work run (34 s) analysed, then delegated with its
+    findings and an expected output. The task waited without a worker slot.
+  - Writing Assistant's child task (depth 1) ran in 17 s and saved a
+    3,410-character report.
+  - The follow-up run (31 s) got the notes and report and saved a
+    6,362-character final result. It even listed the changes it made to the
+    Writing Assistant's draft.
+  - 83 s in total, with 13 events on the parent's timeline in order.
+  - The delegation is still configured, and both tasks are in your dev
+    database. Turn it off under Research Assistant → Edit → Delegation.
+
+**Not tested automatically:** a real usage limit in a child (faked), and
+two worker processes delegating at once (two executors on one database are
+tested).
+
+**Exercise**
+- Add an "Ask me first" option to delegation targets, so a delegation waits
+  for your approval like a tool call. Hint: give `agent_delegation_targets`
+  a `mode` column, return it from `permissionFor` in the invoker, and the
+  existing approval flow does the rest. Write one test where a rejected
+  delegation creates no child task.
