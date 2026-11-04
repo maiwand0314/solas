@@ -38,6 +38,32 @@ export type RunToolContext = {
   signal: AbortSignal;
   /** Called with true while a call waits for approval (the run's clock pauses), false after. */
   onApprovalWait?: (waiting: boolean) => void;
+  /**
+   * Told about each step of every call (requested, approval, result), for a
+   * task's timeline. Awaited, so events are recorded in the order they happen.
+   */
+  onEvent?: (event: ToolEvent) => Promise<void>;
+};
+
+/** One step of a tool call, described with Solas's own summaries (never raw output). */
+export type ToolEvent = {
+  type:
+    | "tool_requested"
+    | "tool_denied"
+    | "approval_requested"
+    | "approval_granted"
+    | "approval_rejected"
+    | "approval_expired"
+    | "approval_cancelled"
+    | "tool_succeeded"
+    | "tool_failed";
+  toolId: string;
+  toolName: string;
+  toolCallId: string;
+  /** The one-line input summary, e.g. "notes/plan.md". */
+  summary: string;
+  /** The result summary or the error, when there is one. */
+  detail?: string;
 };
 
 type Dependencies = {
@@ -73,6 +99,14 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
   async function invoke(tool: AnyToolDefinition, rawInput: unknown, context: RunToolContext): Promise<ToolCallOutcome> {
     const started = Date.now();
     const fields = { runId: context.runId, toolId: tool.id };
+    const emit = async (type: ToolEvent["type"], toolCallId: string, summary: string, detail?: string) => {
+      try {
+        await context.onEvent?.({ type, toolId: tool.id, toolName: tool.name, toolCallId, summary, detail });
+      } catch (error) {
+        // The timeline is a record, not a gate: a failed write never blocks the call's own checks.
+        log("warn", "tool.event_not_recorded", { ...fields, type, error: truncate(error instanceof Error ? error.message : String(error)) });
+      }
+    };
 
     // 1. Permission, read fresh: a change in Agent Builder applies at once.
     const [permission] = await db
@@ -81,8 +115,11 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
       .where(and(eq(agentToolPermissions.agentId, context.agentId), eq(agentToolPermissions.toolId, tool.id)))
       .limit(1);
     if (!permission) {
-      await insertCall(context.runId, tool, storableRaw(rawInput), "—", "denied", { errorMessage: "Not enabled for this agent." });
+      const deniedId = await insertCall(context.runId, tool, storableRaw(rawInput), "—", "denied", {
+        errorMessage: "Not enabled for this agent.",
+      });
       log("warn", "tool.denied", fields);
+      await emit("tool_denied", deniedId, "—", "Not enabled for this agent.");
       return failure(`${tool.name} is not enabled for this agent, so it was not run.`);
     }
 
@@ -91,9 +128,10 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
     const parsed = schema.safeParse(rawInput);
     if (!parsed.success) {
       const problem = parsed.error.issues.map((issue) => `${issue.path.join(".") || "input"}: ${issue.message}`).join("; ");
-      await insertCall(context.runId, tool, storableRaw(rawInput), "invalid input", "failed", {
+      const invalidId = await insertCall(context.runId, tool, storableRaw(rawInput), "invalid input", "failed", {
         errorMessage: truncate(`Invalid input: ${problem}`, 300),
       });
+      await emit("tool_failed", invalidId, "invalid input", "The input didn’t match the tool’s rules, so it didn’t run.");
       return failure(`Invalid input for ${tool.id}: ${problem}`);
     }
     const input: unknown = parsed.data;
@@ -105,10 +143,13 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
       requiresApproval: needsApproval,
       approvalExpiresAt: needsApproval ? new Date(Date.now() + limits.approvalTtlMs) : null,
     });
+    await emit("tool_requested", callId, summary);
     if (needsApproval) {
       log("info", "tool.approval_requested", { ...fields, callId });
+      await emit("approval_requested", callId, summary);
       const decision = await waitForDecision(callId, context);
       log("info", "tool.approval_decided", { ...fields, callId, decision });
+      await emit(DECISION_EVENTS[decision], callId, summary);
       if (decision !== "approved") return failure(DECISION_MESSAGES[decision]);
       // Run exactly the input the owner approved, and only once.
       const [running] = await db
@@ -126,8 +167,10 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
       const workspaceDir = await workspaceFor(context.agentId);
       const output = tool.output.parse(await abortable(tool.execute(input, { workspaceDir, signal }), signal));
       const text = JSON.stringify(output);
-      await finishCall(callId, "succeeded", { resultSummary: truncate(tool.summarizeOutput(output), 200) });
+      const resultSummary = truncate(tool.summarizeOutput(output), 200);
+      await finishCall(callId, "succeeded", { resultSummary });
       log("info", "tool.succeeded", { ...fields, callId, durationMs: Date.now() - started });
+      await emit("tool_succeeded", callId, summary, resultSummary);
       return { text: truncate(text, tool.maxOutputChars), isError: false };
     } catch (error) {
       const message =
@@ -142,6 +185,7 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
         log("error", "tool.crashed", { ...fields, callId, error: truncate(error instanceof Error ? error.message : String(error)) });
       }
       await finishCall(callId, "failed", { errorMessage: message });
+      await emit("tool_failed", callId, summary, message);
       return failure(message);
     }
   }
@@ -213,6 +257,13 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
 }
 
 type Decision = "approved" | "rejected" | "expired" | "cancelled";
+
+const DECISION_EVENTS: Record<Decision, ToolEvent["type"]> = {
+  approved: "approval_granted",
+  rejected: "approval_rejected",
+  expired: "approval_expired",
+  cancelled: "approval_cancelled",
+};
 
 /** What the model is told when a call doesn't run. */
 const DECISION_MESSAGES: Record<Exclude<Decision, "approved">, string> = {

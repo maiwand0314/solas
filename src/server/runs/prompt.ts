@@ -6,12 +6,12 @@
  * project files and cited the sandbox as a source. Everything here is true:
  * the agent has exactly the tools listed, and nothing else.
  */
-export function runtimeNote(toolNames: string[]): string {
+export function runtimeNote(toolNames: string[], place: RunPlace = "conversation"): string {
   const intro = "You are an agent in Solas, the owner's private workspace for AI agents.";
   const tools =
     toolNames.length === 0
-      ? "In this conversation you have no tools: you cannot read or write files, run commands, or open web pages."
-      : `In this conversation you can use only these tools: ${toolNames.join(", ")}. You cannot run commands, ` +
+      ? `In this ${place} you have no tools: you cannot read or write files, run commands, or open web pages.`
+      : `In this ${place} you can use only these tools: ${toolNames.join(", ")}. You cannot run commands, ` +
         "write files, or open web pages. File tools only see your own workspace folder; give paths relative to it.";
   const environment =
     "Any environment details you see (working directory, git status, platform) describe an empty sandbox, not the " +
@@ -19,9 +19,28 @@ export function runtimeNote(toolNames: string[]): string {
   return `${intro} ${tools} ${environment}\n\nThe owner's instructions for you follow.`;
 }
 
+/** Where a run happens: answering in a conversation, or working on a task. */
+export type RunPlace = "conversation" | "task";
+
 /** The system prompt for a run: the runtime note, then the agent's saved instructions unchanged. */
-export function buildSystemPrompt(instructions: string, toolNames: string[] = []): string {
-  return `${runtimeNote(toolNames)}\n\n${instructions}`;
+export function buildSystemPrompt(instructions: string, toolNames: string[] = [], place: RunPlace = "conversation"): string {
+  return `${runtimeNote(toolNames, place)}\n\n${instructions}`;
+}
+
+/**
+ * The prompt for one attempt at a task. A task has no conversation: the owner
+ * isn't there to answer questions, so the agent is asked to finish the work
+ * in one go and state its assumptions.
+ */
+export function buildTaskPrompt(title: string, instructions: string): string {
+  return [
+    `Task: ${title}`,
+    "",
+    instructions,
+    "",
+    "Work on this task now and reply with the finished result. The owner can’t answer questions while you " +
+      "work, so make reasonable assumptions and state them briefly.",
+  ].join("\n");
 }
 
 // Builds the text Claude receives for one run. Each run is a fresh Claude

@@ -20,6 +20,8 @@ const conversations = createConversationService({ db, providers: testProviders }
 const silentLog: Logger = () => {};
 const limits: ExecutorLimits = {
   timeoutMs: 5_000,
+  taskTimeoutMs: 5_000,
+  retryBackoffMs: 1_000,
   heartbeatMs: 20,
   staleAfterMs: 30_000,
   progressWriteMs: 10,
@@ -324,7 +326,7 @@ describe("worker restarts and recovery", () => {
 
     const execution = executor.runOnce();
     await running;
-    executor.abortActiveRun();
+    executor.abortActiveRuns();
     await execution;
 
     expect(await runRow(runId)).toMatchObject({ status: "failed", errorCode: "worker_stopped" });

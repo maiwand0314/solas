@@ -41,6 +41,12 @@ export type ToolDefinition<Input extends z.ZodObject = z.ZodObject, Output exten
   risk: ToolRisk;
   approval: ApprovalPolicy;
   capability: ToolCapability;
+  /**
+   * Whether running it changes anything (files, messages, other services).
+   * Solas never repeats an attempt automatically once such a call may have
+   * run: the change could happen twice. Read-only tools are false.
+   */
+  sideEffects: boolean;
   /** The mode a newly enabled tool starts in. */
   defaultMode: "allow" | "ask";
   timeoutMs: number;

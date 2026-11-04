@@ -36,6 +36,7 @@ function testTool(overrides: Partial<AnyToolDefinition> = {}): AnyToolDefinition
     risk: "low",
     approval: "optional",
     capability: "none",
+    sideEffects: false,
     defaultMode: "allow",
     timeoutMs: 1_000,
     maxOutputChars: 1_000,

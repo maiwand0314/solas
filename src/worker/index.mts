@@ -5,16 +5,20 @@
 //   npm run worker
 //
 // The .mts extension makes this an ES module, so top-level await works.
-// It runs one agent at a time. Stop it with Ctrl+C: a run in progress is
-// stopped and marked failed, so it never stays "running" forever. Pending
-// runs wait in PostgreSQL and are picked up when the worker starts again.
+// It runs one agent at a time unless SOLAS_WORKER_CONCURRENCY says otherwise
+// (at most 3). Stop it with Ctrl+C: runs in progress are stopped and recorded
+// (a task attempt may be retried automatically when that is safe), so nothing
+// stays "running" forever. Pending runs and queued tasks wait in PostgreSQL
+// and are picked up when the worker starts again.
 
-import { setTimeout as sleep } from "node:timers/promises";
+import { randomUUID } from "node:crypto";
+import os from "node:os";
 import { closeDatabase, createDatabase } from "@/server/db/client";
-import { jsonLogger as log, truncate } from "@/server/logger";
+import { jsonLogger as log } from "@/server/logger";
 import { providerRegistry } from "@/server/providers/registry";
-import { RUN_LIMITS, prepareRuntimeDirectory } from "@/server/runs/config";
+import { RUN_LIMITS, prepareRuntimeDirectory, workerConcurrency } from "@/server/runs/config";
 import { createRunExecutor } from "@/server/runs/executor";
+import { runWorkerLoop } from "@/server/runs/worker-loop";
 import { createClaudeAgentSdkRuntime } from "@/server/runtime/claude-agent-sdk";
 import { createToolInvoker } from "@/server/tools/invoker";
 import { toolRegistry } from "@/server/tools/registry";
@@ -25,6 +29,10 @@ if (!databaseUrl) {
   process.exit(1);
 }
 
+// Recorded on every run this worker claims: host, process, and a random part
+// so a restarted worker with a reused PID is still a different owner.
+const workerId = `${os.hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
+const concurrency = workerConcurrency();
 const db = createDatabase(databaseUrl);
 const executor = createRunExecutor({
   db,
@@ -39,6 +47,9 @@ const executor = createRunExecutor({
     }),
   ],
   tools: createToolInvoker({ db, registry: toolRegistry, log, limits: RUN_LIMITS }),
+  // Only tools the registry marks as read-only make a lost task attempt safe to repeat.
+  isReadOnlyTool: (toolId) => toolRegistry.get(toolId)?.sideEffects === false,
+  workerId,
   log,
 });
 
@@ -47,41 +58,19 @@ function shutdown(signal: string) {
   if (stopping) return;
   stopping = true;
   log("info", "worker.stopping", { signal });
-  executor.abortActiveRun();
+  executor.abortActiveRuns();
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-log("info", "worker.started", { pid: process.pid, timeoutMs: RUN_LIMITS.timeoutMs, concurrency: 1 });
+log("info", "worker.started", {
+  workerId,
+  timeoutMs: RUN_LIMITS.timeoutMs,
+  taskTimeoutMs: RUN_LIMITS.taskTimeoutMs,
+  concurrency,
+});
 
-/** Marks runs whose worker died as failed (see recoverStaleRuns). */
-async function recover() {
-  try {
-    const recovered = await executor.recoverStaleRuns();
-    if (recovered > 0) log("warn", "worker.recovered_runs", { count: recovered });
-  } catch (error) {
-    log("error", "worker.recovery_failed", { error: truncate(error instanceof Error ? error.message : String(error)) });
-  }
-}
-
-await recover();
-let lastRecovery = Date.now();
-
-while (!stopping) {
-  if (Date.now() - lastRecovery > RUN_LIMITS.recoveryIntervalMs) {
-    await recover();
-    lastRecovery = Date.now();
-  }
-  let didWork = false;
-  try {
-    didWork = await executor.runOnce();
-  } catch (error) {
-    // Usually the database is down. Keep going; it may come back.
-    log("error", "worker.loop_error", { error: truncate(error instanceof Error ? error.message : String(error)) });
-    await sleep(RUN_LIMITS.pollIntervalMs * 5);
-  }
-  if (!didWork && !stopping) await sleep(RUN_LIMITS.pollIntervalMs);
-}
+await runWorkerLoop({ executor, concurrency, limits: RUN_LIMITS, log, shouldStop: () => stopping });
 
 await closeDatabase(db);
 log("info", "worker.stopped");

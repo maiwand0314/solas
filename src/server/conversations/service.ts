@@ -1,5 +1,5 @@
 import "server-only";
-import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import { conversationTitleSchema, sendMessageSchema } from "@/lib/conversations/validation";
 import { getDatabase, type Database } from "@/server/db/client";
@@ -192,8 +192,12 @@ export function createConversationService({ db, providers }: Dependencies) {
    */
   async function retryRun(id: unknown): Promise<SendResult> {
     const runId = parse(idSchema, id);
-    const [run] = await query(() => db.select().from(runs).where(eq(runs.id, runId)).limit(1));
-    if (!run) throw new ConversationServiceError("not_found", "This reply no longer exists.");
+    const [found] = await query(() => db.select().from(runs).where(eq(runs.id, runId)).limit(1));
+    // A task's attempt is retried from its task, never from here.
+    if (!found?.conversationId || !found.userMessageId) {
+      throw new ConversationServiceError("not_found", "This reply no longer exists.");
+    }
+    const run = { ...found, conversationId: found.conversationId, userMessageId: found.userMessageId };
     if (run.status !== "failed" && run.status !== "cancelled") {
       throw new ConversationServiceError("validation_failed", "Only a failed or stopped reply can be retried.");
     }
@@ -353,11 +357,13 @@ export function createConversationService({ db, providers }: Dependencies) {
    */
   async function cancelRun(id: unknown): Promise<RunState> {
     const runId = parse(idSchema, id);
+    // Only conversation runs: a task is cancelled through its task, which keeps both in step.
+    const ofConversation = and(eq(runs.id, runId), isNotNull(runs.conversationId));
     const [cancelled] = await query(() =>
       db
         .update(runs)
         .set({ status: "cancelled", finishedAt: sql`now()` })
-        .where(and(eq(runs.id, runId), eq(runs.status, "pending")))
+        .where(and(ofConversation, eq(runs.status, "pending")))
         .returning(runStateColumns),
     );
     if (cancelled) return cancelled;
@@ -366,7 +372,7 @@ export function createConversationService({ db, providers }: Dependencies) {
       db
         .update(runs)
         .set({ cancelRequestedAt: sql`now()` })
-        .where(and(eq(runs.id, runId), eq(runs.status, "running"), isNull(runs.cancelRequestedAt)))
+        .where(and(ofConversation, eq(runs.status, "running"), isNull(runs.cancelRequestedAt)))
         .returning(runStateColumns),
     );
     // Otherwise it already finished, or Stop was already pressed.

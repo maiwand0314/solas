@@ -28,6 +28,7 @@ export const currentTimeTool: ToolDefinition<typeof input, typeof output> = {
   risk: "low",
   approval: "optional",
   capability: "none",
+  sideEffects: false,
   defaultMode: "allow",
   timeoutMs: 2_000,
   maxOutputChars: 500,
