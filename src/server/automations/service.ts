@@ -56,7 +56,7 @@ export type AutomationDetail = {
   agent: { id: string; name: string; readiness: "ready" | "disabled" | "unconfigured" };
   /** The next few runs (only while active). */
   upcoming: Date[];
-  /** Newest first. */
+  /** Newest scheduled time first. */
   history: OccurrenceView[];
   /** The newest completed run's result. */
   latestResult: { taskId: string; title: string; result: string; finishedAt: Date | null } | null;
@@ -127,7 +127,7 @@ export function createAutomationService({
         .from(automationOccurrences)
         .leftJoin(tasks, eq(tasks.id, automationOccurrences.taskId))
         .where(inArray(automationOccurrences.automationId, ids))
-        .orderBy(automationOccurrences.automationId, desc(automationOccurrences.createdAt)),
+        .orderBy(automationOccurrences.automationId, desc(automationOccurrences.scheduledFor)),
     );
     return new Map(rows.map(({ automationId, ...row }) => [automationId, toOccurrenceView(row)]));
   }
@@ -142,7 +142,8 @@ export function createAutomationService({
           .from(automationOccurrences)
           .leftJoin(tasks, eq(tasks.id, automationOccurrences.taskId))
           .where(eq(automationOccurrences.automationId, automation.id))
-          .orderBy(desc(automationOccurrences.createdAt))
+          // By when each run was due: a missed period is recorded later, but belongs where it happened.
+          .orderBy(desc(automationOccurrences.scheduledFor))
           .limit(HISTORY_SHOWN),
       ),
       query(() =>
