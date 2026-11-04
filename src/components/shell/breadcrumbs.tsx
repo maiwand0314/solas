@@ -13,6 +13,7 @@ const SUBPAGE_LABELS: Record<string, { new: string; item: string }> = {
   "/conversations": { new: "New conversation", item: "Conversation" },
   "/tasks": { new: "New task", item: "Task" },
   "/teams": { new: "New team", item: "Team" },
+  "/automations": { new: "New automation", item: "Automation" },
 };
 
 function subpageLabel(section: string, rest: string[]): string | null {
