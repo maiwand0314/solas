@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
+  bigint,
   boolean,
   check,
   index,
@@ -119,24 +120,100 @@ export const messages = pgTable(
 export const RUN_STATUSES = ["pending", "running", "completed", "failed", "cancelled"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
+export const TASK_STATUSES = [
+  "queued",
+  "running",
+  "awaiting_approval",
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+] as const;
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+
 /**
- * One execution of an agent: "answer this user message". The web app inserts
- * it as pending; the worker claims it, runs it, and records the outcome. The
- * table doubles as the job queue, so there's no separate queue service.
+ * A piece of work the owner hands to an agent: "do this, I'll check back".
+ * The task is the request and its outcome; each attempt at it is a run (see
+ * runs.task_id), so tasks use the same queue, worker, and runtime as
+ * conversations. The status is kept here, changed only through the
+ * transitions in src/server/tasks/lifecycle.ts.
+ */
+export const tasks = pgTable(
+  "tasks",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    // Deleting an agent deletes its tasks, like its conversations.
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    title: text("title").notNull(),
+    instructions: text("instructions").notNull(),
+    status: text("status", { enum: TASK_STATUSES }).notNull().default("queued"),
+    /** The agent's final answer, saved when an attempt completes. */
+    result: text("result"),
+    /** Stable code and owner-safe message; set when the task failed or was interrupted. */
+    errorCode: text("error_code"),
+    errorMessage: text("error_message"),
+    /** Set by the owner's Cancel while an attempt runs; the worker stops it and confirms. */
+    cancelRequestedAt: timestamp("cancel_requested_at", { withTimezone: true }),
+    /**
+     * Automatic retries still allowed after a lost worker or a provider
+     * outage. Bounded so nothing loops; a manual retry resets it.
+     */
+    autoRetriesLeft: integer("auto_retries_left").notNull().default(1),
+    /**
+     * Chosen by the browser for each submit, and sent again if it retries.
+     * The unique index turns a repeated submit into "already created".
+     */
+    clientRequestId: uuid("client_request_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => sql`now()`),
+    /** When the first attempt started. */
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    /** When the task reached completed, failed, cancelled, or interrupted. */
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (table) => [
+    check(
+      "tasks_status_valid",
+      sql`${table.status} in ('queued', 'running', 'awaiting_approval', 'completed', 'failed', 'cancelled', 'interrupted')`,
+    ),
+    check("tasks_title_not_blank", sql`length(trim(${table.title})) > 0`),
+    check("tasks_auto_retries_left_valid", sql`${table.autoRetriesLeft} between 0 and 5`),
+    uniqueIndex("tasks_client_request_id_unique").on(table.clientRequestId),
+    index("tasks_updated_at_idx").on(table.updatedAt),
+    index("tasks_agent_id_idx").on(table.agentId),
+  ],
+);
+
+/**
+ * One execution of an agent: "answer this user message" or "work on this
+ * task". The web app inserts it as pending; the worker claims it, runs it,
+ * and records the outcome. The table doubles as the job queue, so there's no
+ * separate queue service. A run belongs to exactly one of a conversation or
+ * a task.
  */
 export const runs = pgTable(
   "runs",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    conversationId: uuid("conversation_id")
-      .notNull()
-      .references(() => conversations.id, { onDelete: "cascade" }),
+    /** Set for a conversation run (with userMessageId); null for a task run. */
+    conversationId: uuid("conversation_id").references(() => conversations.id, { onDelete: "cascade" }),
     agentId: uuid("agent_id")
       .notNull()
       .references(() => agents.id, { onDelete: "cascade" }),
-    userMessageId: uuid("user_message_id")
-      .notNull()
-      .references((): AnyPgColumn => messages.id, { onDelete: "cascade" }),
+    userMessageId: uuid("user_message_id").references((): AnyPgColumn => messages.id, { onDelete: "cascade" }),
+    /** Set for a task run: this run is one attempt at that task. */
+    taskId: uuid("task_id").references(() => tasks.id, { onDelete: "cascade" }),
+    /** Which attempt at the task this is, from 1. Always 1 for conversation runs. */
+    attempt: integer("attempt").notNull().default(1),
+    /** The worker that claimed it: whose heartbeat keeps it alive. */
+    workerId: text("worker_id"),
+    /** A scheduled retry isn't claimed before this time (backoff). */
+    notBefore: timestamp("not_before", { withTimezone: true }),
     status: text("status", { enum: RUN_STATUSES }).notNull().default("pending"),
     /** The model actually requested, recorded when the run starts. */
     modelId: text("model_id"),
@@ -166,10 +243,76 @@ export const runs = pgTable(
     uniqueIndex("runs_one_active_per_conversation")
       .on(table.conversationId)
       .where(sql`${table.status} in ('pending', 'running')`),
+    // The same for tasks: one attempt at a time, so a task never runs twice at once.
+    uniqueIndex("runs_one_active_per_task")
+      .on(table.taskId)
+      .where(sql`${table.status} in ('pending', 'running')`),
+    check(
+      "runs_belong_to_conversation_or_task",
+      sql`(${table.taskId} is null and ${table.conversationId} is not null and ${table.userMessageId} is not null)
+        or (${table.taskId} is not null and ${table.conversationId} is null and ${table.userMessageId} is null)`,
+    ),
     // The worker looks for the oldest pending run.
     index("runs_status_created_at_idx").on(table.status, table.createdAt),
+    index("runs_task_id_idx").on(table.taskId),
   ],
 );
+
+export const TASK_EVENT_TYPES = [
+  "created",
+  "queued",
+  "claimed",
+  "started",
+  "tool_requested",
+  "tool_denied",
+  "approval_requested",
+  "approval_granted",
+  "approval_rejected",
+  "approval_expired",
+  "approval_cancelled",
+  "tool_succeeded",
+  "tool_failed",
+  "completed",
+  "failed",
+  "cancel_requested",
+  "cancelled",
+  "interrupted",
+  "retry_scheduled",
+] as const;
+export type TaskEventType = (typeof TASK_EVENT_TYPES)[number];
+
+/**
+ * What happened to a task, in order: the timeline on the task's page and its
+ * audit trail. Append-only. Messages are written by Solas, never copied from
+ * the model or a provider, and data holds only IDs and codes: no tool
+ * output, no credentials.
+ */
+export const taskEvents = pgTable(
+  "task_events",
+  {
+    // Sequential, so "events after N" is exact even within one millisecond.
+    id: bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
+    taskId: uuid("task_id")
+      .notNull()
+      .references(() => tasks.id, { onDelete: "cascade" }),
+    runId: uuid("run_id").references(() => runs.id, { onDelete: "set null" }),
+    type: text("type", { enum: TASK_EVENT_TYPES }).notNull(),
+    message: text("message").notNull(),
+    data: jsonb("data").$type<TaskEventData>().notNull().default({}),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("task_events_task_id_idx").on(table.taskId, table.id)],
+);
+
+/** The only fields an event may carry: references and codes, nothing sensitive. */
+export type TaskEventData = {
+  attempt?: number;
+  toolId?: string;
+  toolCallId?: string;
+  code?: string;
+  /** For a scheduled retry: when it may start (ISO). */
+  notBefore?: string;
+};
 
 /**
  * Which tools an agent may use, and how. A row exists only for an enabled
@@ -246,3 +389,5 @@ export type ToolCallRow = typeof toolCalls.$inferSelect;
 export type ConversationRow = typeof conversations.$inferSelect;
 export type MessageRow = typeof messages.$inferSelect;
 export type RunRow = typeof runs.$inferSelect;
+export type TaskRow = typeof tasks.$inferSelect;
+export type TaskEventRow = typeof taskEvents.$inferSelect;
