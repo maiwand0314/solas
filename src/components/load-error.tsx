@@ -3,6 +3,7 @@ import { AgentServiceError } from "@/server/agents/errors";
 import { OwnerAccessError } from "@/server/auth/owner";
 import { ConversationServiceError } from "@/server/conversations/errors";
 import { TaskServiceError } from "@/server/tasks/errors";
+import { TeamServiceError } from "@/server/teams/errors";
 import { RetryButton } from "./retry-button";
 
 /**
@@ -10,7 +11,7 @@ import { RetryButton } from "./retry-button";
  * message and a way forward; anything else is logged on the server and shown
  * generically, without internal details.
  */
-const SUBJECT_LABELS = { agents: "Agents", conversations: "Conversations", tasks: "Tasks" } as const;
+const SUBJECT_LABELS = { agents: "Agents", conversations: "Conversations", tasks: "Tasks", teams: "Teams" } as const;
 
 export function LoadError({ error, subject = "agents" }: { error: unknown; subject?: keyof typeof SUBJECT_LABELS }) {
   if (error instanceof OwnerAccessError) {
@@ -21,7 +22,10 @@ export function LoadError({ error, subject = "agents" }: { error: unknown; subje
     );
   }
   if (
-    (error instanceof AgentServiceError || error instanceof ConversationServiceError || error instanceof TaskServiceError) &&
+    (error instanceof AgentServiceError ||
+      error instanceof ConversationServiceError ||
+      error instanceof TaskServiceError ||
+      error instanceof TeamServiceError) &&
     error.code === "database_unavailable"
   ) {
     return (

@@ -3,12 +3,13 @@ import { AgentServiceError, type AgentErrorCode, type FieldErrors } from "@/serv
 import { OwnerAccessError } from "@/server/auth/owner";
 import { ConversationServiceError, type ConversationErrorCode } from "@/server/conversations/errors";
 import { TaskServiceError, type TaskErrorCode } from "@/server/tasks/errors";
+import { TeamServiceError, type TeamErrorCode } from "@/server/teams/errors";
 
 // Server Actions return values instead of throwing, so forms can show
 // field-level messages. Only plain, serializable data crosses to the browser:
 // never stack traces, SQL, or the original error.
 
-export type ActionErrorCode = AgentErrorCode | ConversationErrorCode | TaskErrorCode | "forbidden";
+export type ActionErrorCode = AgentErrorCode | ConversationErrorCode | TaskErrorCode | TeamErrorCode | "forbidden";
 
 export type ActionResult<T> =
   | { ok: true; data: T }
@@ -18,7 +19,12 @@ export function toActionError(error: unknown): Extract<ActionResult<never>, { ok
   if (error instanceof OwnerAccessError) {
     return { ok: false, error: { code: "forbidden", message: error.message, fieldErrors: {} } };
   }
-  if (error instanceof AgentServiceError || error instanceof ConversationServiceError || error instanceof TaskServiceError) {
+  if (
+    error instanceof AgentServiceError ||
+    error instanceof ConversationServiceError ||
+    error instanceof TaskServiceError ||
+    error instanceof TeamServiceError
+  ) {
     if (error.code === "unexpected" || error.code === "database_unavailable") {
       // Keep the details in the server log, where the owner can look them up.
       console.error("[solas] action failed:", error.cause ?? error);
