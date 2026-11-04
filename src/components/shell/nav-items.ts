@@ -6,6 +6,7 @@ import {
   OverviewIcon,
   SettingsIcon,
   TasksIcon,
+  TeamsIcon,
   type IconProps,
 } from "@/components/icons";
 
@@ -18,6 +19,7 @@ export type NavItem = {
 export const primaryNavItems: NavItem[] = [
   { href: "/", label: "Overview", icon: OverviewIcon },
   { href: "/agents", label: "Agents", icon: AgentsIcon },
+  { href: "/teams", label: "Teams", icon: TeamsIcon },
   { href: "/conversations", label: "Conversations", icon: ConversationsIcon },
   { href: "/tasks", label: "Tasks", icon: TasksIcon },
   { href: "/automations", label: "Automations", icon: AutomationsIcon },

@@ -43,6 +43,17 @@ export function AgentsIcon(props: IconProps) {
   );
 }
 
+export function TeamsIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <circle cx="9" cy="9" r="3" />
+      <path d="M3.5 18.5c.9-2.6 2.9-4 5.5-4s4.6 1.4 5.5 4" />
+      <circle cx="16.5" cy="8" r="2.5" />
+      <path d="M16 13.2c2.2 0 3.8 1.2 4.5 3.3" />
+    </Icon>
+  );
+}
+
 export function ConversationsIcon(props: IconProps) {
   return (
     <Icon {...props}>
