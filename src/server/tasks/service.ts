@@ -27,6 +27,7 @@ import { RUN_LIMITS } from "@/server/runs/config";
 import { TaskServiceError, fromDatabaseError, validationError } from "./errors";
 import { jsonLogger } from "@/server/logger";
 import { cancelTaskInTx, stopOrphanedChildren } from "./cancel";
+import { insertTaskWithFirstRun } from "./create";
 import { recordTaskEvent } from "./events";
 import { transitionTask, type Queryable } from "./lifecycle";
 
@@ -184,20 +185,16 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
     try {
       return await query(() =>
         db.transaction(async (tx) => {
-          const [task] = await tx
-            .insert(tasks)
-            .values({ agentId, title, instructions, clientRequestId, teamId: teamId ?? null, autoRetriesLeft: limits.taskAutoRetries })
-            .returning({ id: tasks.id });
-          const [run] = await tx.insert(runs).values({ taskId: task.id, agentId, attempt: 1 }).returning({ id: runs.id });
-          await recordTaskEvent(tx, { taskId: task.id, type: "created", message: `You created this task for ${agent.name}.` });
-          await recordTaskEvent(tx, {
-            taskId: task.id,
-            runId: run.id,
-            type: "queued",
-            message: "Queued as attempt 1. It starts when the worker picks it up.",
-            data: { attempt: 1 },
+          const { taskId } = await insertTaskWithFirstRun(tx, {
+            agentId,
+            title,
+            instructions,
+            clientRequestId,
+            teamId,
+            autoRetries: limits.taskAutoRetries,
+            createdMessage: `You created this task for ${agent.name}.`,
           });
-          return { taskId: task.id };
+          return { taskId };
         }),
       );
     } catch (error) {

@@ -1,5 +1,6 @@
 import "server-only";
 import { AgentServiceError, type AgentErrorCode, type FieldErrors } from "@/server/agents/errors";
+import { AutomationServiceError, type AutomationErrorCode } from "@/server/automations/errors";
 import { OwnerAccessError } from "@/server/auth/owner";
 import { ConversationServiceError, type ConversationErrorCode } from "@/server/conversations/errors";
 import { TaskServiceError, type TaskErrorCode } from "@/server/tasks/errors";
@@ -9,7 +10,13 @@ import { TeamServiceError, type TeamErrorCode } from "@/server/teams/errors";
 // field-level messages. Only plain, serializable data crosses to the browser:
 // never stack traces, SQL, or the original error.
 
-export type ActionErrorCode = AgentErrorCode | ConversationErrorCode | TaskErrorCode | TeamErrorCode | "forbidden";
+export type ActionErrorCode =
+  | AgentErrorCode
+  | ConversationErrorCode
+  | TaskErrorCode
+  | TeamErrorCode
+  | AutomationErrorCode
+  | "forbidden";
 
 export type ActionResult<T> =
   | { ok: true; data: T }
@@ -23,7 +30,8 @@ export function toActionError(error: unknown): Extract<ActionResult<never>, { ok
     error instanceof AgentServiceError ||
     error instanceof ConversationServiceError ||
     error instanceof TaskServiceError ||
-    error instanceof TeamServiceError
+    error instanceof TeamServiceError ||
+    error instanceof AutomationServiceError
   ) {
     if (error.code === "unexpected" || error.code === "database_unavailable") {
       // Keep the details in the server log, where the owner can look them up.

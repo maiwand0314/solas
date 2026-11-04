@@ -10,10 +10,16 @@
 // (a task attempt may be retried automatically when that is safe), so nothing
 // stays "running" forever. Pending runs and queued tasks wait in PostgreSQL
 // and are picked up when the worker starts again.
+//
+// It also runs the automation scheduler (M6A), which turns due schedules into
+// ordinary tasks. Schedules live in PostgreSQL too: a stopped worker starts
+// nothing, and a run it was too late for is recorded as missed, not caught up.
 
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import { closeDatabase, createDatabase } from "@/server/db/client";
+import { AUTOMATION_LIMITS } from "@/lib/automations/limits";
+import { createScheduler } from "@/server/automations/scheduler";
 import { jsonLogger as log } from "@/server/logger";
 import { providerRegistry } from "@/server/providers/registry";
 import { RUN_LIMITS, prepareRuntimeDirectory, workerConcurrency } from "@/server/runs/config";
@@ -53,6 +59,9 @@ const executor = createRunExecutor({
   log,
 });
 
+// Automations (M6A): turns due schedules into ordinary tasks for the loop below.
+const scheduler = createScheduler({ db, providers: providerRegistry, log });
+
 let stopping = false;
 function shutdown(signal: string) {
   if (stopping) return;
@@ -70,7 +79,14 @@ log("info", "worker.started", {
   concurrency,
 });
 
-await runWorkerLoop({ executor, concurrency, limits: RUN_LIMITS, log, shouldStop: () => stopping });
+await runWorkerLoop({
+  executor,
+  scheduler,
+  concurrency,
+  limits: { ...RUN_LIMITS, schedulerIntervalMs: AUTOMATION_LIMITS.checkIntervalMs },
+  log,
+  shouldStop: () => stopping,
+});
 
 await closeDatabase(db);
 log("info", "worker.stopped");
