@@ -107,7 +107,10 @@ export function TaskList({ tasks }: { tasks: TaskSummary[] }) {
               >
                 {task.title}
               </Link>
-              <p className="mt-0.5 truncate text-sm text-muted">{task.agentName}</p>
+              <p className="mt-0.5 truncate text-sm text-muted">
+                {task.agentName}
+                {task.delegatedBy && <span className="text-subtle"> · delegated by {task.delegatedBy}</span>}
+              </p>
               <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-subtle md:hidden">
                 <TaskStatusBadge status={task.status} cancelling={cancelling} />
                 {times}

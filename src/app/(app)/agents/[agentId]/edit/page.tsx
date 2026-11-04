@@ -5,7 +5,7 @@ import { LoadError } from "@/components/load-error";
 import { AgentDetailsSkeleton } from "@/components/agents/agent-skeletons";
 import { BackLink } from "@/components/agents/back-link";
 import { PageHeader } from "@/components/ui/page-header";
-import { getAgentToolsForOwner } from "@/server/agents/queries";
+import { getAgentDelegationTargetsForOwner, getAgentToolsForOwner, listAgentsForOwner } from "@/server/agents/queries";
 import { providerRegistry } from "@/server/providers/registry";
 import { toolRegistry } from "@/server/tools/registry";
 import { displayWorkspacePath } from "@/server/tools/workspace";
@@ -28,7 +28,11 @@ async function EditAgentContent({ params }: Pick<PageProps<"/agents/[agentId]/ed
   const result = await loadAgent(agentId);
   if ("error" in result) return <LoadError error={result.error} />;
   const { agent } = result;
-  const toolSettings = await getAgentToolsForOwner(agent.id);
+  const [toolSettings, targets, allAgents] = await Promise.all([
+    getAgentToolsForOwner(agent.id),
+    getAgentDelegationTargetsForOwner(agent.id),
+    listAgentsForOwner(),
+  ]);
   return (
     <>
       <BackLink href={`/agents/${agent.id}`}>{agent.name}</BackLink>
@@ -43,6 +47,10 @@ async function EditAgentContent({ params }: Pick<PageProps<"/agents/[agentId]/ed
         tools={toolRegistry.catalog()}
         toolSettings={toolSettings}
         workspacePath={displayWorkspacePath(agent.id)}
+        delegationOptions={allAgents
+          .filter((other) => other.id !== agent.id)
+          .map(({ id, name, role, enabled }) => ({ id, name, role, enabled }))}
+        delegateTo={targets.map((target) => target.id)}
       />
     </>
   );

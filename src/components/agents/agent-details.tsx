@@ -2,7 +2,8 @@ import type { ReactNode } from "react";
 import { Callout } from "@/components/ui/callout";
 import { PageHeader } from "@/components/ui/page-header";
 import { RelativeTime } from "@/components/ui/relative-time";
-import type { Agent } from "@/server/agents/service";
+import Link from "next/link";
+import type { Agent, DelegationTarget } from "@/server/agents/service";
 import type { ToolCatalogEntry } from "@/server/tools/types";
 import { AgentHeaderActions, DeleteAgentSection } from "./agent-detail-actions";
 import { AgentEnabledSwitch } from "./agent-enabled-switch";
@@ -16,6 +17,8 @@ type AgentDetailsProps = {
   /** The agent's enabled tools, in registry order. */
   tools: (Pick<ToolCatalogEntry, "id" | "name" | "risk" | "approval" | "capability"> & { mode: "allow" | "ask" })[];
   workspacePath: string;
+  /** Agents this one may delegate to; empty when delegation is off. */
+  delegationTargets: DelegationTarget[];
 };
 
 /**
@@ -26,7 +29,7 @@ type AgentDetailsProps = {
  * schedules, memory) each get their own section here, between "AI model"
  * and "Status", without changing the sections around them.
  */
-export function AgentDetails({ agent, modelLabel, tools, workspacePath }: AgentDetailsProps) {
+export function AgentDetails({ agent, modelLabel, tools, workspacePath, delegationTargets }: AgentDetailsProps) {
   const ref = { id: agent.id, name: agent.name };
   return (
     <>
@@ -88,6 +91,29 @@ export function AgentDetails({ agent, modelLabel, tools, workspacePath }: AgentD
                   <code className="font-mono text-[0.8125rem] break-all text-foreground">{workspacePath}</code>
                 </p>
               )}
+            </div>
+          )}
+        </DetailSection>
+
+        <DetailSection title="Delegation" description="Checked by Solas on every delegation.">
+          {delegationTargets.length === 0 ? (
+            <p className="text-muted">Off. This agent does all of its tasks itself.</p>
+          ) : (
+            <div className="flex flex-col gap-3">
+              <p className="text-sm text-muted">In a task, it may hand one subtask to:</p>
+              <ul className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-surface">
+                {delegationTargets.map((target) => (
+                  <li key={target.id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-3">
+                    <Link href={`/agents/${target.id}`} className="font-medium underline-offset-2 hover:underline">
+                      {target.name}
+                    </Link>
+                    <span className="text-sm text-muted">
+                      {target.role}
+                      {target.enabled ? "" : " · Disabled"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
         </DetailSection>

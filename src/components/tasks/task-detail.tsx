@@ -9,7 +9,12 @@ import { PageHeader } from "@/components/ui/page-header";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { cn } from "@/lib/cn";
 import { isActiveTaskStatus } from "@/lib/tasks/status";
-import type { TaskAttempt, TaskDetail as TaskDetailData, TaskEventView } from "@/server/tasks/service";
+import type {
+  TaskAttempt,
+  TaskDelegationView,
+  TaskDetail as TaskDetailData,
+  TaskEventView,
+} from "@/server/tasks/service";
 import { TaskActions } from "./task-actions";
 import { TaskApprovals } from "./task-approvals";
 import { TaskStatusBadge } from "./task-status-badge";
@@ -34,6 +39,8 @@ const EVENT_TONE: Partial<Record<TaskEventView["type"], string>> = {
   retry_scheduled: "bg-warning",
   claimed: "bg-accent",
   started: "bg-accent",
+  delegated: "bg-accent",
+  continuation_queued: "bg-accent",
 };
 
 const fullDateTime = new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "medium", timeZone: "UTC" });
@@ -44,7 +51,7 @@ const fullDateTime = new Intl.DateTimeFormat("en", { dateStyle: "medium", timeSt
  * from the database every second (LiveRefresh); nothing is simulated.
  */
 export function TaskDetail({ detail, toolInfo }: { detail: TaskDetailData; toolInfo: ToolInfo }) {
-  const { task, agent, attempts, events, toolCalls } = detail;
+  const { task, agent, attempts, events, toolCalls, parent, delegations } = detail;
   const active = isActiveTaskStatus(task.status);
   const cancelling = task.cancelRequestedAt !== null && active;
   const current = attempts.at(-1);
@@ -70,10 +77,34 @@ export function TaskDetail({ detail, toolInfo }: { detail: TaskDetailData; toolI
         actions={<TaskActions taskId={task.id} title={task.title} status={task.status} cancelling={cancelling} />}
       />
 
+      {parent && (
+        <Callout title={`Delegated by ${parent.agent.name}`} className="mb-6">
+          Part of{" "}
+          <Link href={`/tasks/${parent.task.id}`} className="font-medium text-foreground underline underline-offset-2">
+            {parent.task.title}
+          </Link>
+          . {agent.name} got only the request below, and its result goes back to {parent.agent.name}.
+        </Callout>
+      )}
       <TaskApprovals calls={waiting} toolInfo={toolInfo} agentName={agent.name} />
       <StatusNotice detail={detail} current={current} cancelling={cancelling} />
 
       <div className="divide-y divide-border">
+        {delegations.length > 0 && (
+          <Section title="Delegation" description="Work handed to another agent, as its own task.">
+            <div className="flex flex-col gap-3">
+              {delegations.map((delegation) => (
+                <DelegationCard
+                  key={delegation.id}
+                  delegation={delegation}
+                  parentAgentName={agent.name}
+                  toolInfo={toolInfo}
+                  finalResultSaved={task.result !== null}
+                />
+              ))}
+            </div>
+          </Section>
+        )}
         {task.result !== null ? (
           <Section title="Result" description={task.finishedAt ? <>Saved <RelativeTime date={task.finishedAt} /></> : undefined}>
             <div className="rounded-lg border border-border bg-surface px-4 py-3.5 text-reading break-words">
@@ -88,7 +119,7 @@ export function TaskDetail({ detail, toolInfo }: { detail: TaskDetailData; toolI
           </Section>
         ) : null}
 
-        <Section title="Instructions">
+        <Section title={parent ? `Request from ${parent.agent.name}` : "Instructions"}>
           <div className="rounded-lg border border-border bg-surface px-4 py-3.5 text-reading break-words whitespace-pre-wrap">
             {task.instructions}
           </div>
@@ -176,6 +207,17 @@ function StatusNotice({
         . You can close Solas; it keeps running.
       </StatusLine>
     );
+  } else if (task.status === "waiting_on_delegate") {
+    const names = detail.delegations
+      .filter((delegation) => delegation.status === "waiting")
+      .map((delegation) => delegation.agent.name)
+      .join(", ");
+    notice = (
+      <StatusLine active>
+        Waiting for {names || "the delegated task"}. {agent.name} continues when it’s done; no worker is held while it
+        waits.
+      </StatusLine>
+    );
   } else if (task.status === "awaiting_approval") {
     notice = <StatusLine active>Waiting for your approval{attempt}. The attempt’s time limit is paused.</StatusLine>;
   } else if (task.status === "failed") {
@@ -191,6 +233,83 @@ function StatusNotice({
   }
 
   return notice ? <div className="mb-6">{notice}</div> : null;
+}
+
+/** One delegation on the parent's page: who, what was sent, the child's status, approvals, and result. */
+function DelegationCard({
+  delegation,
+  parentAgentName,
+  toolInfo,
+  finalResultSaved,
+}: {
+  delegation: TaskDelegationView;
+  parentAgentName: string;
+  toolInfo: ToolInfo;
+  finalResultSaved: boolean;
+}) {
+  const { child, agent } = delegation;
+  return (
+    <article className="rounded-lg border border-border bg-surface" aria-label={`Delegated to ${agent.name}`}>
+      <header className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-border px-4 py-3">
+        <p className="text-sm">
+          <span className="text-muted">{parentAgentName}</span>
+          <span aria-hidden="true" className="mx-1.5 text-subtle">
+            →
+          </span>
+          <span className="sr-only"> delegated to </span>
+          <Link href={`/agents/${agent.id}`} className="font-medium underline-offset-2 hover:underline">
+            {agent.name}
+          </Link>
+        </p>
+        <TaskStatusBadge status={child.status} cancelling={child.cancelRequestedAt !== null} />
+        <span className="ml-auto text-xs text-subtle tabular-nums">
+          Delegated <RelativeTime date={delegation.createdAt} />
+          {delegation.completedAt ? (
+            <>
+              {" "}· finished <RelativeTime date={delegation.completedAt} />
+            </>
+          ) : null}
+        </span>
+      </header>
+      <div className="flex flex-col gap-3 px-4 py-3.5">
+        <Link href={`/tasks/${child.id}`} className="font-medium underline-offset-2 hover:underline">
+          {child.title}
+        </Link>
+        <TaskApprovals calls={delegation.waitingCalls} toolInfo={toolInfo} agentName={agent.name} />
+        <details className="group text-sm">
+          <summary className="inline-flex cursor-pointer items-center gap-1.5 rounded-sm text-subtle hover:text-foreground">
+            <span aria-hidden="true" className="transition-transform duration-100 group-open:rotate-90">
+              ›
+            </span>
+            What {parentAgentName} sent
+          </summary>
+          <div className="mt-2 rounded-md border border-border bg-background px-3 py-2.5 text-sm break-words whitespace-pre-wrap">
+            {delegation.taskDescription}
+            {delegation.expectedOutput ? `\n\nExpected output: ${delegation.expectedOutput}` : ""}
+          </div>
+        </details>
+        {child.result !== null && (
+          <details className="group text-sm" open={!finalResultSaved}>
+            <summary className="inline-flex cursor-pointer items-center gap-1.5 rounded-sm text-subtle hover:text-foreground">
+              <span aria-hidden="true" className="transition-transform duration-100 group-open:rotate-90">
+                ›
+              </span>
+              {agent.name}’s result
+            </summary>
+            <div className="mt-2 rounded-md border border-border bg-background px-3 py-2.5 text-reading break-words">
+              <Markdown>{child.result}</Markdown>
+            </div>
+          </details>
+        )}
+        {child.status === "failed" && child.errorMessage && <p className="text-sm text-danger">{child.errorMessage}</p>}
+        {child.status === "interrupted" && (
+          <p className="text-sm text-muted">
+            Interrupted. Open the delegated task to retry or cancel it; {parentAgentName} waits until you do.
+          </p>
+        )}
+      </div>
+    </article>
+  );
 }
 
 function StatusLine({ children, active = false }: { children: ReactNode; active?: boolean }) {

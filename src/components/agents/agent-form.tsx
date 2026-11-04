@@ -23,6 +23,7 @@ import {
 import type { Agent } from "@/server/agents/service";
 import type { ProviderDefinition } from "@/server/providers/registry";
 import type { ToolCatalogEntry } from "@/server/tools/types";
+import { DelegationFields, type DelegationOption } from "./delegation-fields";
 import { ToolPermissionsFields } from "./tool-permissions-fields";
 import { useUnsavedChangesGuard } from "./use-unsaved-changes";
 
@@ -32,9 +33,11 @@ type AgentFormProps = {
   tools: ToolCatalogEntry[];
   /** Where the agent's workspace is (edit) or will be (create), for display. */
   workspacePath: string;
+  /** The other agents, which this one could delegate to. */
+  delegationOptions: DelegationOption[];
 } & (
-  | { mode: "create"; agent?: undefined; toolSettings?: undefined }
-  | { mode: "edit"; agent: Agent; toolSettings: AgentToolSetting[] }
+  | { mode: "create"; agent?: undefined; toolSettings?: undefined; delegateTo?: undefined }
+  | { mode: "edit"; agent: Agent; toolSettings: AgentToolSetting[]; delegateTo: string[] }
 );
 
 /** What the inputs hold. Selects use "" for "not configured". */
@@ -48,6 +51,10 @@ type FormValues = {
   enabled: boolean;
   /** Enabled tools only, kept in catalog order so comparisons are stable. */
   tools: AgentToolSetting[];
+  /** The delegation switch; turning it off clears the targets when saved. */
+  delegationOn: boolean;
+  /** Chosen delegation targets, in list order. */
+  delegateTo: string[];
 };
 
 const EMPTY_VALUES: FormValues = {
@@ -59,12 +66,14 @@ const EMPTY_VALUES: FormValues = {
   modelId: "",
   enabled: true,
   tools: [],
+  delegationOn: false,
+  delegateTo: [],
 };
 
 // Error focus order follows the form's visual order.
-const FIELD_ORDER = ["name", "role", "description", "instructions", "providerId", "modelId", "tools"] as const;
+const FIELD_ORDER = ["name", "role", "description", "instructions", "providerId", "modelId", "tools", "delegateTo"] as const;
 
-function valuesFromAgent(agent: Agent, tools: AgentToolSetting[]): FormValues {
+function valuesFromAgent(agent: Agent, tools: AgentToolSetting[], delegateTo: string[]): FormValues {
   return {
     name: agent.name,
     role: agent.role,
@@ -74,6 +83,8 @@ function valuesFromAgent(agent: Agent, tools: AgentToolSetting[]): FormValues {
     modelId: agent.modelId ?? "",
     enabled: agent.enabled,
     tools,
+    delegationOn: delegateTo.length > 0,
+    delegateTo,
   };
 }
 
@@ -88,6 +99,7 @@ function toInput(values: FormValues) {
     modelId: values.modelId || null,
     enabled: values.enabled,
     tools: values.tools,
+    delegateTo: values.delegationOn ? values.delegateTo : [],
   };
 }
 
@@ -110,13 +122,24 @@ function changedFields(next: AgentInput, initial: AgentInput): Partial<AgentInpu
  * and saves → on success, go to the agent's page; on failure, show the
  * server's field errors next to the inputs.
  */
-export function AgentForm({ mode, agent, providers, tools, toolSettings, workspacePath }: AgentFormProps) {
+export function AgentForm({
+  mode,
+  agent,
+  providers,
+  tools,
+  toolSettings,
+  workspacePath,
+  delegationOptions,
+  delegateTo,
+}: AgentFormProps) {
   const router = useRouter();
   // Unique per form instance: Next.js keeps recently visited pages mounted
   // (hidden) for instant back navigation, so fixed ids could appear twice.
   const idPrefix = useId();
   const fieldId = (field: string) => `${idPrefix}-${field}`;
-  const [initial] = useState<FormValues>(() => (agent ? valuesFromAgent(agent, toolSettings ?? []) : EMPTY_VALUES));
+  const [initial] = useState<FormValues>(() =>
+    agent ? valuesFromAgent(agent, toolSettings ?? [], delegateTo ?? []) : EMPTY_VALUES,
+  );
   const [values, setValues] = useState<FormValues>(initial);
   const [errors, setErrors] = useState<FieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
@@ -136,7 +159,8 @@ export function AgentForm({ mode, agent, providers, tools, toolSettings, workspa
   }, [initial]);
 
   const changes = changedFields(toInput(values), toInput(initial));
-  const dirty = Object.keys(changes).length > 0;
+  // Turning delegation on counts as a change even before a target is chosen, so Save explains what's missing.
+  const dirty = Object.keys(changes).length > 0 || values.delegationOn !== initial.delegationOn;
   useUnsavedChangesGuard(dirty && !saved);
 
   function setField<K extends keyof FormValues>(field: K, value: FormValues[K]) {
@@ -157,6 +181,10 @@ export function AgentForm({ mode, agent, providers, tools, toolSettings, workspa
     event.preventDefault();
     if (pending) return;
 
+    if (values.delegationOn && values.delegateTo.length === 0) {
+      showErrors({ delegateTo: ["Choose at least one agent, or turn delegation off."] }, null);
+      return;
+    }
     const input = mode === "create" ? toInput(values) : changes;
     const check = validateAgentInput(mode === "create" ? createAgentSchema : updateAgentSchema, input);
     if (!check.ok) {
@@ -285,6 +313,24 @@ export function AgentForm({ mode, agent, providers, tools, toolSettings, workspa
           error={errorFor("tools")}
           errorId={fieldId("tools")}
           workspacePath={workspacePath}
+        />
+      </FormSection>
+
+      <FormSection
+        title="Delegation"
+        description="Whether this agent may hand a subtask to another agent in a task, and to which ones. Off until you choose."
+      >
+        <DelegationFields
+          options={delegationOptions}
+          on={values.delegationOn}
+          value={values.delegateTo}
+          onToggle={(on) => {
+            setField("delegationOn", on);
+            if (errors.delegateTo) setErrors((current) => ({ ...current, delegateTo: undefined }));
+          }}
+          onChange={(next) => setField("delegateTo", next)}
+          error={errorFor("delegateTo")}
+          errorId={fieldId("delegateTo")}
         />
       </FormSection>
 
