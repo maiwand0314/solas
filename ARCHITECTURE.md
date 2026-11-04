@@ -63,11 +63,12 @@ Four ideas to hold on to:
 | **Persistent storage** | PostgreSQL with Drizzle ORM and versioned migrations | `src/server/db/` | M2 |
 | **Agent management** | CRUD for agent definitions: name, role, instructions, model, tool profile, budgets | `src/server/agents/` | M2 |
 | **Agent execution layer** | `AgentRuntime` interface + adapters. Turns "agent + input" into a Solas `RunResult` (events and streaming in M3B) | `src/server/runtime/`, `src/server/runs/` | M3A |
-| **Background worker** | Separate Node process: claims pending runs, supervises them, recovers after crashes (schedules in M8) | `src/worker/` | M3A |
+| **Background worker** | Separate Node process: claims pending runs (up to a configurable number at once), supervises them, recovers after crashes (schedules in M8) | `src/worker/`, `src/server/runs/worker-loop.ts` | M3A, M4B |
 | **Conversations** | Per-agent threads. Each user message creates a run; the agent's reply is stored as a message | `src/server/conversations/` | M3A |
 | **Tools and permissions** | Tool registry, per-agent permissions, workspaces, and the enforcement layer every call goes through | `src/server/tools/` | M4A |
 | **Approvals** | Tool calls that need approval wait for the owner's decision in the conversation | `src/server/tools/invoker.ts`, `src/server/conversations/` | M4A |
-| **Tasks and schedules** | One-off assignments and recurring triggers that create runs | `src/server/tasks/` | M8 |
+| **Tasks** | One-off assignments the worker runs in the background; each attempt is a run. State machine, retry policy, timeline | `src/server/tasks/` | M4B |
+| **Schedules** | Recurring triggers that create tasks | `src/server/tasks/` (later) | M8 |
 | **Authentication** | Single owner. Login page, database sessions, checks in every data-access function | `src/server/auth/`, `src/proxy.ts` | M9 |
 | **Deployment** | One VPS: web, worker, PostgreSQL, reverse proxy; private network access | `deploy/` (later) | M10 |
 
@@ -119,20 +120,33 @@ messages (M3A, built)
   a message is only stored when it is final, so it needs no status of its own;
   the status lives on the run
 
-runs (M3A, built)
-  id, conversation_id → conversations, agent_id → agents,
-  user_message_id → messages (the message being answered),
+runs (M3A, built; extended in M4B)
+  id, agent_id → agents,
+  conversation_id → conversations + user_message_id → messages
+    (a conversation run: "answer this message"), or
+  task_id → tasks (M4B; a task run: one attempt at the task);
+    a check constraint requires exactly one of the two
+  attempt (M4B; 1, 2, … per task), worker_id (M4B; who claimed it),
+  not_before (M4B; a scheduled retry isn't claimed before this),
   status ('pending' | 'running' | 'completed' | 'failed' | 'cancelled'),
   model_id (recorded at start), error_code, error_message,
   cancel_requested_at, input_tokens, output_tokens,
-  partial_output (M3B; the reply so far, kept on a stopped or failed run),
-  heartbeat_at (M3B; refreshed every second by the worker running it),
+  partial_output (M3B; the text so far, kept on a stopped or failed run),
+  heartbeat_at (M3B; refreshed every second by the worker running it: the lease),
   created_at, started_at, finished_at
-  unique: one pending/running run per conversation
-  later: task_id, 'awaiting_approval'
+  unique: one pending/running run per conversation, and per task
 
-run_events (planned, when tool calls need a timeline)
-  id (sequential), run_id → runs, type, payload (jsonb), created_at
+tasks (M4B, built — see §5.8)
+  id, agent_id → agents (cascade), title, instructions,
+  status ('queued' | 'running' | 'awaiting_approval' | 'completed' |
+          'failed' | 'cancelled' | 'interrupted'),
+  result, error_code, error_message, cancel_requested_at,
+  auto_retries_left, client_request_id (unique; idempotent create),
+  created_at, updated_at, started_at, finished_at
+
+task_events (M4B, built)
+  id (sequential identity), task_id → tasks (cascade), run_id → runs,
+  type, message (written by Solas), data (jsonb: ids and codes only), created_at
 
 agent_tool_permissions (M4A, built)
   agent_id → agents (cascade), tool_id, mode ('allow' | 'ask'), created_at
@@ -145,15 +159,16 @@ tool_calls (M4A, built; also the approval record)
   requires_approval, approval_expires_at, decided_at,
   result_summary, error_message, created_at, finished_at
 
-tasks (M8)        id, agent_id, title, instructions, status, result_run_id, …
 schedules (M8)    id, agent_id, task template, cron, timezone, enabled, next_run_at, …
 sessions (M9)     id, token_hash, expires_at, user_agent, created_at
 ```
 
 Design choices:
 
-- **`run_events` is append-only.** It is the audit log, the source for live
-  streaming, and the history of what an agent did. Events are never edited.
+- **`task_events` is append-only.** It is a task's audit log and timeline.
+  Events are never edited, and they hold Solas's own sentences plus IDs and
+  codes: no model output, no tool output, no credentials. (Conversation runs
+  have no event table; their tool activity lives in `tool_calls`.)
 - **`runs` is the queue.** No separate queue service: the worker claims the
   oldest `pending` row with `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP
   LOCKED LIMIT 1)` and sets `running`. Note the `=`: with `IN`, PostgreSQL
@@ -487,9 +502,11 @@ and very old turns of a long conversation are forgotten.
   - A run whose heartbeat is older than 30 s has lost its worker. On start,
     and every 30 s, a worker marks such runs `failed` (`worker_stopped`).
   - A live worker's runs are never touched, so a second worker is safe.
-- **No blind re-runs.** An interrupted run is not repeated automatically:
+- **No blind re-runs.** An interrupted reply is not repeated automatically:
   Claude may already have done (and counted) the work, and Solas can't verify
-  a result it never received. The owner decides with Retry.
+  a result it never received. The owner decides with Retry. (A task attempt
+  follows the task retry policy instead: one automatic retry when that is
+  provably safe, see §5.8.)
 
 ### 5.7 Tools and permissions (built in M4A)
 
@@ -502,6 +519,7 @@ of tools Solas can run. Each tool is a `ToolDefinition` in backend code:
 | `name`, `description` | For the owner and the model |
 | `input`, `output` | Zod schemas: arguments are validated, and the result must match its contract before the model sees it |
 | `risk`, `capability` | Shown to the owner (low/medium/high; what it may touch) |
+| `sideEffects` | Whether it changes anything (M4B). A lost task attempt that may have run such a tool is never repeated automatically |
 | `approval`, `defaultMode` | `optional` (owner picks "Run automatically" or "Ask me first") or `required` (always asks) |
 | `timeoutMs`, `maxOutputChars` | Limits per call |
 | `summarizeInput/Output` | One-line summaries for the activity log |
@@ -565,6 +583,144 @@ paths, network access. Tool output is **untrusted** (a file can contain text
 that tries to steer the agent); safety comes from least privilege and
 approvals, not from trusting the model.
 
+### 5.8 Background tasks and durable execution (built in M4B)
+
+A **task** is work the owner hands to an agent and comes back to later. It
+reuses everything conversations already have: the same queue (`runs`), the
+same worker, the same `AgentRuntime` and Claude adapter, the same tools,
+permissions, and approvals. Only three things are task-specific: the prompt,
+where the result goes, and what happens after a failure.
+
+```
+Browser            Web (Next.js)                        PostgreSQL              Worker
+ │ Create task ──▶ createTask (Server Action, owner guard)
+ │                 ├ validate (Zod, shared with the form)
+ │                 ├ agent exists, enabled, has a model?
+ │                 └ one transaction: task (queued) + run (attempt 1, pending)
+ │                   + events "created", "queued" ───────────────▶ tasks, runs, task_events
+ │ ◀── { taskId }                                                              claim (SKIP LOCKED, due only)
+ │                                                                             + task → running + "claimed"
+ │ task page: router.refresh() every 1 s while active ──▶ reads                 ├ agent, tools, prompt (title + instructions)
+ │   status, "written so far", approvals, attempts, timeline                    ├ "started", tool steps → task_events
+ │                                                                             ├ runtime.run(…) with heartbeat, Stop, timeout
+ │ (the tab can close at any time: nothing depends on it)                      └ one transaction: run outcome + task's next
+ │                                                                               state + event
+```
+
+**Task vs. attempt.** The task row is the owner's request and its final
+outcome. Each try is a run: attempt 1, attempt 2 after a retry, and so on.
+The page shows both: the task's status, and every attempt with its own
+status, timing, model, tokens, and error.
+
+**The state machine** (`src/server/tasks/lifecycle.ts`):
+
+```
+ queued ──claimed──▶ running ⇄ awaiting_approval
+   │                   ├─▶ completed      result saved; final
+   │                   ├─▶ failed         error saved; Retry possible
+   │                   ├─▶ interrupted    worker lost and repeating isn't safe; Retry possible
+   │                   ├─▶ cancelled      owner's Cancel, confirmed by the worker
+   │                   └─▶ queued         automatic retry (when safe)
+   └─▶ cancelled       Cancel before a worker took it
+ failed / interrupted / cancelled ──Retry──▶ queued (new attempt)
+```
+
+Every change goes through `transitionTask()`, which runs
+`UPDATE tasks SET status = $to … WHERE id = $id AND status IN (<allowed from>)`.
+The database checks the rule in the same statement that applies it, so two
+processes racing (Cancel vs. claim, approve vs. expiry) can't both win, and
+nothing can move a completed task. State changes are in the same transaction
+as the run's change and the event that describes it.
+
+**Claiming, locks, and leases.**
+- `claimNextRun()` picks the oldest pending run that is due
+  (`not_before` is null or past, by the database clock) with
+  `FOR UPDATE SKIP LOCKED`: a row lock that a second worker skips instead of
+  waiting for, so one run is never claimed twice. The claim sets
+  `status = running`, `worker_id`, `heartbeat_at`, and moves the task to
+  running, all in one transaction. If the task can't start (cancelled at that
+  instant), the run is cancelled too.
+- `heartbeat_at` is the **lease**: the worker refreshes it every second.
+  A lease older than 30 s means the worker is gone (crash, kill, power loss).
+- Lock order is always run first, then task, in the worker and in Cancel, so
+  they can't deadlock.
+- Before calling the provider, the worker checks the run's cancel request
+  once more, so a Cancel pressed right after the claim never starts Claude.
+
+**After a failure: the retry policy** (`decideAfterFailure`).
+
+| Failure | What happens |
+| --- | --- |
+| Worker lost (`worker_stopped`: crash, kill, Ctrl+C) or provider outage | Retried automatically **once**, after 15 s (doubling per attempt), but only if no tool with side effects may have run and no approval was pending |
+| Lost, but an action with side effects may have run | **Interrupted.** Repeating it could do it twice; the owner checks and decides |
+| Lost while an approval was pending | **Interrupted.** That Claude session can't be restored; a new attempt would ask again, so the owner starts it |
+| Usage limit, timeout, not signed in, model unavailable, agent disabled, … | **Failed**, never retried automatically. A usage limit would only be hit again, and every try counts against the plan |
+
+Tools declare `sideEffects` in the registry. All M4A tools only read, so a
+lost attempt that used them is safe to repeat. A tool that isn't in the
+registry counts as having side effects (fail closed).
+
+**Exactly once is not promised.** Database locks guarantee one worker per
+attempt and one result per task. They can't guarantee that something outside
+the database happened exactly once: if a worker dies after a tool changed
+something but before Solas recorded it, only the owner can tell. That is
+why such attempts are interrupted, not repeated.
+
+**Cancellation.** A queued task is cancelled at once (its pending run too).
+For a running task, Cancel sets `cancel_requested_at` on the task and its
+run; the worker's heartbeat sees it within a second, aborts the provider call
+(the SDK's abort controller), withdraws any pending approval, and records
+"cancelled". Until then the page says "Cancelling…", because that is the
+truth. Once stopped, anything the runtime returns is discarded.
+
+**Approvals in tasks** work exactly as in conversations (§5.7, §6.2): the
+call waits in `tool_calls`, the task moves to `awaiting_approval` (the
+attempt's timeout pauses), and the task page shows the same card with the
+exact input. A decision applies to that one call. Rejected, expired, and
+withdrawn requests never run.
+
+**Live progress.** The task page and the Tasks list re-render from the
+database on a timer while something is active (`LiveRefresh`:
+`router.refresh()` every 1 s on a task, 2 s on the list, paused while the tab
+is hidden). Why not SSE: one owner, one tab, and polling a server render is
+the same pattern conversations use, with nothing new to deploy; the
+append-only `task_events` (sequential IDs) make an SSE stream a small change
+later. No percentage is shown: the worker can't measure progress, so it
+shows real states and real text instead.
+
+**Concurrency.** `SOLAS_WORKER_CONCURRENCY` (1 by default, at most 3) caps
+how many runs one worker executes at once, tasks and replies together. The
+loop (`runWorkerLoop`) claims only while a slot is free.
+
+**Usage limits.** A `usage_limit` result fails the attempt with Solas's own
+message, and the task is never retried automatically, so there is no loop
+that keeps spending the plan. The owner retries after the reset.
+
+**Unattended use.** Tasks run while the worker runs on the owner's Mac, with
+the owner's own Claude Code sign-in (§5.1). That is still personal, local
+use. Running tasks on a server around the clock is a different question,
+decided in M10 against the then-current terms (API key by default).
+
+**Files.**
+
+| File | Responsibility |
+| --- | --- |
+| `src/server/db/schema.ts`, `drizzle/0005_tasks_and_task_events.sql` | `tasks`, `task_events`, new `runs` columns and constraints |
+| `src/server/tasks/lifecycle.ts` | State machine, `transitionTask()`, retry policy |
+| `src/server/tasks/service.ts` | Web side: create (idempotent), list/search/count, get, cancel, retry |
+| `src/server/tasks/execution.ts` | Worker side: claimed, started, tool steps, attempt ended |
+| `src/server/tasks/events.ts` | Appends one timeline event |
+| `src/server/runs/executor.ts` | Shared run execution; branches to task handlers where tasks differ |
+| `src/server/runs/worker-loop.ts`, `src/worker/index.mts` | Job loop with concurrency, recovery timer, shutdown |
+| `src/app/(app)/tasks/` | Pages and Server Actions |
+| `src/components/tasks/`, `src/components/live-refresh.tsx` | List, form, detail, actions, approvals, live refresh |
+
+**Preparing for hosting.** Nothing here depends on the browser or the laptop
+being open: the database holds every state, the worker can restart or move,
+and two workers can share one database safely (SKIP LOCKED, leases). On a
+VPS, web and worker become two services; what changes is the credential
+(M10) and real authentication (M9), not the task design.
+
 ## 6. Request flows
 
 ### 6.1 Sending a message
@@ -587,16 +743,17 @@ Worker: sees "approved" → flips it to "running" (once) → runs the stored inp
 ```
 
 Limitation: the worker keeps the run (and the Claude session) open while it
-waits. If the worker stops during a wait, the run fails as usual and the
-request can't be approved any more; resuming a session after a restart is a
-later refinement.
+waits. If the worker stops during a wait, the request is withdrawn
+(`cancelled`) and can't be approved any more. A conversation reply fails as
+usual; a task becomes "interrupted", and Retry starts a new attempt that asks
+again (§5.8). Resuming a session after a restart is a later refinement.
 
 ### 6.3 Scheduled task (M8)
 
 ```
 Worker scheduler tick → schedules where next_run_at <= now and enabled
-  → insert run (queued) with the task's instructions → advance next_run_at
-  → normal run flow; result visible under Tasks
+  → create a task (as createTask does: task + attempt 1) → advance next_run_at
+  → normal task flow (§5.8); result visible under Tasks
 ```
 
 ## 7. Security model
@@ -614,7 +771,7 @@ Worker scheduler tick → schedules where next_run_at <= now and enabled
 | Database input | Zod validation in the service; strict objects; unique index and check constraints in the database |
 | Authentication | Single owner (M9) before any network exposure; checks in the data layer, not only in Proxy |
 | Mutations | Server Actions (origin-checked) and Route Handlers (validate `Origin` and body) |
-| Abuse and cost | Budgets per run, one concurrent run by default, rate limits (M9) |
+| Abuse and cost | Budgets per run, one concurrent run by default (at most 3), no automatic retry after a usage limit, bounded retries otherwise, rate limits (M9) |
 | Deployment | Security review checklist and owner approval before M10; private access preferred |
 
 ## 8. Folder structure (target)
@@ -628,7 +785,7 @@ src/
 │  │  ├─ page.tsx             Overview
 │  │  ├─ agents/ …            list, new, [agentId]
 │  │  ├─ conversations/ …     list, [conversationId]
-│  │  ├─ tasks/ …
+│  │  ├─ tasks/ …             list, new, [taskId] (M4B)
 │  │  ├─ automations/ …       schedules (M8)
 │  │  ├─ loading.tsx          skeleton shown while a page loads
 │  │  └─ settings/
@@ -646,11 +803,11 @@ src/
 │  ├─ auth/                   owner guard (M2A), sessions (M9)
 │  ├─ actions/                ActionResult + error mapping for Server Actions (M2A)
 │  ├─ conversations/          service, queries, errors                      (M3A)
-│  ├─ runs/                   executor, prompt, config (limits)             (M3A)
+│  ├─ runs/                   executor, prompt, config, worker-loop         (M3A, M4B)
 │  ├─ runtime/                AgentRuntime types, claude-agent-sdk adapter  (M3A)
 │  ├─ logger.ts               JSON-line logs, scalar fields only            (M3A)
 │  ├─ tools/                  registry, builtin/ tools, workspace, invoker  (M4A)
-│  ├─ tasks/
+│  ├─ tasks/                  lifecycle, service, execution, events         (M4B)
 ├─ test/                      Vitest global setup (test database)           (M2A)
 ├─ worker/index.mts          worker entry point and job loop               (M3A)
 └─ proxy.ts                   (M9)
@@ -687,7 +844,7 @@ Owner's devices ──(private network, e.g. Tailscale)──▶ Hetzner VPS
 | Static | ESLint, `tsc --noEmit`, `next build` | Every milestone |
 | Unit | Vitest (since M2A) | Pure logic: validation, provider rules, host checks, error mapping |
 | Integration | Vitest + `solas_test` database (since M2A) | Agent service CRUD, constraints, persistence, database-down handling |
-| Runtime | A fake `AgentRuntime` (executor tests) and a fake SDK `query` (adapter tests) | Since M3A: instructions passed through, error mapping, refusals, timeouts, Stop, recovery, no Claude call |
+| Runtime | A fake `AgentRuntime` (executor tests) and a fake SDK `query` (adapter tests) | Since M3A: instructions passed through, error mapping, refusals, timeouts, Stop, recovery, no Claude call. Since M4B: tasks end to end (claim races, retries, leases, crash and shutdown recovery, side-effect safety, approvals, cancellation, concurrency) |
 | End-to-end | Playwright (since M3B): `npm run test:e2e` builds the app and runs it on port 3100 against `solas_e2e_test`, which the tests fill directly | Conversations: navigation, reload, streaming, Markdown, rename, delete, duplicates, retry, keyboard, themes (contrast measured), mobile. No worker, so no Claude |
 | Manual | Per-milestone checklist | Both themes, keyboard only, 375px, real agent run |
 

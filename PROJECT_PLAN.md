@@ -1,6 +1,6 @@
 # Solas — Project Plan
 
-_Last updated: 2026-10-23_
+_Last updated: 2026-11-04_
 
 ## Vision
 
@@ -94,8 +94,8 @@ the background.
 
 ### Out of scope for the MVP (planned later)
 
-- Tools beyond plain conversation, and the approval flow (M6–M7)
-- Tasks and schedules (M8)
+- Tools beyond plain conversation, and the approval flow (M6–M7; foundation in M4A)
+- Schedules (M8; one-off tasks arrived in M4B)
 - Authentication (M9) — required before any network exposure
 - Deployment / phone access (M10)
 - Integrations, notifications, multi-agent collaboration (M11+)
@@ -216,14 +216,44 @@ Pulled forward from the old M6 and M7, as the smallest secure slice:
 - **Tests:** Vitest 198, Playwright 24, and one real run where Claude used
   three tools with one approval.
 
-**M4B — Workspace writing and approvals you can trust** *(proposed)*
+**M4B — Background tasks and durable execution** *(done 2026-11-04)*
+Pulled forward from M8 (tasks; schedules stay in M8):
+- **Tasks:** `tasks` (the request and its outcome) and `task_events` (an
+  append-only timeline). Each attempt is a row in `runs` with `task_id`, so
+  tasks use the same queue, worker, runtime, tools, and approvals as
+  conversations. No second queue.
+- **State machine:** queued → running ⇄ awaiting_approval → completed /
+  failed / cancelled / interrupted, enforced by conditional UPDATEs
+  (`src/server/tasks/lifecycle.ts`). Completed is final.
+- **Durable queue:** claims with `FOR UPDATE SKIP LOCKED` and only when a
+  retry's `not_before` has passed; worker ID and heartbeat lease on each run;
+  configurable concurrency (`SOLAS_WORKER_CONCURRENCY`, 1 by default, at
+  most 3).
+- **Recovery:** a lost attempt is retried once, after a backoff, only when
+  that is safe (no tool with side effects ran, no approval pending);
+  otherwise the task is "interrupted" for the owner. Usage limits, timeouts,
+  and configuration errors are never retried automatically.
+- **Cancellation** goes through the worker and is shown truthfully
+  ("Cancelling…") until confirmed; **Retry** starts a new attempt.
+- **UI:** Tasks list with search, status filters and counts (in the URL);
+  New task form (idempotent submit); task page with result, live progress,
+  approvals, attempts, tool activity, and timeline. Live updates by
+  re-rendering from the database every second while active.
+- **Tests:** Vitest 247, Playwright 38, and real runs with Claude: browser
+  closed mid-run, worker killed mid-run (recovered as attempt 2), and Cancel
+  then Retry.
+- No new dependencies.
+
+**M4C — Workspace writing and approvals you can trust** *(proposed)*
 - **Writing tools:** create and edit text files in the agent's own workspace,
   always with approval and a before/after preview. Never outside the
-  workspace, never deleting.
+  workspace, never deleting. Marked `sideEffects: true`, so the retry
+  policy never repeats them.
 - **Approvals:** a badge in the sidebar when something waits for you, and an
   agent-level audit view of every tool call.
-- **Robustness:** approvals that survive a worker restart (the run is
-  re-queued with the decision), and a per-agent limit on tool calls per run.
+- **Robustness:** a per-agent limit on tool calls per run. (Approvals that
+  survive a worker restart need a resumable session; until then an
+  interrupted attempt asks again on Retry, see ARCHITECTURE §5.8.)
 
 **M4 — Runs you can inspect** *(proposed)*
 A run history per agent and conversation: status, timing, tokens, errors.
@@ -240,9 +270,9 @@ Remaining: writing tools inside the workspace (with approval), more Solas
 tools, approvals that survive a worker restart, and a per-agent audit view.
 Shell stays disabled.
 
-**M8 — Tasks and schedules**
-Assign one-off tasks to an agent, see status and results. Schedules (cron-like)
-with run history, pause / resume, and budgets per agent.
+**M8 — Schedules** *(one-off tasks done in M4B)*
+Schedules (cron-like) that create tasks, with run history, pause / resume, and
+budgets per agent.
 
 ### Phase 3 — Away from the laptop
 
@@ -274,7 +304,10 @@ execution for any future shell or code tools.
 | How the worker runs TypeScript | ✓ M3A | `tsx` (already a dev dependency), like the agents CLI |
 | Conversation continuity | ✓ M3B | Rebuild bounded history from PostgreSQL (last 20 messages / 60,000 characters). SDK session resume rejected: transcripts would live in `~/.claude`, outside Solas's database and its delete button. Revisit with summaries if long conversations need more memory |
 | Test tooling | ✓ M2A, M3B | Vitest (unit + integration); Playwright browser tests since M3B (`npm run test:e2e`) |
-| Hosted runtime credentials | M10 | Re-check terms; API key by default for hosted use |
+| Background task execution | ✓ M4B | Tasks are runs with `task_id`: one queue, one worker, one runtime. Retries are automatic only after a lost worker or provider outage, once, when safe; otherwise "interrupted" for the owner |
+| Live updates for tasks | ✓ M4B | Re-render from PostgreSQL every second while active (`router.refresh()`); SSE from `task_events` stays the upgrade path |
+| Resuming an approval after a worker restart | Later | Needs a resumable provider session; SDK resume was rejected in M3B (transcripts outside PostgreSQL). Until then: interrupted + Retry asks again |
+| Hosted runtime credentials | M10 | Re-check terms; API key by default for hosted use. Unattended tasks on a server make this decision stricter, not looser |
 | Hosting cost and setup | M10 | Explicit approval required |
 | Final name, logo, brand | Later | Typographic wordmark until then |
 

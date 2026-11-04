@@ -907,3 +907,205 @@ the real run), and approvals across a worker restart (not supported yet).
   count. Reuse `resolveWorkspacePath`, register it, and write two tests: one
   normal file, one path outside the workspace. Then enable it for an agent
   and ask it to count the words in a file.
+
+## M4B — Background tasks and durable execution (2026-11-04)
+
+**Built:** You can hand an agent a task and walk away. Tasks → New task →
+choose an agent, title, instructions → Create. The task is saved, the worker
+picks it up, and the agent works with its saved instructions, model, and tool
+permissions. You can close the browser; the result is in PostgreSQL when you
+come back. The task page follows the real progress (status, text so far,
+approvals, attempts, timeline). Cancel and Retry work through the worker, and
+a worker that crashes mid-task doesn't lose it.
+
+**Concepts**
+1. **A durable task queue** is a table of work that outlives every process.
+   Solas already had one: `runs`. A task is the owner's request (`tasks`);
+   each attempt at it is a run with `task_id`. So there is one queue, one
+   worker, one runtime, and the tools and approvals from M4A apply unchanged.
+2. **Why a separate worker.** A web request lives for seconds and dies with
+   the tab; an agent run can take minutes, spawns Claude Code, and must
+   survive the browser closing. The web app only writes rows; the worker,
+   which has no network port, does the work. They meet only in PostgreSQL.
+3. **How claiming works.** `UPDATE runs SET status = 'running' … WHERE id =
+   (SELECT id … WHERE status = 'pending' AND (not_before IS NULL OR not_before
+   <= now()) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)`. The row
+   lock means "mine"; SKIP LOCKED means a second worker takes the next row
+   instead of waiting. In the same transaction the task moves to running.
+4. **Locks vs. leases.** A lock lasts only as long as a transaction (here,
+   milliseconds). A run lasts minutes, so ownership is a **lease**: the worker
+   refreshes `heartbeat_at` every second. A lease older than 30 s means the
+   worker is gone, and recovery may take the run over. `worker_id` records
+   which worker held it.
+5. **How the worker talks to Claude.** Exactly as for conversations: the
+   executor builds a prompt (for a task: the title, the instructions, and
+   "you can't ask questions, state your assumptions") and calls
+   `AgentRuntime.run()`. The Claude adapter is unchanged; it doesn't know
+   tasks exist.
+6. **How events are stored.** `task_events` is append-only, with sequential
+   IDs. Each event is written in the same transaction as the change it
+   describes (claimed, started, each tool step, approval, completed, …). The
+   messages are Solas's own sentences; data holds IDs and codes only.
+7. **Browser-independent execution.** The browser only reads. The task page
+   calls `router.refresh()` every second while the task is active, which
+   re-renders it on the server from PostgreSQL. Closing the tab stops the
+   reading, never the work.
+8. **How cancellation works.** Queued: cancelled at once with its pending run.
+   Running: `cancel_requested_at` is set; the worker's heartbeat sees it
+   within a second, aborts the Claude call, withdraws any pending approval,
+   and records "cancelled". Until then the page says "Cancelling…". The worker
+   also checks right before starting Claude, so an early Cancel costs nothing.
+9. **If the worker crashes.** The run stays "running" with an ageing lease.
+   The next worker (on start, then every 30 s) marks it failed
+   (`worker_stopped`) and asks the retry policy: retry once after 15 s if it
+   is safe (no tool with side effects ran, no approval pending), otherwise
+   "interrupted" for you to decide. A Ctrl+C shutdown goes the same way,
+   without the 30 s wait.
+10. **If Claude hits a usage limit.** The attempt fails with Solas's own
+    message and is **never** retried automatically: retrying would only hit
+    the limit again. You retry after the reset.
+11. **Approvals in long-running tasks.** The attempt waits (its timeout
+    paused) and the task shows "Waiting for approval" with the same card as
+    conversations. The Claude session waits in the worker's memory, so if the
+    worker stops, the request is withdrawn and the task is interrupted. Retry
+    starts a new attempt that asks again. Resuming the old session would
+    need provider session resume, which M3B rejected.
+12. **Toward hosting.** Every state is in the database, the worker can
+    restart or move, and two workers can safely share one database. On a VPS
+    only the credential (M10) and owner login (M9) change.
+
+**Lessons**
+- **A state machine belongs in the WHERE clause.** `UPDATE … WHERE status IN
+  (allowed)` makes the database enforce the rule at the moment of change. An
+  `if` in code, followed by an UPDATE, leaves a gap another process can use.
+- **Pick one lock order.** The worker locks run, then task; at first Cancel
+  locked task, then run. Two transactions waiting on each other is a
+  deadlock. A test that races Cancel against a claim ten times made the
+  order part of the design.
+- **"Stopped" must win over a late result.** A test found that a runtime
+  returning a result after Cancel was saved as completed. Now an aborted run
+  is always recorded as stopped, whatever arrives afterwards.
+- **Exactly once is a promise about the database only.** Locks ensure one
+  worker per attempt and one result per task. Whether an outside action
+  happened once, Solas can't know if the worker died at the wrong moment.
+  That's why tools declare `sideEffects`, and why such attempts are
+  interrupted, not repeated.
+- **Flaky tests are usually honest about timing.** Two intermittent failures
+  were tests that checked a state a few milliseconds too early, or left a
+  "crashed" execution running into the next test. Model a crash as the state
+  it leaves behind, not as a half-alive process.
+- **zsh doesn't split `$VAR` into words** the way bash does: `kill -9 $PIDS`
+  passed one argument containing every PID. Scripts that rely on word
+  splitting should run in bash.
+
+**Security and reliability limitations (honest list)**
+- **Approvals don't survive a worker restart** (see concept 11).
+- **Exactly-once side effects aren't guaranteed** (see the lessons). All
+  current tools only read, so today nothing can be duplicated.
+- **Recovery takes up to about a minute** after a crash: a 30 s lease plus
+  the 30 s recovery timer, then the 15 s backoff.
+- **Polling, not push:** about one server render per second per open task
+  page. Fine for one owner; SSE from `task_events` is the upgrade path.
+- **Task results are Markdown from the model,** rendered safely (no raw HTML,
+  no images), as in conversations.
+- **No task deletion.** Tasks go away with their agent. Deleting one task
+  needs a decision about its history first.
+- **Subscription use stays local and personal.** Tasks run on your Mac with
+  your own Claude Code sign-in. Unattended hosted use is decided in M10.
+
+**Files changed**
+- New, in `src/server/tasks/`:
+  - `lifecycle.ts` (state machine, `transitionTask`, retry policy);
+  - `service.ts`, `queries.ts`, and `errors.ts` (web side);
+  - `execution.ts` and `events.ts` (worker side, timeline);
+  - `lifecycle.test.ts` and `tasks.test.ts`.
+- New in `src/server/runs/`: `worker-loop.ts` (concurrency, recovery timer).
+- New, in `src/lib/tasks/`: `validation.ts` and `status.ts` (shared with the
+  browser).
+- New UI:
+  - pages: `app/(app)/tasks/` (list, `new/`, `[taskId]/`, actions, error);
+  - components: `components/tasks/` (list and toolbar, form, detail,
+    actions, approvals, status badge), plus `live-refresh.tsx` and
+    `use-now.ts`.
+- New tests: `e2e/tasks.spec.ts`.
+- Database: `drizzle/0005_tasks_and_task_events.sql`. It adds two tables and
+  four `runs` columns, and makes `runs.conversation_id` and `user_message_id`
+  optional (a check requires a conversation or a task). It deletes nothing.
+- Changed:
+  - schema;
+  - executor (task branches, several runs at once, cancel check before start,
+    stopped beats a late result, per-run recovery);
+  - worker entry (worker ID, concurrency, loop);
+  - config (task limits, `workerConcurrency`) and `.env.example`;
+  - prompt (task prompt, "task" wording);
+  - tool types (`sideEffects`) and the invoker (step events);
+  - conversation service (only conversation runs can be retried or
+    cancelled there);
+  - conversation view (`useNow` moved out) and tool activity
+    (`ApprovalCard` exported);
+  - Badge (`active` tone), breadcrumbs (task labels), load error, action
+    errors, the agent delete warning (mentions tasks);
+  - e2e helpers.
+
+**How it was verified**
+- `lint`, `typecheck`, and `build` pass. One build warning (whole-project
+  tracing from `workspace.ts`) is unchanged from M4A.
+- Vitest: 247 tests pass, three full runs in a row; the task file passed ten
+  runs in a row. New tests cover:
+  - creating, validation, and unknown, disabled, or unconfigured agents;
+  - duplicate submits, including two at the same moment;
+  - claiming, two workers racing, and the result saved;
+  - completed tasks never running again;
+  - provider failure, usage limit (no retry), timeout (never a success),
+    one bounded retry with backoff, and manual retry (only once);
+  - cancelling a queued or running task, and Cancel racing a claim;
+  - shutdown and crash recovery, expired leases, a live worker left alone,
+    queued tasks kept across restarts;
+  - side-effect tools interrupted, not repeated; read-only tools retried;
+  - approvals approved, rejected, expired, withdrawn on Cancel, and pending
+    during a crash or shutdown;
+  - permissions removed mid-run;
+  - list filters, search (wildcards taken literally), and counts;
+  - concurrency 1 and 2.
+- Playwright: 38 tests pass (14 new). They cover:
+  - the form (only ready agents, one task per double submit, field errors,
+    keyboard only);
+  - live progress without reload, "written so far", the saved Markdown
+    result;
+  - a closed browser, then the result on the next visit;
+  - Cancel (queued, and running with "Cancelling…"), Retry, interrupted;
+  - an approval in a task;
+  - filters, search, and counts in the URL;
+  - a 375 px phone in light and dark (no sideways scroll, AA contrast).
+- Real runs with Claude (dev app, real worker, a "Research Assistant (M4B
+  test)" agent made in Agent Builder, Haiku 5.5 to save plan usage):
+  - "Research AI Agent Architectures": created in the UI, seen running, then
+    the browser was closed at 00:18:26. Claude finished at 00:18:31 (7.7 s,
+    856 output tokens). On return the page showed the saved result
+    (2,298 characters, Markdown table); PostgreSQL had the task completed
+    with one attempt. The session reported `apiKeySource: "none"`, no tools,
+    `dontAsk`.
+  - Crash: the worker and its Claude Code child were killed with SIGKILL
+    right after the session started. The task stayed "running" with an
+    ageing lease. A new worker marked attempt 1 `worker_stopped` about 44 s
+    after the crash (30 s lease, then its next recovery check), queued
+    attempt 2, started it 16 s later, and completed it 9 s after that.
+  - Cancel and Retry in the UI: "Cancelling…" then "Cancelled" (attempt 1
+    stopped after 4 s, partial text kept); Retry ran attempt 2 to completed.
+    The timeline had all ten events in order.
+  - Afterwards, every completed task still had exactly the attempts above:
+    nothing ran again by itself.
+  - The test agent and its five tasks are still in your dev database so you
+    can look at them. Deleting the agent deletes them.
+
+**Not tested automatically:** a real Claude usage limit (the mapping is unit
+tested with a fake), and two worker processes on one machine at once (the
+claim race is tested with two executors on one database).
+
+**Exercise**
+- Make the automatic retry count configurable per task. Add a "Retries if
+  the worker stops" select (0–2) to the New task form, validate it in
+  `createTaskSchema`, store it in `auto_retries_left`, and write two tests:
+  one where a crash with 0 retries ends as "interrupted", one where 2 retries
+  allow a second automatic attempt. Hint: `decideAfterFailure` doesn't need
+  to change.
