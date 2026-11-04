@@ -28,6 +28,7 @@ const limits: ExecutorLimits = {
   timeoutMs: 5_000,
   taskTimeoutMs: 5_000,
   retryBackoffMs: 1_000,
+  taskAutoRetries: 1,
   heartbeatMs: 20,
   staleAfterMs: 30_000,
   progressWriteMs: 10,

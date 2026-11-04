@@ -1,5 +1,6 @@
 import "server-only";
 import { currentTimeTool } from "./builtin/current-time";
+import { delegateToAgentTool } from "./builtin/delegate";
 import { listWorkspaceFilesTool, readWorkspaceFileTool } from "./builtin/workspace-files";
 import type { AnyToolDefinition, ToolCatalogEntry } from "./types";
 
@@ -10,7 +11,7 @@ import type { AnyToolDefinition, ToolCatalogEntry } from "./types";
 export type ToolRegistry = {
   list(): readonly AnyToolDefinition[];
   get(id: string): AnyToolDefinition | undefined;
-  /** Plain data for the browser (no handlers, no schemas). */
+  /** Plain data for the browser (no handlers, no schemas): the tools an owner switches on per agent. */
   catalog(): ToolCatalogEntry[];
 };
 
@@ -30,7 +31,7 @@ export function createToolRegistry(tools: readonly AnyToolDefinition[]): ToolReg
     list: () => tools,
     get: (id) => byId.get(id),
     catalog: () =>
-      tools.map(({ id, name, description, risk, approval, capability, defaultMode }) => ({
+      tools.filter(isPermissionTool).map(({ id, name, description, risk, approval, capability, defaultMode }) => ({
         id,
         name,
         description,
@@ -42,7 +43,17 @@ export function createToolRegistry(tools: readonly AnyToolDefinition[]): ToolReg
   };
 }
 
-export const toolRegistry = createToolRegistry([currentTimeTool, listWorkspaceFilesTool, readWorkspaceFileTool]);
+/** A tool the owner switches on in Agent Builder (not one granted by delegation targets). */
+export function isPermissionTool(tool: AnyToolDefinition): boolean {
+  return (tool.grantedBy ?? "permissions") === "permissions";
+}
+
+export const toolRegistry = createToolRegistry([
+  currentTimeTool,
+  listWorkspaceFilesTool,
+  readWorkspaceFileTool,
+  delegateToAgentTool,
+]);
 
 /** Tool names and risk levels by ID, for showing tool activity (plain data). */
 export function toolDisplayInfo(registry: ToolRegistry = toolRegistry) {

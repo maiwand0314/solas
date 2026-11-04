@@ -10,6 +10,8 @@ import { tasks, type TaskStatus } from "@/server/db/schema";
 // change one task can't both win, and a completed task can't be reopened.
 //
 //   queued ──claimed──▶ running ⇄ awaiting_approval
+//     │                   ├─▶ waiting_on_delegate  (delegated; no worker slot held)
+//     │                   │       └─▶ queued      (follow-up run with the child's result)
 //     │                   │
 //     │                   ├─▶ completed            (result saved)
 //     │                   ├─▶ failed               (error saved)
@@ -19,16 +21,18 @@ import { tasks, type TaskStatus } from "@/server/db/schema";
 //     └─▶ cancelled       (Cancel before a worker took it)
 //
 //   failed / interrupted / cancelled ──owner's Retry──▶ queued
+//   waiting_on_delegate / interrupted ──Cancel──▶ cancelled
 //   completed is final.
 
 export const TASK_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
   queued: ["running", "cancelled"],
-  running: ["awaiting_approval", "completed", "failed", "cancelled", "interrupted", "queued"],
+  running: ["awaiting_approval", "waiting_on_delegate", "completed", "failed", "cancelled", "interrupted", "queued"],
   awaiting_approval: ["running", "completed", "failed", "cancelled", "interrupted", "queued"],
+  waiting_on_delegate: ["queued", "cancelled"],
   completed: [],
   failed: ["queued"],
   cancelled: ["queued"],
-  interrupted: ["queued"],
+  interrupted: ["queued", "cancelled"],
 };
 
 export function canTransition(from: TaskStatus, to: TaskStatus): boolean {

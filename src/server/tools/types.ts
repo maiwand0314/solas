@@ -13,7 +13,7 @@ export type ToolRisk = "low" | "medium" | "high";
 export type ApprovalPolicy = "optional" | "required";
 
 /** What a tool may touch, shown to the owner in plain words. */
-export type ToolCapability = "none" | "workspace-read";
+export type ToolCapability = "none" | "workspace-read" | "delegate";
 
 /** What a running tool gets from Solas. Nothing else is in scope. */
 export type ToolContext = {
@@ -21,6 +21,24 @@ export type ToolContext = {
   workspaceDir: string;
   /** Aborted on Stop, timeout, or when the tool's own time limit is reached. */
   signal: AbortSignal;
+  /**
+   * Present only in a run allowed to delegate (M5A): hands a subtask to
+   * another agent. The backend checks everything; see src/server/tasks/delegation.ts.
+   */
+  delegate?: (request: DelegationRequest) => Promise<DelegationReceipt>;
+};
+
+/** What the delegation tool asks for, after input validation. */
+export type DelegationRequest = { targetAgentId: string; taskDescription: string; expectedOutput?: string };
+
+/** What the backend answers: a reference to the child task, and its result if it already has one. */
+export type DelegationReceipt = {
+  delegationId: string;
+  childTaskId: string;
+  agentName: string;
+  status: "queued" | "waiting" | "completed" | "failed" | "cancelled";
+  message: string;
+  result?: string;
 };
 
 /** A safe failure: the message is written for the model and the owner. */
@@ -49,6 +67,12 @@ export type ToolDefinition<Input extends z.ZodObject = z.ZodObject, Output exten
   sideEffects: boolean;
   /** The mode a newly enabled tool starts in. */
   defaultMode: "allow" | "ask";
+  /**
+   * Who grants it. "permissions" (default): the agent's tool switches in
+   * Agent Builder. "delegation": the agent's delegation targets; such a tool
+   * isn't listed among the switches and only exists in runs allowed to delegate.
+   */
+  grantedBy?: "permissions" | "delegation";
   timeoutMs: number;
   /** The result sent to the model is cut to this many characters. */
   maxOutputChars: number;

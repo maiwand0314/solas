@@ -46,6 +46,7 @@ export function fakeRuntime(
 /** Resolves only when the signal aborts, like a provider that never answers. */
 export function untilAborted(signal: AbortSignal): Promise<RunResult> {
   return new Promise((resolve) => {
+    if (signal.aborted) return resolve({ status: "aborted" });
     signal.addEventListener("abort", () => resolve({ status: "aborted" }), { once: true });
   });
 }

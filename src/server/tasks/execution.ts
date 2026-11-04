@@ -3,6 +3,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { runs, tasks, toolCalls, type RunRow, type TaskEventData, type TaskEventType } from "@/server/db/schema";
 import type { Logger } from "@/server/logger";
 import type { ToolEvent } from "@/server/tools/invoker";
+import { hasPendingDelegation, isDelegationCancelled, markChildrenCancelled, onChildFinished, onChildInterrupted, onParentRunCompleted } from "./delegation";
 import { recordTaskEvent } from "./events";
 import { decideAfterFailure, transitionTask, type AfterFailure, type Queryable } from "./lifecycle";
 
@@ -54,6 +55,8 @@ export function createTaskRunHandlers({ log, limits, isReadOnlyTool }: Dependenc
    */
   async function onClaimed(tx: Queryable, run: RunRow): Promise<boolean> {
     const taskId = run.taskId!;
+    // A child whose parent already stopped must not start.
+    if (await isDelegationCancelled(tx, taskId)) return false;
     const moved = await transitionTask(tx, taskId, "running", { startedAt: sql`coalesce(${tasks.startedAt}, now())` }, [
       "queued",
     ]);
@@ -66,7 +69,7 @@ export function createTaskRunHandlers({ log, limits, isReadOnlyTool }: Dependenc
 
   async function loadTask(db: Queryable, taskId: string) {
     const [task] = await db
-      .select({ title: tasks.title, instructions: tasks.instructions })
+      .select({ title: tasks.title, instructions: tasks.instructions, depth: tasks.depth })
       .from(tasks)
       .where(eq(tasks.id, taskId))
       .limit(1);
@@ -106,36 +109,68 @@ export function createTaskRunHandlers({ log, limits, isReadOnlyTool }: Dependenc
 
   /**
    * Called inside the transaction that recorded the run's outcome. Brings
-   * the task to its next state: completed, cancelled, failed, interrupted, or
-   * queued again for an automatic retry (decideAfterFailure decides).
+   * the task to its next state: completed, cancelled, failed, interrupted,
+   * queued again for an automatic retry (decideAfterFailure decides), or,
+   * after a delegation, waiting for the delegated task (M5A).
+   *
+   * Delegation links: a child that completes, fails, or is cancelled tells
+   * its parent (which may continue); a parent that stops cancels its waiting
+   * children (stopped right after this transaction, see cancel.ts).
    */
   async function onAttemptEnded(tx: Queryable, run: RunRow, outcome: AttemptOutcome) {
     const taskId = run.taskId!;
     const attempt = run.attempt;
+    const [task] = await tx
+      .select({
+        id: tasks.id,
+        parentTaskId: tasks.parentTaskId,
+        autoRetriesLeft: tasks.autoRetriesLeft,
+        cancelRequestedAt: tasks.cancelRequestedAt,
+      })
+      .from(tasks)
+      .where(eq(tasks.id, taskId))
+      .for("update");
+    if (!task) return; // deleted with its agent
+
     if (outcome.status === "completed") {
+      // A delegation made in this run: wait for it (or continue with its result) instead of completing.
+      if (run.purpose === "work") {
+        if (task.cancelRequestedAt) {
+          // Cancel was pressed while the run finished; with a delegation pending, honour the cancel.
+          if (await hasPendingDelegation(tx, taskId)) {
+            await transitionTask(tx, taskId, "cancelled", { finishedAt: sql`now()` });
+            await recordEvent(tx, taskId, run.id, "cancelled", "Cancelled before the delegated work could be finished.", { attempt });
+            await markChildrenCancelled(tx, taskId);
+            return;
+          }
+        } else if ((await onParentRunCompleted(tx, run, outcome.text)) !== "none") {
+          return;
+        }
+      }
       const done = await transitionTask(tx, taskId, "completed", {
         result: outcome.text,
         errorCode: null,
         errorMessage: null,
         finishedAt: sql`now()`,
       });
-      if (done) await recordEvent(tx, taskId, run.id, "completed", "Completed. The result is saved.", { attempt });
-      else log("warn", "task.completion_not_applied", { taskId, runId: run.id });
-      return;
-    }
-    if (outcome.status === "cancelled") {
-      if (await transitionTask(tx, taskId, "cancelled", { finishedAt: sql`now()` })) {
-        await recordEvent(tx, taskId, run.id, "cancelled", `Cancelled. Attempt ${attempt} was stopped.`, { attempt });
+      if (done) {
+        await recordEvent(tx, taskId, run.id, "completed", "Completed. The result is saved.", { attempt });
+        await onChildFinished(tx, task, { status: "completed" });
+      } else {
+        log("warn", "task.completion_not_applied", { taskId, runId: run.id });
       }
       return;
     }
 
-    const [task] = await tx
-      .select({ autoRetriesLeft: tasks.autoRetriesLeft, cancelRequestedAt: tasks.cancelRequestedAt })
-      .from(tasks)
-      .where(eq(tasks.id, taskId))
-      .for("update");
-    if (!task) return; // deleted with its agent
+    if (outcome.status === "cancelled") {
+      if (await transitionTask(tx, taskId, "cancelled", { finishedAt: sql`now()` })) {
+        await recordEvent(tx, taskId, run.id, "cancelled", `Cancelled. Attempt ${attempt} was stopped.`, { attempt });
+        await onChildFinished(tx, task, { status: "cancelled" });
+      }
+      await markChildrenCancelled(tx, taskId);
+      return;
+    }
+
     // The owner already asked to cancel: the attempt ending any other way doesn't change that.
     if (task.cancelRequestedAt) {
       if (await transitionTask(tx, taskId, "cancelled", { finishedAt: sql`now()` })) {
@@ -143,7 +178,9 @@ export function createTaskRunHandlers({ log, limits, isReadOnlyTool }: Dependenc
           attempt,
           code: outcome.code,
         });
+        await onChildFinished(tx, task, { status: "cancelled" });
       }
+      await markChildrenCancelled(tx, taskId);
       return;
     }
     const calls = await tx
@@ -163,22 +200,22 @@ export function createTaskRunHandlers({ log, limits, isReadOnlyTool }: Dependenc
       },
       limits.retryBackoffMs,
     );
-    await applyFailure(tx, run, outcome, decision, task.autoRetriesLeft);
+    await applyFailure(tx, run, task, outcome, decision);
   }
 
   async function applyFailure(
     tx: Queryable,
     run: RunRow,
+    task: { id: string; parentTaskId: string | null; autoRetriesLeft: number },
     outcome: Extract<AttemptOutcome, { status: "failed" }>,
     decision: AfterFailure,
-    autoRetriesLeft: number,
   ) {
     const taskId = run.taskId!;
     const attempt = run.attempt;
     const data = { attempt, code: outcome.code };
 
     if (decision.action === "retry") {
-      const queued = await transitionTask(tx, taskId, "queued", { autoRetriesLeft: autoRetriesLeft - 1 }, [
+      const queued = await transitionTask(tx, taskId, "queued", { autoRetriesLeft: task.autoRetriesLeft - 1 }, [
         "running",
         "awaiting_approval",
       ]);
@@ -190,6 +227,8 @@ export function createTaskRunHandlers({ log, limits, isReadOnlyTool }: Dependenc
           taskId,
           agentId: run.agentId,
           attempt: attempt + 1,
+          // A retried follow-up is still a follow-up: it gets the delegated result, not the tool.
+          purpose: run.purpose,
           // The database clock, like every other time the worker compares.
           notBefore: sql`now() + make_interval(secs => ${seconds})`,
         })
@@ -210,13 +249,18 @@ export function createTaskRunHandlers({ log, limits, isReadOnlyTool }: Dependenc
       const message = INTERRUPT_MESSAGES[decision.reason];
       if (await transitionTask(tx, taskId, "interrupted", { errorCode: outcome.code, errorMessage: message, finishedAt: sql`now()` })) {
         await recordEvent(tx, taskId, run.id, "interrupted", `Attempt ${attempt} was interrupted. ${message}`, data);
+        // A delegated task that's interrupted keeps its parent waiting: the owner retries or cancels it.
+        await onChildInterrupted(tx, task);
       }
+      await markChildrenCancelled(tx, taskId);
       return;
     }
 
     if (await transitionTask(tx, taskId, "failed", { errorCode: outcome.code, errorMessage: outcome.message, finishedAt: sql`now()` })) {
       await recordEvent(tx, taskId, run.id, "failed", `Attempt ${attempt} failed: ${outcome.message}`, data);
+      await onChildFinished(tx, task, { status: "failed", message: outcome.message });
     }
+    await markChildrenCancelled(tx, taskId);
   }
 
   return { recordEvent, onClaimed, loadTask, onStarted, onToolEvent, onAttemptEnded };

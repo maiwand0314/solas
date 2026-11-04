@@ -50,13 +50,22 @@ async function expectToolError(promise: Promise<unknown>, message: RegExp) {
 const read = (file: string) => readWorkspaceFileTool.execute({ path: file }, context());
 
 describe("registry", () => {
-  it("holds the three first tools, with unique, model-safe IDs", () => {
+  it("holds the tools, with unique, model-safe IDs", () => {
     expect(toolRegistry.list().map((tool) => tool.id)).toEqual([
       "current_time",
       "list_workspace_files",
       "read_workspace_file",
+      "delegate_to_agent",
     ]);
     expect(toolRegistry.catalog()[0]).not.toHaveProperty("execute");
+  });
+
+  it("keeps the delegation tool out of the tool switches: it is granted by delegation targets", () => {
+    expect(toolRegistry.catalog().map((tool) => tool.id)).toEqual([
+      "current_time",
+      "list_workspace_files",
+      "read_workspace_file",
+    ]);
   });
 
   it("refuses duplicate IDs, unsafe IDs, and approval-required tools that default to running", () => {

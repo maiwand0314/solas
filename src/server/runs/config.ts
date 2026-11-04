@@ -42,6 +42,28 @@ export const RUN_LIMITS = {
   historyCharacters: 60_000,
 } as const;
 
+/**
+ * Limits for delegation between agents (M5A). Conservative on purpose: every
+ * delegation costs at least two more Claude calls (the child, and the
+ * parent's follow-up), and all of it counts against the owner's plan.
+ */
+export const DELEGATION_LIMITS = {
+  /** How deep delegation goes: 1 means a delegated task can't delegate again. */
+  maxDepth: 1,
+  /** Child tasks one task may have that are waiting or completed. */
+  maxChildrenPerTask: 1,
+  /** Agents one agent may list as delegation targets. */
+  maxTargetsPerAgent: 20,
+  /** What the parent may send: the task description… */
+  maxDescriptionChars: 8_000,
+  /** …and the expected output. */
+  maxExpectedOutputChars: 2_000,
+  /** The parent's notes from before it delegated, given back to it (the newest part is kept). */
+  maxParentNotesChars: 8_000,
+  /** The child's result as given to the parent (the start is kept). */
+  maxChildResultChars: 20_000,
+} as const;
+
 /** Runs one worker may execute at once, whatever their kind. */
 export const MAX_WORKER_CONCURRENCY = 3;
 

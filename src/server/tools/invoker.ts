@@ -3,11 +3,11 @@ import { and, eq, sql } from "drizzle-orm";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { z } from "zod";
 import type { Database } from "@/server/db/client";
-import { agentToolPermissions, toolCalls, type ToolCallStatus } from "@/server/db/schema";
+import { agentDelegationTargets, agents, agentToolPermissions, toolCalls, type ToolCallStatus } from "@/server/db/schema";
 import { truncate, type Logger } from "@/server/logger";
 import type { RuntimeTool, ToolCallOutcome } from "@/server/runtime/types";
 import type { ToolRegistry } from "./registry";
-import { ToolError, type AnyToolDefinition } from "./types";
+import { ToolError, type AnyToolDefinition, type ToolContext } from "./types";
 import { ensureWorkspace } from "./workspace";
 
 // The permission enforcement layer. Every tool call an agent makes goes
@@ -43,6 +43,11 @@ export type RunToolContext = {
    * task's timeline. Awaited, so events are recorded in the order they happen.
    */
   onEvent?: (event: ToolEvent) => Promise<void>;
+  /**
+   * Set only for a task run that may delegate (M5A). Without it the
+   * delegation tool isn't offered, and a call to it is refused.
+   */
+  delegate?: ToolContext["delegate"];
 };
 
 /** One step of a tool call, described with Solas's own summaries (never raw output). */
@@ -85,15 +90,53 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
       .select({ toolId: agentToolPermissions.toolId })
       .from(agentToolPermissions)
       .where(eq(agentToolPermissions.agentId, context.agentId));
-    return permitted
+    const tools = permitted
       .map(({ toolId }) => registry.get(toolId))
-      .filter((tool): tool is AnyToolDefinition => tool !== undefined)
-      .map((tool) => ({
-        name: tool.id,
-        description: tool.description,
-        inputShape: tool.input.shape,
-        invoke: (input: unknown) => invoke(tool, input, context),
-      }));
+      .filter((tool): tool is AnyToolDefinition => tool !== undefined && (tool.grantedBy ?? "permissions") === "permissions")
+      .map((tool) => runtimeTool(tool, tool.description, context));
+
+    // Delegation (M5A): only in runs allowed to delegate, and only if the owner chose targets.
+    const delegation = registry.list().find((tool) => tool.grantedBy === "delegation");
+    if (delegation && context.delegate) {
+      const targets = await delegationTargets(context.agentId);
+      if (targets.length > 0) {
+        const list = targets.map((target) => `- ${target.id}: ${target.name}${target.role ? ` (${target.role})` : ""}`).join("\n");
+        tools.push(runtimeTool(delegation, `${delegation.description}\n\nAgents you may delegate to:\n${list}`, context));
+      }
+    }
+    return tools;
+  }
+
+  function runtimeTool(tool: AnyToolDefinition, description: string, context: RunToolContext): RuntimeTool {
+    return { name: tool.id, description, inputShape: tool.input.shape, invoke: (input: unknown) => invoke(tool, input, context) };
+  }
+
+  /** The agents this agent may delegate to (enabled ones only), read fresh. */
+  async function delegationTargets(agentId: string) {
+    return db
+      .select({ id: agents.id, name: agents.name, role: agents.role })
+      .from(agentDelegationTargets)
+      .innerJoin(agents, eq(agents.id, agentDelegationTargets.targetAgentId))
+      .where(and(eq(agentDelegationTargets.agentId, agentId), eq(agents.enabled, true)));
+  }
+
+  /** The agent's permission for a tool right now: its mode, or null when it isn't allowed. */
+  async function permissionFor(tool: AnyToolDefinition, context: RunToolContext): Promise<"allow" | "ask" | null> {
+    if (tool.grantedBy === "delegation") {
+      // Granted by delegation targets, in a run allowed to delegate. Which target is checked by the delegation itself.
+      const [target] = await db
+        .select({ id: agentDelegationTargets.targetAgentId })
+        .from(agentDelegationTargets)
+        .where(eq(agentDelegationTargets.agentId, context.agentId))
+        .limit(1);
+      return context.delegate && target ? "allow" : null;
+    }
+    const [permission] = await db
+      .select({ mode: agentToolPermissions.mode })
+      .from(agentToolPermissions)
+      .where(and(eq(agentToolPermissions.agentId, context.agentId), eq(agentToolPermissions.toolId, tool.id)))
+      .limit(1);
+    return permission?.mode ?? null;
   }
 
   async function invoke(tool: AnyToolDefinition, rawInput: unknown, context: RunToolContext): Promise<ToolCallOutcome> {
@@ -109,12 +152,8 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
     };
 
     // 1. Permission, read fresh: a change in Agent Builder applies at once.
-    const [permission] = await db
-      .select({ mode: agentToolPermissions.mode })
-      .from(agentToolPermissions)
-      .where(and(eq(agentToolPermissions.agentId, context.agentId), eq(agentToolPermissions.toolId, tool.id)))
-      .limit(1);
-    if (!permission) {
+    const mode = await permissionFor(tool, context);
+    if (!mode) {
       const deniedId = await insertCall(context.runId, tool, storableRaw(rawInput), "—", "denied", {
         errorMessage: "Not enabled for this agent.",
       });
@@ -138,7 +177,7 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
     const summary = truncate(tool.summarizeInput(input), 200);
 
     // 3. Approval, when the tool or the agent's setting asks for it.
-    const needsApproval = tool.approval === "required" || permission.mode === "ask";
+    const needsApproval = tool.approval === "required" || mode === "ask";
     const callId = await insertCall(context.runId, tool, input, summary, needsApproval ? "awaiting_approval" : "running", {
       requiresApproval: needsApproval,
       approvalExpiresAt: needsApproval ? new Date(Date.now() + limits.approvalTtlMs) : null,
@@ -164,8 +203,11 @@ export function createToolInvoker({ db, registry, log, limits, workspaceFor = en
     const timeLimit = AbortSignal.timeout(tool.timeoutMs);
     const signal = AbortSignal.any([context.signal, timeLimit]);
     try {
-      const workspaceDir = await workspaceFor(context.agentId);
-      const output = tool.output.parse(await abortable(tool.execute(input, { workspaceDir, signal }), signal));
+      // Only file tools get (and create) the agent's workspace folder.
+      const workspaceDir = tool.capability === "workspace-read" ? await workspaceFor(context.agentId) : "";
+      const output = tool.output.parse(
+        await abortable(tool.execute(input, { workspaceDir, signal, delegate: context.delegate }), signal),
+      );
       const text = JSON.stringify(output);
       const resultSummary = truncate(tool.summarizeOutput(output), 200);
       await finishCall(callId, "succeeded", { resultSummary });

@@ -6,6 +6,7 @@ export type TaskStatusName =
   | "queued"
   | "running"
   | "awaiting_approval"
+  | "waiting_on_delegate"
   | "completed"
   | "failed"
   | "cancelled"
@@ -17,6 +18,7 @@ export const TASK_STATUS_DISPLAY: Record<TaskStatusName, { label: string; tone: 
   queued: { label: "Queued", tone: "neutral" },
   running: { label: "Running", tone: "active" },
   awaiting_approval: { label: "Waiting for approval", tone: "warning" },
+  waiting_on_delegate: { label: "Waiting on agent", tone: "active" },
   completed: { label: "Completed", tone: "success" },
   failed: { label: "Failed", tone: "danger" },
   cancelled: { label: "Cancelled", tone: "neutral" },
@@ -24,7 +26,7 @@ export const TASK_STATUS_DISPLAY: Record<TaskStatusName, { label: string; tone: 
 };
 
 /** A task in one of these is still being worked on (or waiting to be). */
-export const ACTIVE_TASK_STATUSES: readonly TaskStatusName[] = ["queued", "running", "awaiting_approval"];
+export const ACTIVE_TASK_STATUSES: readonly TaskStatusName[] = ["queued", "running", "awaiting_approval", "waiting_on_delegate"];
 
 export function isActiveTaskStatus(status: TaskStatusName): boolean {
   return ACTIVE_TASK_STATUSES.includes(status);
@@ -34,7 +36,7 @@ export function isActiveTaskStatus(status: TaskStatusName): boolean {
 export const TASK_FILTERS = [
   { id: "all", label: "All", statuses: null },
   { id: "queued", label: "Queued", statuses: ["queued"] },
-  { id: "running", label: "Running", statuses: ["running"] },
+  { id: "running", label: "Running", statuses: ["running", "waiting_on_delegate"] },
   { id: "awaiting_approval", label: "Awaiting approval", statuses: ["awaiting_approval"] },
   { id: "completed", label: "Completed", statuses: ["completed"] },
   { id: "failed", label: "Failed", statuses: ["failed"] },

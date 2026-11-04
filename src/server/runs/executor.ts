@@ -6,10 +6,12 @@ import { agents, conversations, messages, runs, toolCalls, type RunRow, type Run
 import { truncate, type Logger } from "@/server/logger";
 import { getAgentReadiness, type ProviderRegistry } from "@/server/providers/registry";
 import type { AgentRuntime, RunUsage } from "@/server/runtime/types";
+import { stopOrphanedChildren } from "@/server/tasks/cancel";
+import { delegate, loadContinuation } from "@/server/tasks/delegation";
 import { createTaskRunHandlers } from "@/server/tasks/execution";
 import type { ToolInvoker } from "@/server/tools/invoker";
-import { RUN_LIMITS } from "./config";
-import { buildPrompt, buildSystemPrompt, buildTaskPrompt } from "./prompt";
+import { DELEGATION_LIMITS, RUN_LIMITS } from "./config";
+import { buildContinuationPrompt, buildPrompt, buildSystemPrompt, buildTaskPrompt } from "./prompt";
 
 // The worker's side of a run: claim a pending run, load the agent from
 // PostgreSQL, call the agent's provider through the AgentRuntime interface,
@@ -27,6 +29,8 @@ export type ExecutorLimits = {
   timeoutMs: number;
   taskTimeoutMs: number;
   retryBackoffMs: number;
+  /** Automatic retries a delegated (child) task starts with. */
+  taskAutoRetries: number;
   heartbeatMs: number;
   staleAfterMs: number;
   progressWriteMs: number;
@@ -51,6 +55,7 @@ type Dependencies = {
   /** Recorded on each run this executor claims, so a run's owner is known. */
   workerId?: string;
   limits?: ExecutorLimits;
+  delegationLimits?: typeof DELEGATION_LIMITS;
 };
 
 export function createRunExecutor({
@@ -62,6 +67,7 @@ export function createRunExecutor({
   isReadOnlyTool = () => false,
   workerId = `worker-${process.pid}`,
   limits = RUN_LIMITS,
+  delegationLimits = DELEGATION_LIMITS,
 }: Dependencies) {
   const runtimeFor = new Map(runtimes.map((runtime) => [runtime.providerId, runtime]));
   const tasks = createTaskRunHandlers({ log, limits, isReadOnlyTool });
@@ -132,6 +138,9 @@ export function createRunExecutor({
       });
       if (done) recovered++;
     }
+    // Children whose parent stopped, left running by a crash between the two steps.
+    const orphans = await stopOrphanedChildren(db, log);
+    if (orphans > 0) log("warn", "worker.stopped_orphaned_children", { count: orphans });
     return recovered;
   }
 
@@ -231,6 +240,8 @@ export function createRunExecutor({
     }
 
     const saved = await finish(run, outcome, partial.text);
+    // A parent that stopped takes its delegated children with it (their own transactions).
+    if (run.taskId && saved) await stopOrphanedChildren(db, log, run.taskId).catch(() => 0);
     log(outcome.status === "failed" ? "warn" : "info", "run.finished", {
       ...fields,
       status: outcome.status,
@@ -265,8 +276,9 @@ export function createRunExecutor({
     const runtime = runtimeFor.get(agent.providerId!);
     if (!runtime) return failed("runtime_unavailable", "This worker can’t run the agent’s provider.");
 
-    const prompt = await promptFor(run);
-    if (prompt === null) return { status: "cancelled" }; // the task was deleted
+    const prepared = await promptFor(run);
+    if (prepared === null) return { status: "cancelled" }; // the task was deleted
+    const { prompt, canDelegate } = prepared;
     await db.update(runs).set({ modelId: agent.modelId }).where(eq(runs.id, run.id));
 
     const controller = new AbortController();
@@ -325,6 +337,11 @@ export function createRunExecutor({
           onApprovalWait: (waiting) => (waiting ? deadline.pause() : deadline.resume()),
           // A task records every tool step on its timeline.
           onEvent: run.taskId ? (event) => tasks.onToolEvent(db, run, event) : undefined,
+          // Only a task's own work run, at a depth that still allows it, may delegate (M5A).
+          delegate: canDelegate
+            ? (request) =>
+                delegate(db, { run, request, providers, limits: delegationLimits, autoRetries: limits.taskAutoRetries })
+            : undefined,
         })) ?? [];
       const toolNames = runTools.map((tool) => tool.name);
       if (run.taskId) {
@@ -361,11 +378,20 @@ export function createRunExecutor({
     return run.taskId ? limits.taskTimeoutMs : limits.timeoutMs;
   }
 
-  /** The prompt: the task's own words, or the conversation so far plus the new message. Null if the task is gone. */
-  async function promptFor(run: RunRow): Promise<string | null> {
+  /**
+   * The prompt: the task's own words (or, for a follow-up after a delegation,
+   * the task plus the delegated result), or the conversation so far plus the
+   * new message. Null if the task is gone.
+   */
+  async function promptFor(run: RunRow): Promise<{ prompt: string; canDelegate: boolean } | null> {
     if (run.taskId) {
       const task = await tasks.loadTask(db, run.taskId);
-      return task ? buildTaskPrompt(task.title, task.instructions) : null;
+      if (!task) return null;
+      if (run.purpose === "continue") {
+        const delegations = await loadContinuation(db, run.taskId);
+        return { prompt: buildContinuationPrompt(task.title, task.instructions, delegations), canDelegate: false };
+      }
+      return { prompt: buildTaskPrompt(task.title, task.instructions), canDelegate: task.depth < delegationLimits.maxDepth };
     }
     const history = await db
       .select({ id: messages.id, role: messages.role, content: messages.content })
@@ -374,7 +400,7 @@ export function createRunExecutor({
       .orderBy(asc(messages.createdAt));
     const index = history.findIndex((message) => message.id === run.userMessageId);
     if (index === -1) throw new Error("The run's message is missing.");
-    return buildPrompt(history.slice(0, index), history[index].content, limits);
+    return { prompt: buildPrompt(history.slice(0, index), history[index].content, limits), canDelegate: false };
   }
 
   function stopped(run: RunRow, reason: StopReason): Outcome {

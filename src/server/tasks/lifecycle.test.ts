@@ -23,7 +23,14 @@ describe("task transitions", () => {
   });
 
   it("goes back to queued only by a retry: automatic from a running attempt, or the owner's from a stopped task", () => {
-    expect(allowedFrom("queued").sort()).toEqual(["awaiting_approval", "cancelled", "failed", "interrupted", "running"]);
+    expect(allowedFrom("queued").sort()).toEqual([
+      "awaiting_approval",
+      "cancelled",
+      "failed",
+      "interrupted",
+      "running",
+      "waiting_on_delegate",
+    ]);
   });
 
   it("starts running only from queued, so a cancelled task is never picked up", () => {

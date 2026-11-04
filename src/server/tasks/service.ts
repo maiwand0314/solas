@@ -1,5 +1,6 @@
 import "server-only";
-import { and, asc, count, desc, eq, ilike, inArray, max, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, max, or, type SQL } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { z } from "zod";
 import { TASK_FILTERS, type TaskFilterId } from "@/lib/tasks/status";
 import { createTaskSchema } from "@/lib/tasks/validation";
@@ -7,12 +8,14 @@ import { getDatabase, type Database } from "@/server/db/client";
 import {
   agents,
   runs,
+  taskDelegations,
   taskEvents,
   tasks,
   toolCalls,
   type AgentRow,
   type RunRow,
   type TaskEventRow,
+  type TaskDelegationRow,
   type TaskRow,
   type TaskStatus,
   type ToolCallRow,
@@ -20,6 +23,8 @@ import {
 import { getAgentReadiness, providerRegistry, type ProviderRegistry } from "@/server/providers/registry";
 import { RUN_LIMITS } from "@/server/runs/config";
 import { TaskServiceError, fromDatabaseError, validationError } from "./errors";
+import { jsonLogger } from "@/server/logger";
+import { cancelTaskInTx, stopOrphanedChildren } from "./cancel";
 import { recordTaskEvent } from "./events";
 import { transitionTask, type Queryable } from "./lifecycle";
 
@@ -29,8 +34,13 @@ import { transitionTask, type Queryable } from "./lifecycle";
 
 export type TaskSummary = Pick<
   TaskRow,
-  "id" | "title" | "status" | "cancelRequestedAt" | "createdAt" | "updatedAt" | "finishedAt"
-> & { agentId: string; agentName: string };
+  "id" | "title" | "status" | "cancelRequestedAt" | "createdAt" | "updatedAt" | "finishedAt" | "parentTaskId"
+> & {
+  agentId: string;
+  agentName: string;
+  /** For a delegated task: the agent of the task that delegated it. */
+  delegatedBy: string | null;
+};
 
 /** One attempt as the task page shows it: its state, never worker internals. */
 export type TaskAttempt = Pick<
@@ -70,12 +80,34 @@ export type TaskToolCall = Pick<
   | "finishedAt"
 >;
 
+/** A delegation as the parent task's page shows it (M5A). */
+export type TaskDelegationView = {
+  id: string;
+  status: TaskDelegationRow["status"];
+  taskDescription: string;
+  expectedOutput: string | null;
+  createdAt: Date;
+  completedAt: Date | null;
+  agent: { id: string; name: string };
+  child: Pick<TaskRow, "id" | "title" | "status" | "cancelRequestedAt" | "result" | "errorMessage" | "finishedAt">;
+  /** The child's tool calls waiting for the owner's approval, so they can be decided from the parent too. */
+  waitingCalls: TaskToolCall[];
+};
+
+/** The task that delegated this one (M5A). */
+export type TaskParentView = {
+  task: Pick<TaskRow, "id" | "title" | "status">;
+  agent: { id: string; name: string };
+};
+
 export type TaskDetail = {
   task: TaskRow;
   agent: Pick<AgentRow, "id" | "name" | "enabled" | "providerId" | "modelId">;
   attempts: TaskAttempt[];
   events: TaskEventView[];
   toolCalls: TaskToolCall[];
+  parent: TaskParentView | null;
+  delegations: TaskDelegationView[];
 };
 
 export type TaskListQuery = { filter?: TaskFilterId; search?: string };
@@ -114,6 +146,8 @@ const toolCallColumns = {
 };
 
 const idSchema = z.uuid({ error: "Invalid task." });
+const parentTasks = alias(tasks, "parent_tasks");
+const parentAgents = alias(agents, "parent_agents");
 const searchSchema = z.string().trim().max(200).catch("");
 /** One owner, a working list: the most recently active tasks are enough. */
 const LIST_LIMIT = 200;
@@ -190,11 +224,15 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
           createdAt: tasks.createdAt,
           updatedAt: tasks.updatedAt,
           finishedAt: tasks.finishedAt,
+          parentTaskId: tasks.parentTaskId,
           agentId: agents.id,
           agentName: agents.name,
+          delegatedBy: parentAgents.name,
         })
         .from(tasks)
         .innerJoin(agents, eq(agents.id, tasks.agentId))
+        .leftJoin(parentTasks, eq(parentTasks.id, tasks.parentTaskId))
+        .leftJoin(parentAgents, eq(parentAgents.id, parentTasks.agentId))
         .where(and(...conditions))
         .orderBy(desc(tasks.updatedAt))
         .limit(LIST_LIMIT),
@@ -257,69 +295,90 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
           .orderBy(asc(toolCalls.createdAt)),
       ),
     ]);
+    const [parent, delegations] = await Promise.all([parentOf(task), delegationsOf(task.id)]);
     const { id: agentId, name, enabled, providerId, modelId } = agent;
-    return { task, agent: { id: agentId, name, enabled, providerId, modelId }, attempts, events, toolCalls: calls };
+    return {
+      task,
+      agent: { id: agentId, name, enabled, providerId, modelId },
+      attempts,
+      events,
+      toolCalls: calls,
+      parent,
+      delegations,
+    };
+  }
+
+  async function parentOf(task: TaskRow): Promise<TaskParentView | null> {
+    if (!task.parentTaskId) return null;
+    const [row] = await query(() =>
+      db
+        .select({ id: tasks.id, title: tasks.title, status: tasks.status, agentId: agents.id, agentName: agents.name })
+        .from(tasks)
+        .innerJoin(agents, eq(agents.id, tasks.agentId))
+        .where(eq(tasks.id, task.parentTaskId!)),
+    );
+    return row
+      ? { task: { id: row.id, title: row.title, status: row.status }, agent: { id: row.agentId, name: row.agentName } }
+      : null;
+  }
+
+  async function delegationsOf(taskId: string): Promise<TaskDelegationView[]> {
+    const rows = await query(() =>
+      db
+        .select({
+          id: taskDelegations.id,
+          status: taskDelegations.status,
+          taskDescription: taskDelegations.taskDescription,
+          expectedOutput: taskDelegations.expectedOutput,
+          createdAt: taskDelegations.createdAt,
+          completedAt: taskDelegations.completedAt,
+          agentId: agents.id,
+          agentName: agents.name,
+          child: {
+            id: tasks.id,
+            title: tasks.title,
+            status: tasks.status,
+            cancelRequestedAt: tasks.cancelRequestedAt,
+            result: tasks.result,
+            errorMessage: tasks.errorMessage,
+            finishedAt: tasks.finishedAt,
+          },
+        })
+        .from(taskDelegations)
+        .innerJoin(tasks, eq(tasks.id, taskDelegations.childTaskId))
+        .innerJoin(agents, eq(agents.id, taskDelegations.targetAgentId))
+        .where(eq(taskDelegations.parentTaskId, taskId))
+        .orderBy(asc(taskDelegations.createdAt)),
+    );
+    return Promise.all(
+      rows.map(async ({ agentId, agentName, ...row }) => ({
+        ...row,
+        agent: { id: agentId, name: agentName },
+        waitingCalls: await query(() =>
+          db
+            .select(toolCallColumns)
+            .from(toolCalls)
+            .innerJoin(runs, eq(runs.id, toolCalls.runId))
+            .where(and(eq(runs.taskId, row.child.id), eq(toolCalls.status, "awaiting_approval"))),
+        ),
+      })),
+    );
   }
 
   /**
-   * Cancels a task. A queued task is cancelled at once, with its waiting run.
-   * A running one gets a cancel request: the worker stops the attempt within
-   * about a second and records "cancelled". Until then the task truthfully
-   * stays running, marked as cancelling.
+   * Cancels a task. A queued (or waiting, or interrupted) task is cancelled
+   * at once. A running one gets a cancel request: the worker stops the
+   * attempt within about a second and records "cancelled"; until then the
+   * task truthfully stays running, marked as cancelling.
    *
-   * Rows are locked run first, then task: the same order the worker uses
-   * when it claims or finishes a run, so the two can never deadlock.
+   * Delegation (M5A): cancelling a parent cancels its delegated task too;
+   * cancelling a delegated task lets its waiting parent continue without it.
    */
   async function cancel(id: unknown): Promise<TaskRow> {
     const taskId = parse(idSchema, id);
-    return query(() =>
-      db.transaction(async (tx) => {
-        const [active] = await tx
-          .select({ id: runs.id, status: runs.status, attempt: runs.attempt })
-          .from(runs)
-          .where(and(eq(runs.taskId, taskId), inArray(runs.status, ["pending", "running"])))
-          .for("update");
-        const task = await getTaskRow(taskId, tx, true);
-
-        if (task.status === "queued") {
-          if (active?.status === "pending") {
-            await tx.update(runs).set({ status: "cancelled", finishedAt: sql`now()` }).where(eq(runs.id, active.id));
-          }
-          await transitionTask(tx, taskId, "cancelled", { finishedAt: sql`now()` }, ["queued"]);
-          await recordTaskEvent(tx, {
-            taskId,
-            runId: active?.id,
-            type: "cancelled",
-            message: "You cancelled this task before it started.",
-          });
-          return getTaskRow(taskId, tx);
-        }
-
-        if (task.status === "running" || task.status === "awaiting_approval") {
-          if (task.cancelRequestedAt) return task; // already asked
-          if (active?.status === "running") {
-            await tx.update(runs).set({ cancelRequestedAt: sql`now()` }).where(eq(runs.id, active.id));
-          }
-          const [updated] = await tx
-            .update(tasks)
-            .set({ cancelRequestedAt: sql`now()` })
-            .where(eq(tasks.id, taskId))
-            .returning();
-          await recordTaskEvent(tx, {
-            taskId,
-            runId: active?.id,
-            type: "cancel_requested",
-            message: active
-              ? `You asked to cancel. Waiting for the worker to stop attempt ${active.attempt}.`
-              : "You asked to cancel.",
-            data: active ? { attempt: active.attempt } : {},
-          });
-          return updated;
-        }
-
-        throw new TaskServiceError("invalid_state", "Only a queued or running task can be cancelled.");
-      }),
-    );
+    const { task, childrenToStop } = await query(() => db.transaction((tx) => cancelTaskInTx(tx, taskId, "owner")));
+    if (childrenToStop.length > 0) await stopOrphanedChildren(db, jsonLogger, taskId);
+    return task;
   }
 
   /**
@@ -330,6 +389,7 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
   async function retry(id: unknown): Promise<TaskRow> {
     const taskId = parse(idSchema, id);
     const task = await getTaskRow(taskId);
+    if (task.parentTaskId) await assertParentWaitsFor(task);
     if (!RETRYABLE.includes(task.status)) {
       throw new TaskServiceError(
         "invalid_state",
@@ -374,6 +434,27 @@ export function createTaskService({ db, providers, limits = RUN_LIMITS }: Depend
         return getTaskRow(taskId, tx);
       }),
     );
+  }
+
+  /**
+   * A delegated task can be retried only while its parent still waits for it
+   * (it was interrupted). Once the parent has moved on with a failure or a
+   * cancellation, a new result would reach no one: retry the parent instead.
+   */
+  async function assertParentWaitsFor(child: TaskRow) {
+    const [delegation] = await query(() =>
+      db
+        .select({ status: taskDelegations.status, parentStatus: tasks.status })
+        .from(taskDelegations)
+        .innerJoin(tasks, eq(tasks.id, taskDelegations.parentTaskId))
+        .where(eq(taskDelegations.childTaskId, child.id)),
+    );
+    if (delegation?.status !== "waiting" || delegation.parentStatus !== "waiting_on_delegate") {
+      throw new TaskServiceError(
+        "invalid_state",
+        "The task that delegated this one has already moved on. Retry that task instead.",
+      );
+    }
   }
 
   async function getTaskRow(id: string, from: Queryable = db, lock = false): Promise<TaskRow> {
