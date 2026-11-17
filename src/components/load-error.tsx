@@ -18,6 +18,7 @@ const SUBJECT_LABELS = {
   tasks: "Tasks",
   teams: "Teams",
   automations: "Automations",
+  notifications: "Notifications",
 } as const;
 
 export function LoadError({ error, subject = "agents" }: { error: unknown; subject?: keyof typeof SUBJECT_LABELS }) {

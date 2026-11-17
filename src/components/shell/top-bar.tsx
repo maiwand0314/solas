@@ -1,5 +1,6 @@
 import { Breadcrumbs } from "./breadcrumbs";
 import { CommandMenu } from "./command-menu";
+import { NotificationBell } from "@/components/notifications/notification-bell";
 import { MobileNav } from "./mobile-nav";
 import { SidebarToggle } from "./sidebar-toggle";
 import { Wordmark } from "./wordmark";
@@ -22,7 +23,8 @@ export function TopBar() {
         <Breadcrumbs />
       </div>
 
-      <div className="ml-auto flex items-center">
+      <div className="ml-auto flex items-center gap-1">
+        <NotificationBell />
         <CommandMenu />
       </div>
     </header>

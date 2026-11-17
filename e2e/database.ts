@@ -27,9 +27,12 @@ export const {
   teamMembers,
   automations,
   automationOccurrences,
+  notifications,
 } = schema;
 
 export async function resetDatabase() {
+  await db.delete(notifications);
+  await db.delete(automations); // team automations survive an agent delete, and block a team delete
   await db.delete(teams); // cascades to team membership
   await db.delete(agents); // cascades to conversations, messages, tasks, runs, and automations
 }
@@ -230,4 +233,20 @@ export async function createDelegation(
     })
     .returning();
   return { ...created, delegation: link };
+}
+
+/** A notification as the worker's sync would have written it (no worker runs in these tests). */
+export async function createNotification(overrides: Partial<typeof notifications.$inferInsert> = {}) {
+  const [notification] = await db
+    .insert(notifications)
+    .values({
+      kind: "task_failed",
+      dedupeKey: `test:${crypto.randomUUID()}`,
+      title: "Task failed: Research AI Agent Architectures",
+      body: "The attempt didn’t finish within 10 minutes, so the run was stopped.",
+      occurredAt: new Date(Date.now() - 5 * 60_000),
+      ...overrides,
+    })
+    .returning();
+  return notification;
 }
