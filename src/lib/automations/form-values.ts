@@ -7,8 +7,16 @@ import type { Schedule, ScheduleKind, Weekday } from "./schedule";
 export type AutomationFormValues = {
   name: string;
   description: string;
+  /** Whether runs go to one agent or to a team's coordinator (M6B). */
+  targetKind: "agent" | "team";
   agentId: string;
+  teamId: string;
   instructions: string;
+  /** Limits (M6B): empty means "only the global limit". */
+  maxRunsPerDay: string;
+  maxDurationMinutes: string;
+  allowOverlap: boolean;
+  pauseAfterFailures: string;
   kind: ScheduleKind;
   date: string;
   time: string;
@@ -51,3 +59,8 @@ export function valuesFromSchedule(schedule: Schedule): ScheduleFields {
   };
 }
 
+
+/** An empty box means "no per-automation limit". */
+export function optionalNumber(value: string): number | null {
+  return value.trim() === "" ? null : Number(value);
+}

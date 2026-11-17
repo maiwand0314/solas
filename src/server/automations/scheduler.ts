@@ -3,7 +3,7 @@ import { and, asc, eq, lte, sql } from "drizzle-orm";
 import { AUTOMATION_LIMITS } from "@/lib/automations/limits";
 import { formatInTimeZone, planDueRuns, type DuePlan } from "@/lib/automations/schedule";
 import type { Database } from "@/server/db/client";
-import { agents, automationOccurrences, automations, type AutomationRow } from "@/server/db/schema";
+import { automationOccurrences, automations, type AutomationRow } from "@/server/db/schema";
 import type { Logger } from "@/server/logger";
 import type { ProviderRegistry } from "@/server/providers/registry";
 import type { Queryable } from "@/server/tasks/lifecycle";
@@ -89,10 +89,9 @@ export function createScheduler({ db, providers, log, limits = AUTOMATION_LIMITS
       if (plan.missed && (await recordMissed(tx, automation, plan.missed))) result.missed += plan.missed.count;
 
       if (plan.run) {
-        const [agent] = await tx.select().from(agents).where(eq(agents.id, automation.agentId));
-        const check = await checkCanStart(tx, { automation, agent, now: at, providers, limits });
+        const check = await checkCanStart(tx, { automation, now: at, providers, limits });
         if (check.ok) {
-          const started = await startOccurrence(tx, { automation, agent, scheduledFor: plan.run, trigger: "schedule", limits });
+          const started = await startOccurrence(tx, { automation, check, scheduledFor: plan.run, trigger: "schedule", limits });
           if (started) {
             result.started++;
             log("info", "automation.started", { automationId: automation.id, taskId: started.taskId });
@@ -100,6 +99,16 @@ export function createScheduler({ db, providers, log, limits = AUTOMATION_LIMITS
         } else if (await recordSkipped(tx, automation, plan.run, "schedule", check)) {
           result.skipped++;
           log("warn", "automation.skipped", { automationId: automation.id, reason: check.reason });
+        }
+        // Repeated failures pause the automation itself, so it stops asking
+        // for runs that would fail again; the owner resumes it deliberately.
+        if (!check.ok && check.reason === "paused_after_failures") {
+          await tx
+            .update(automations)
+            .set({ enabled: false, nextRunAt: null, pausedReason: check.message })
+            .where(eq(automations.id, automation.id));
+          log("warn", "automation.paused", { automationId: automation.id, reason: check.reason });
+          return;
         }
       }
 

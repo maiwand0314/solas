@@ -27,6 +27,16 @@ export const AUTOMATION_LIMITS = {
   usageLimitCooldownMs: 60 * 60_000,
   /** Automatic retries an automation's task gets (same safe policy as any task). */
   taskAutoRetries: 1,
+  /**
+   * The longest one attempt of an automation's task may run (M6B). Equal to
+   * the worker's global task timeout (RUN_LIMITS.taskTimeoutMs, checked by a
+   * test): an automation may ask for less, never more.
+   */
+  maxDurationMs: 10 * 60_000,
+  /** The shortest per-automation duration limit. */
+  minDurationMs: 60_000,
+  /** The most failed runs in a row an automation may be set to tolerate before pausing. */
+  maxPauseAfterFailures: 10,
   /** How often the worker checks for automations that are due. */
   checkIntervalMs: 15_000,
   /** Field lengths. */

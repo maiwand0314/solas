@@ -11,6 +11,8 @@ import {
   automationOccurrences,
   automations,
   tasks,
+  teamMembers,
+  teams,
   type AgentRow,
   type AutomationOccurrenceRow,
   type AutomationRow,
@@ -41,11 +43,14 @@ export type OccurrenceView = Pick<
 
 export type AutomationSummary = Pick<
   AutomationRow,
-  "id" | "name" | "description" | "enabled" | "schedule" | "timeZone" | "nextRunAt" | "lastRunAt" | "createdAt" | "updatedAt"
+  "id" | "name" | "description" | "enabled" | "schedule" | "timeZone" | "nextRunAt" | "lastRunAt" | "createdAt" | "updatedAt" | "pausedReason"
 > & {
   state: AutomationState;
   scheduleText: string;
-  agent: { id: string; name: string };
+  /** An individual automation's agent; null for a team automation. */
+  agent: { id: string; name: string } | null;
+  /** A team automation's team and its current coordinator (null: none, so runs are skipped). */
+  team: { id: string; name: string; coordinator: { id: string; name: string } | null } | null;
   lastOccurrence: OccurrenceView | null;
 };
 
@@ -53,7 +58,12 @@ export type AutomationDetail = {
   automation: AutomationRow;
   state: AutomationState;
   scheduleText: string;
-  agent: { id: string; name: string; readiness: "ready" | "disabled" | "unconfigured" };
+  agent: { id: string; name: string; readiness: "ready" | "disabled" | "unconfigured" } | null;
+  team: {
+    id: string;
+    name: string;
+    coordinator: { id: string; name: string; readiness: "ready" | "disabled" | "unconfigured" } | null;
+  } | null;
   /** The next few runs (only while active). */
   upcoming: Date[];
   /** Newest scheduled time first. */
@@ -64,6 +74,15 @@ export type AutomationDetail = {
   hasActiveRun: boolean;
   counts: { started: number; missed: number; skipped: number };
 };
+
+type Executor = { agent: AgentRow; field: "agentId" | "teamId" };
+
+/** The form's values as columns: the duration is stored in milliseconds. */
+function toColumns(values: AutomationValues) {
+  const { maxDurationMinutes, ...rest } = values;
+  // targetKind only chose which of agentId / teamId is kept; it isn't a column.
+  return { ...rest, targetKind: undefined, maxDurationMs: maxDurationMinutes ? maxDurationMinutes * 60_000 : null };
+}
 
 const idSchema = z.uuid({ error: "Invalid automation." });
 const HISTORY_SHOWN = 50;
@@ -88,13 +107,15 @@ export function createAutomationService({
   async function list(): Promise<AutomationSummary[]> {
     const rows = await query(() =>
       db
-        .select({ automation: automations, agentName: agents.name })
+        .select({ automation: automations, agentName: agents.name, teamName: teams.name })
         .from(automations)
-        .innerJoin(agents, eq(agents.id, automations.agentId))
+        .leftJoin(agents, eq(agents.id, automations.agentId))
+        .leftJoin(teams, eq(teams.id, automations.teamId))
         .orderBy(sql`${automations.nextRunAt} asc nulls last`, sql`lower(${automations.name})`),
     );
     const latest = await latestOccurrences(rows.map((row) => row.automation.id));
-    return rows.map(({ automation, agentName }) => {
+    const coordinators = await coordinatorsOf(rows.flatMap((row) => (row.automation.teamId ? [row.automation.teamId] : [])));
+    return rows.map(({ automation, agentName, teamName }) => {
       const lastOccurrence = latest.get(automation.id) ?? null;
       return {
         id: automation.id,
@@ -107,12 +128,34 @@ export function createAutomationService({
         lastRunAt: automation.lastRunAt,
         createdAt: automation.createdAt,
         updatedAt: automation.updatedAt,
+        pausedReason: automation.pausedReason,
         state: stateOf(automation, lastOccurrence),
         scheduleText: describeSchedule(automation.schedule),
-        agent: { id: automation.agentId, name: agentName },
+        agent: automation.agentId && agentName ? { id: automation.agentId, name: agentName } : null,
+        team:
+          automation.teamId && teamName
+            ? {
+                id: automation.teamId,
+                name: teamName,
+                coordinator: pickCoordinator(coordinators.get(automation.teamId)),
+              }
+            : null,
         lastOccurrence,
       };
     });
+  }
+
+  /** The current coordinator (an agent row) of each team, in one query. */
+  async function coordinatorsOf(teamIds: string[]): Promise<Map<string, AgentRow>> {
+    if (teamIds.length === 0) return new Map();
+    const rows = await query(() =>
+      db
+        .select({ teamId: teamMembers.teamId, agent: agents })
+        .from(teamMembers)
+        .innerJoin(agents, eq(agents.id, teamMembers.agentId))
+        .where(and(inArray(teamMembers.teamId, teamIds), eq(teamMembers.role, "coordinator"))),
+    );
+    return new Map(rows.map((row) => [row.teamId, row.agent]));
   }
 
   /** The newest occurrence of each automation, in one query. */
@@ -134,8 +177,10 @@ export function createAutomationService({
 
   async function get(id: unknown): Promise<AutomationDetail> {
     const automation = await getRow(parse(idSchema, id));
-    const [agentRows, historyRows, resultRows, [{ active }], countRows] = await Promise.all([
-      query(() => db.select().from(agents).where(eq(agents.id, automation.agentId))),
+    const [agentRows, historyRows, resultRows, [{ active }], countRows, teamRows] = await Promise.all([
+      automation.agentId
+        ? query(() => db.select().from(agents).where(eq(agents.id, automation.agentId!)))
+        : Promise.resolve([] as AgentRow[]),
       query(() =>
         db
           .select(occurrenceColumns)
@@ -167,8 +212,13 @@ export function createAutomationService({
           .where(eq(automationOccurrences.automationId, automation.id))
           .groupBy(automationOccurrences.status),
       ),
+      automation.teamId
+        ? query(() => db.select({ id: teams.id, name: teams.name }).from(teams).where(eq(teams.id, automation.teamId!)))
+        : Promise.resolve([] as { id: string; name: string }[]),
     ]);
     const agent = agentRows[0];
+    const team = teamRows[0];
+    const coordinator = team ? (await coordinatorsOf([team.id])).get(team.id) : undefined;
     const history = historyRows.map(toOccurrenceView);
     const latest = resultRows[0];
     const countOf = (status: string) => countRows.find((row) => row.status === status)?.runs ?? 0;
@@ -176,7 +226,15 @@ export function createAutomationService({
       automation,
       state: stateOf(automation, history[0] ?? null),
       scheduleText: describeSchedule(automation.schedule),
-      agent: { id: agent.id, name: agent.name, readiness: getAgentReadiness(agent, providers).state },
+      agent: agent ? { id: agent.id, name: agent.name, readiness: getAgentReadiness(agent, providers).state } : null,
+      team: team
+        ? {
+            ...team,
+            coordinator: coordinator
+              ? { id: coordinator.id, name: coordinator.name, readiness: getAgentReadiness(coordinator, providers).state }
+              : null,
+          }
+        : null,
       upcoming: automation.nextRunAt
         ? [
             automation.nextRunAt,
@@ -192,15 +250,15 @@ export function createAutomationService({
 
   async function create(input: unknown): Promise<AutomationRow> {
     const values = parse(automationSchema, input);
-    const agent = await getAgent(values.agentId);
+    const executor = await getExecutor(values);
     const now = clock();
     return query(() =>
       db.transaction(async (tx) => {
         const nextRunAt = values.enabled ? firstRun(values.schedule, values.timeZone, now) : null;
-        if (nextRunAt) await assertCanSchedule(tx, { agent, schedule: values.schedule });
+        if (nextRunAt) await assertCanSchedule(tx, { executor, schedule: values.schedule });
         const [created] = await tx
           .insert(automations)
-          .values({ ...values, scheduleAnchorAt: now, nextRunAt })
+          .values({ ...toColumns(values), scheduleAnchorAt: now, nextRunAt })
           .returning();
         return created;
       }),
@@ -214,7 +272,7 @@ export function createAutomationService({
   async function update(id: unknown, input: unknown): Promise<AutomationRow> {
     const automationId = parse(idSchema, id);
     const values = parse(automationSchema, input);
-    const agent = await getAgent(values.agentId);
+    const executor = await getExecutor(values);
     const now = clock();
     return query(() =>
       db.transaction(async (tx) => {
@@ -233,10 +291,11 @@ export function createAutomationService({
             nextRunAt = current.nextRunAt;
           }
         }
-        if (nextRunAt) await assertCanSchedule(tx, { agent, schedule: values.schedule, except: automationId });
+        if (nextRunAt) await assertCanSchedule(tx, { executor, schedule: values.schedule, except: automationId });
         const [updated] = await tx
           .update(automations)
-          .set({ ...values, scheduleAnchorAt, nextRunAt })
+          // Saving is the owner's deliberate edit: an automatic pause's reason no longer applies once it is on again.
+          .set({ ...toColumns(values), scheduleAnchorAt, nextRunAt, pausedReason: values.enabled ? null : current.pausedReason })
           .where(eq(automations.id, automationId))
           .returning();
         return updated;
@@ -255,7 +314,7 @@ export function createAutomationService({
         if (!enabled) {
           const [paused] = await tx
             .update(automations)
-            .set({ enabled: false, nextRunAt: null })
+            .set({ enabled: false, nextRunAt: null, pausedReason: null })
             .where(eq(automations.id, automationId))
             .returning();
           return paused;
@@ -267,11 +326,11 @@ export function createAutomationService({
             "This one-time run’s time has passed. Edit the automation to choose a new time.",
           );
         }
-        const [agent] = await tx.select().from(agents).where(eq(agents.id, current.agentId));
-        await assertCanSchedule(tx, { agent, schedule: current.schedule, except: automationId });
+        const executor = await getExecutor(current);
+        await assertCanSchedule(tx, { executor, schedule: current.schedule, except: automationId });
         const [resumed] = await tx
           .update(automations)
-          .set({ enabled: true, nextRunAt, scheduleAnchorAt: now })
+          .set({ enabled: true, nextRunAt, scheduleAnchorAt: now, pausedReason: null })
           .where(eq(automations.id, automationId))
           .returning();
         return resumed;
@@ -299,10 +358,9 @@ export function createAutomationService({
     return query(() =>
       db.transaction(async (tx) => {
         const automation = await getRow(automationId, tx, true);
-        const [agent] = await tx.select().from(agents).where(eq(agents.id, automation.agentId));
-        const check = await checkCanStart(tx, { automation, agent, now, providers, limits });
-        if (!check.ok) throw new AutomationServiceError("cannot_start", check.message.replace(/^Skipped: /, "Can’t run now: "));
-        const started = await startOccurrence(tx, { automation, agent, scheduledFor: now, trigger: "manual", limits });
+        const check = await checkCanStart(tx, { automation, now, providers, limits, trigger: "manual" });
+        if (!check.ok) throw new AutomationServiceError("cannot_start", check.message.replace(/^(Skipped|Paused): /, "Can’t run now: "));
+        const started = await startOccurrence(tx, { automation, check, scheduledFor: now, trigger: "manual", limits });
         if (!started) throw new AutomationServiceError("cannot_start", "This run was just started. Check the history.");
         return { taskId: started.taskId };
       }),
@@ -324,14 +382,19 @@ export function createAutomationService({
    * agent can work, at most maxActiveAutomations are scheduled, and their
    * worst-case runs per day stay under maxRunsPerDay.
    */
-  async function assertCanSchedule(tx: Queryable, { agent, schedule, except }: { agent: AgentRow; schedule: Schedule; except?: string }) {
+  async function assertCanSchedule(
+    tx: Queryable,
+    { executor, schedule, except }: { executor: Executor; schedule: Schedule; except?: string },
+  ) {
+    const { agent, field } = executor;
     const readiness = getAgentReadiness(agent, providers);
     if (readiness.state !== "ready") {
+      const who = field === "teamId" ? `The coordinator “${agent.name}”` : `“${agent.name}”`;
       const message =
         readiness.state === "disabled"
-          ? `“${agent.name}” is disabled. Enable it, or save this automation as paused.`
-          : `“${agent.name}” can’t work yet: ${readiness.reason} Choose a model for it first.`;
-      throw new AutomationServiceError("agent_unavailable", message, { agentId: [message] });
+          ? `${who} is disabled. Enable it, or save this automation as paused.`
+          : `${who} can’t work yet: ${readiness.reason} Choose a model for it first.`;
+      throw new AutomationServiceError("agent_unavailable", message, { [field]: [message] });
     }
     await tx.execute(sql`select pg_advisory_xact_lock(${SAVE_LOCK})`);
     const others = await tx
@@ -360,13 +423,30 @@ export function createAutomationService({
     return row;
   }
 
-  async function getAgent(id: string): Promise<AgentRow> {
-    const [agent] = await query(() => db.select().from(agents).where(eq(agents.id, id)).limit(1));
+  /**
+   * Who will do the work, checked when saving: the chosen agent, or the
+   * chosen team's coordinator (the team must exist and have one).
+   */
+  async function getExecutor(values: { agentId: string | null; teamId: string | null }): Promise<Executor> {
+    if (values.teamId) {
+      const [team] = await query(() => db.select({ id: teams.id, name: teams.name }).from(teams).where(eq(teams.id, values.teamId!)));
+      if (!team) {
+        const message = "This team doesn’t exist. It may have been deleted.";
+        throw new AutomationServiceError("agent_not_found", message, { teamId: [message] });
+      }
+      const coordinator = (await coordinatorsOf([team.id])).get(team.id);
+      if (!coordinator) {
+        const message = `The team “${team.name}” has no coordinator. Choose one on the team page first.`;
+        throw new AutomationServiceError("agent_unavailable", message, { teamId: [message] });
+      }
+      return { agent: coordinator, field: "teamId" };
+    }
+    const [agent] = await query(() => db.select().from(agents).where(eq(agents.id, values.agentId!)).limit(1));
     if (!agent) {
       const message = "This agent doesn’t exist. It may have been deleted.";
       throw new AutomationServiceError("agent_not_found", message, { agentId: [message] });
     }
-    return agent;
+    return { agent, field: "agentId" };
   }
 
   return { list, get, create, update, setEnabled, remove, runNow };
@@ -421,6 +501,10 @@ function toOccurrenceView(row: OccurrenceRow): OccurrenceView {
           }
         : null,
   };
+}
+
+function pickCoordinator(agent: AgentRow | undefined): { id: string; name: string } | null {
+  return agent ? { id: agent.id, name: agent.name } : null;
 }
 
 function stateOf(automation: AutomationRow, last: Pick<OccurrenceView, "status"> | null): AutomationState {

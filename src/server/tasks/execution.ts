@@ -69,7 +69,7 @@ export function createTaskRunHandlers({ log, limits, isReadOnlyTool }: Dependenc
 
   async function loadTask(db: Queryable, taskId: string) {
     const [task] = await db
-      .select({ title: tasks.title, instructions: tasks.instructions, depth: tasks.depth })
+      .select({ title: tasks.title, instructions: tasks.instructions, depth: tasks.depth, maxDurationMs: tasks.maxDurationMs })
       .from(tasks)
       .where(eq(tasks.id, taskId))
       .limit(1);

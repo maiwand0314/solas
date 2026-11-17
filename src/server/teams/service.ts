@@ -1,5 +1,5 @@
 import "server-only";
-import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { createTeamSchema, teamDelegationSchema, updateTeamSchema } from "@/lib/teams/validation";
 import { getDatabase, type Database } from "@/server/db/client";
@@ -7,6 +7,7 @@ import {
   agentDelegationTargets,
   agents,
   agentToolPermissions,
+  automations,
   taskEvents,
   tasks,
   teamMembers,
@@ -295,6 +296,16 @@ export function createTeamService({ db, providers, tools = toolRegistry }: Depen
   /** Deletes the team and its membership rows. Agents and tasks stay; tasks lose only the team link. */
   async function remove(id: unknown): Promise<void> {
     const teamId = parse(idSchema, id);
+    // Automations (M6B) run through their team, so it stays until they are deleted or moved.
+    const [{ used }] = await query(() =>
+      db.select({ used: count() }).from(automations).where(eq(automations.teamId, teamId)),
+    );
+    if (used > 0) {
+      throw new TeamServiceError(
+        "validation_failed",
+        `This team is used by ${used} ${used === 1 ? "automation" : "automations"}. Delete or change ${used === 1 ? "it" : "them"} first.`,
+      );
+    }
     const deleted = await query(() => db.delete(teams).where(eq(teams.id, teamId)).returning({ id: teams.id }));
     if (deleted.length === 0) throw notFound();
   }

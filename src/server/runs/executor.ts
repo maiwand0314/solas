@@ -278,7 +278,8 @@ export function createRunExecutor({
 
     const prepared = await promptFor(run);
     if (prepared === null) return { status: "cancelled" }; // the task was deleted
-    const { prompt, canDelegate } = prepared;
+    const { prompt, canDelegate, maxDurationMs } = prepared;
+    const timeoutMs = timeoutFor(run, maxDurationMs);
     await db.update(runs).set({ modelId: agent.modelId }).where(eq(runs.id, run.id));
 
     const controller = new AbortController();
@@ -289,7 +290,7 @@ export function createRunExecutor({
     };
     const stillRunning = and(eq(runs.id, run.id), eq(runs.status, "running"));
     // The run's clock, paused while a tool call waits for the owner's approval.
-    const deadline = createDeadline(timeoutFor(run), () => stop("timeout"));
+    const deadline = createDeadline(timeoutMs, () => stop("timeout"));
     // Once a second: prove this worker is alive, and learn whether the owner
     // pressed Stop. No row means the run was deleted (with its conversation)
     // or taken over by recovery: either way, stop working on it.
@@ -359,13 +360,13 @@ export function createRunExecutor({
       );
       // Stopped (Cancel, timeout, shutdown): whatever the runtime returned
       // after that point isn't accepted as the result.
-      if (controller.signal.aborted) return stopped(run, stopReason ?? "cancelled");
+      if (controller.signal.aborted) return stopped(run, stopReason ?? "cancelled", timeoutMs);
       if (result.status === "completed") return result;
       if (result.status === "failed") {
         if (result.retryAt) log("info", "run.retry_after", { runId: run.id, retryAt: result.retryAt.toISOString() });
         return failed(result.code, result.message);
       }
-      return stopped(run, stopReason ?? "cancelled");
+      return stopped(run, stopReason ?? "cancelled", timeoutMs);
     } finally {
       deadline.clear();
       clearInterval(heartbeat);
@@ -374,8 +375,10 @@ export function createRunExecutor({
     }
   }
 
-  function timeoutFor(run: RunRow): number {
-    return run.taskId ? limits.taskTimeoutMs : limits.timeoutMs;
+  /** The global limit, or a shorter one the task carries (from its automation); never a longer one. */
+  function timeoutFor(run: RunRow, maxDurationMs?: number | null): number {
+    const global = run.taskId ? limits.taskTimeoutMs : limits.timeoutMs;
+    return maxDurationMs ? Math.min(global, maxDurationMs) : global;
   }
 
   /**
@@ -383,15 +386,19 @@ export function createRunExecutor({
    * the task plus the delegated result), or the conversation so far plus the
    * new message. Null if the task is gone.
    */
-  async function promptFor(run: RunRow): Promise<{ prompt: string; canDelegate: boolean } | null> {
+  async function promptFor(run: RunRow): Promise<{ prompt: string; canDelegate: boolean; maxDurationMs: number | null } | null> {
     if (run.taskId) {
       const task = await tasks.loadTask(db, run.taskId);
       if (!task) return null;
       if (run.purpose === "continue") {
         const delegations = await loadContinuation(db, run.taskId);
-        return { prompt: buildContinuationPrompt(task.title, task.instructions, delegations), canDelegate: false };
+        return { prompt: buildContinuationPrompt(task.title, task.instructions, delegations), canDelegate: false, maxDurationMs: task.maxDurationMs };
       }
-      return { prompt: buildTaskPrompt(task.title, task.instructions), canDelegate: task.depth < delegationLimits.maxDepth };
+      return {
+        prompt: buildTaskPrompt(task.title, task.instructions),
+        canDelegate: task.depth < delegationLimits.maxDepth,
+        maxDurationMs: task.maxDurationMs,
+      };
     }
     const history = await db
       .select({ id: messages.id, role: messages.role, content: messages.content })
@@ -400,12 +407,12 @@ export function createRunExecutor({
       .orderBy(asc(messages.createdAt));
     const index = history.findIndex((message) => message.id === run.userMessageId);
     if (index === -1) throw new Error("The run's message is missing.");
-    return { prompt: buildPrompt(history.slice(0, index), history[index].content, limits), canDelegate: false };
+    return { prompt: buildPrompt(history.slice(0, index), history[index].content, limits), canDelegate: false, maxDurationMs: null };
   }
 
-  function stopped(run: RunRow, reason: StopReason): Outcome {
+  function stopped(run: RunRow, reason: StopReason, timeoutMs: number): Outcome {
     if (reason === "timeout") {
-      const minutes = Math.round(timeoutFor(run) / 60_000);
+      const minutes = Math.round(timeoutMs / 60_000);
       const what = run.taskId ? "The attempt didn’t finish" : "No reply";
       return failed("timeout", `${what} within ${minutes} ${minutes === 1 ? "minute" : "minutes"}, so the run was stopped.`);
     }

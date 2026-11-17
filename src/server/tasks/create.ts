@@ -10,6 +10,8 @@ export type NewTask = {
   teamId?: string | null;
   /** Set when an automation created the task (M6A). */
   automationId?: string | null;
+  /** A shorter time limit per attempt than the global one (M6B), from the automation. */
+  maxDurationMs?: number | null;
   clientRequestId?: string;
   autoRetries: number;
   /** The first line of the task's timeline: who created it, and why. */
@@ -33,6 +35,7 @@ export async function insertTaskWithFirstRun(tx: Queryable, input: NewTask): Pro
       clientRequestId: input.clientRequestId,
       teamId: input.teamId ?? null,
       automationId: input.automationId ?? null,
+      maxDurationMs: input.maxDurationMs ?? null,
       autoRetriesLeft: input.autoRetries,
     })
     .returning({ id: tasks.id });

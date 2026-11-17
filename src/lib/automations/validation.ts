@@ -79,16 +79,49 @@ const timeZone = z
   .string({ error: "Choose a time zone." })
   .refine(isValidTimeZone, { error: "Choose a time zone from the list." });
 
-/** Creating or editing an automation: the form always sends every field. */
-export const automationSchema = z.strictObject({
-  name,
-  description: description.default(""),
-  agentId: z.uuid({ error: "Choose an agent." }),
-  instructions: taskInstructionsSchema,
-  schedule: scheduleSchema,
-  timeZone: timeZone.default(DEFAULT_TIME_ZONE),
-  enabled: z.boolean({ error: "Choose whether it is active." }).default(true),
-});
+const optionalInt = (min: number, max: number, message: string) =>
+  z
+    .int({ error: message })
+    .min(min, { error: message })
+    .max(max, { error: message })
+    .nullable()
+    .default(null);
+
+/**
+ * Creating or editing an automation: the form always sends every field.
+ * An automation runs one agent ("agent") or a team's coordinator ("team");
+ * only the chosen one is kept. The limits (M6B) can only be as strict as the
+ * global AUTOMATION_LIMITS or stricter; null means "use the global limit".
+ */
+export const automationSchema = z
+  .strictObject({
+    name,
+    description: description.default(""),
+    targetKind: z.enum(["agent", "team"], { error: "Choose an agent or a team." }).default("agent"),
+    agentId: z.uuid({ error: "Choose an agent." }).nullable().default(null),
+    teamId: z.uuid({ error: "Choose a team." }).nullable().default(null),
+    instructions: taskInstructionsSchema,
+    schedule: scheduleSchema,
+    timeZone: timeZone.default(DEFAULT_TIME_ZONE),
+    enabled: z.boolean({ error: "Choose whether it is active." }).default(true),
+    maxRunsPerDay: optionalInt(1, AUTOMATION_LIMITS.maxRunsPerDay, `Enter 1 to ${AUTOMATION_LIMITS.maxRunsPerDay}, or leave it empty.`),
+    maxDurationMinutes: optionalInt(
+      AUTOMATION_LIMITS.minDurationMs / 60_000,
+      AUTOMATION_LIMITS.maxDurationMs / 60_000,
+      `Enter ${AUTOMATION_LIMITS.minDurationMs / 60_000} to ${AUTOMATION_LIMITS.maxDurationMs / 60_000} minutes, or leave it empty.`,
+    ),
+    allowOverlap: z.boolean({ error: "Choose whether runs may overlap." }).default(false),
+    pauseAfterFailures: optionalInt(1, AUTOMATION_LIMITS.maxPauseAfterFailures, `Enter 1 to ${AUTOMATION_LIMITS.maxPauseAfterFailures}, or leave it empty.`),
+  })
+  .superRefine((value, ctx) => {
+    if (value.targetKind === "agent" && !value.agentId) ctx.addIssue({ code: "custom", path: ["agentId"], message: "Choose an agent." });
+    if (value.targetKind === "team" && !value.teamId) ctx.addIssue({ code: "custom", path: ["teamId"], message: "Choose a team." });
+  })
+  .transform((value) => ({
+    ...value,
+    agentId: value.targetKind === "agent" ? value.agentId : null,
+    teamId: value.targetKind === "team" ? value.teamId : null,
+  }));
 
 export type AutomationInput = z.input<typeof automationSchema>;
 export type AutomationValues = z.output<typeof automationSchema>;
