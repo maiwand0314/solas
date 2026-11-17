@@ -1,4 +1,5 @@
 import "server-only";
+import { z } from "zod";
 import { AgentServiceError, type AgentErrorCode, type FieldErrors } from "@/server/agents/errors";
 import { AutomationServiceError, type AutomationErrorCode } from "@/server/automations/errors";
 import { OwnerAccessError } from "@/server/auth/owner";
@@ -41,6 +42,12 @@ export function toActionError(error: unknown): Extract<ActionResult<never>, { ok
       ok: false,
       error: { code: error.code, message: error.message, fieldErrors: error.fieldErrors },
     };
+  }
+  // Services that validate with a bare schema (e.g. notification ids and preferences):
+  // the schema's own message, never the input.
+  if (error instanceof z.ZodError) {
+    const message = error.issues[0]?.message ?? "Invalid input.";
+    return { ok: false, error: { code: "validation_failed", message, fieldErrors: {} } };
   }
   console.error("[solas] unexpected action error:", error);
   return {
