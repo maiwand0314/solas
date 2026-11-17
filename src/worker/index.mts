@@ -14,6 +14,11 @@
 // It also runs the automation scheduler (M6A), which turns due schedules into
 // ordinary tasks. Schedules live in PostgreSQL too: a stopped worker starts
 // nothing, and a run it was too late for is recorded as missed, not caught up.
+//
+// It reports its own health (M6C) in worker_instances: a heartbeat on a timer,
+// whether or not there is work, and when each step last succeeded. Settings
+// shows it. Under launchd (scripts/launchd/solas-worker.sh) a crash is
+// restarted; a graceful stop (SIGTERM, exit code 0) is not.
 
 import { randomUUID } from "node:crypto";
 import os from "node:os";
@@ -21,6 +26,8 @@ import { closeDatabase, createDatabase } from "@/server/db/client";
 import { AUTOMATION_LIMITS } from "@/lib/automations/limits";
 import { createScheduler } from "@/server/automations/scheduler";
 import { createNotificationSync } from "@/server/notifications/sync";
+import { createWorkerHealth } from "@/server/workers/health";
+import { WORKER_HEALTH } from "@/server/workers/limits";
 import { jsonLogger as log } from "@/server/logger";
 import { providerRegistry } from "@/server/providers/registry";
 import { RUN_LIMITS, prepareRuntimeDirectory, workerConcurrency } from "@/server/runs/config";
@@ -66,6 +73,9 @@ const scheduler = createScheduler({ db, providers: providerRegistry, log });
 // Notifications (M6B): the in-app inbox, derived from rows the engine already writes.
 const notifications = createNotificationSync(db);
 
+// Worker health (M6C): written by this process only, read by Settings.
+const health = createWorkerHealth({ db, workerId, hostname: os.hostname(), pid: process.pid, log });
+
 let stopping = false;
 function shutdown(signal: string) {
   if (stopping) return;
@@ -75,6 +85,10 @@ function shutdown(signal: string) {
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+// After the signal handlers, so a SIGTERM while the database is slow is still graceful.
+await health.heartbeat();
+const heartbeatTimer = setInterval(() => void health.heartbeat(), WORKER_HEALTH.heartbeatIntervalMs);
 
 log("info", "worker.started", {
   workerId,
@@ -87,11 +101,14 @@ await runWorkerLoop({
   executor,
   scheduler,
   notifications,
+  health,
   concurrency,
   limits: { ...RUN_LIMITS, schedulerIntervalMs: AUTOMATION_LIMITS.checkIntervalMs },
   log,
   shouldStop: () => stopping,
 });
 
+clearInterval(heartbeatTimer);
+await health.stopped();
 await closeDatabase(db);
 log("info", "worker.stopped");

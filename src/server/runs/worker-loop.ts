@@ -15,6 +15,15 @@ type LoopOptions = {
    * the scheduler. A failure here is logged and never stops the loop.
    */
   notifications?: { sync(): Promise<{ created: number }> };
+  /**
+   * Worker health (M6C): told when each step succeeds or fails, so the web
+   * app can show whether the scheduler, sync, and recovery actually work.
+   * It never throws; reporting can't stop the loop.
+   */
+  health?: {
+    succeeded(step: "scheduler" | "notifications" | "recovery"): Promise<void>;
+    failed(step: "scheduler" | "notifications" | "recovery" | "queue", error: unknown): Promise<void>;
+  };
   /** Runs executed at once. Claims stop while every slot is busy. */
   concurrency: number;
   limits: { pollIntervalMs: number; recoveryIntervalMs: number; schedulerIntervalMs?: number };
@@ -30,15 +39,17 @@ type LoopOptions = {
  * tries again. When asked to stop, it claims nothing new and waits for the
  * runs in progress to finish (the caller aborts them first).
  */
-export async function runWorkerLoop({ executor, scheduler, notifications, concurrency, limits, log, shouldStop }: LoopOptions): Promise<void> {
+export async function runWorkerLoop({ executor, scheduler, notifications, health, concurrency, limits, log, shouldStop }: LoopOptions): Promise<void> {
   const inFlight = new Set<Promise<void>>();
 
   async function recover() {
     try {
       const recovered = await executor.recoverStaleRuns();
       if (recovered > 0) log("warn", "worker.recovered_runs", { count: recovered });
+      await health?.succeeded("recovery");
     } catch (error) {
       log("error", "worker.recovery_failed", { error: message(error) });
+      await health?.failed("recovery", error);
     }
   }
 
@@ -47,8 +58,10 @@ export async function runWorkerLoop({ executor, scheduler, notifications, concur
     try {
       const result = await scheduler.tick();
       if (result.started + result.skipped + result.missed > 0) log("info", "worker.scheduled", result);
+      await health?.succeeded("scheduler");
     } catch (error) {
       log("error", "worker.scheduler_failed", { error: message(error) });
+      await health?.failed("scheduler", error);
     }
   }
 
@@ -57,8 +70,10 @@ export async function runWorkerLoop({ executor, scheduler, notifications, concur
     try {
       const { created } = await notifications.sync();
       if (created > 0) log("info", "worker.notified", { created });
+      await health?.succeeded("notifications");
     } catch (error) {
       log("error", "worker.notifications_failed", { error: message(error) });
+      await health?.failed("notifications", error);
     }
   }
 
@@ -96,6 +111,7 @@ export async function runWorkerLoop({ executor, scheduler, notifications, concur
       } catch (error) {
         // Usually the database is down. Keep going; it may come back.
         log("error", "worker.loop_error", { error: message(error) });
+        await health?.failed("queue", error);
         await sleep(limits.pollIntervalMs * 5);
         continue;
       }
