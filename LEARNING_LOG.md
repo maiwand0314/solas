@@ -1715,10 +1715,11 @@ decides what reaches the inbox.
   unavailable.
 - After changing Node.js versions (nvm), run `install` again.
 - A hung worker and a sleeping Mac both look "not responding".
-- `npm audit` reports a moderate advisory for Next.js 16.4.2 (fixed in
-  16.4.6) and two for `hono` (a transitive dependency); `next build`
-  sometimes stops on that advisory. Not upgraded here: dependency upgrades
-  need your approval.
+- `npm audit` reported a moderate advisory for Next.js 16.4.2, and
+  `next build` sometimes stopped on it. With your approval, `next` and
+  `eslint-config-next` were upgraded to 16.4.6 after the milestone (all
+  checks passed again). Two moderate advisories remain in `hono`, a
+  transitive dependency.
 - No real Claude run in this milestone.
 
 **Files**
