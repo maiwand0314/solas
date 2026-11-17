@@ -1663,3 +1663,112 @@ iCloud placeholders that block when read)
 - Which kinds of notification do you want to switch off?
 - Should the bell also show a count in the browser tab title?
 - Where should delivery outside the app go once the worker runs on a VPS?
+
+---
+
+## M6C — Worker operations, health, and notification preferences (2026-11-17)
+
+**Built:** The worker now reports its own health (heartbeat, start, graceful
+stop, and when its scheduler, notification sync, and recovery last worked),
+shown as a dot in the header and a Worker section in Settings; an opt-in
+macOS LaunchAgent keeps it running; and a switch per notification kind
+decides what reaches the inbox.
+
+**Concepts**
+1. **Liveness is not health.** A heartbeat proves the process is alive; it
+   doesn't prove the scheduler works. So each step records its own last
+   success, and a live worker whose step fails, or hasn't succeeded for two
+   minutes, is "degraded", not "running".
+2. **Absence as a signal.** A crashed process can't say it crashed. A
+   graceful stop writes `stopped_at`; a crash writes nothing, and the
+   heartbeat simply goes stale. The UI tells the two apart by what is
+   missing.
+3. **One writer per row.** Every worker writes only its own row (keyed by
+   its worker id), so several workers, or a restarted one, never overwrite
+   each other, and the web app only reads.
+4. **Bounded everything.** Retention (7 days, 50 failures per worker), at
+   most 20 failures waiting in memory during an outage, at most one restart
+   every 30 seconds. Unbounded logs, queues, and restart loops are how
+   small tools become operational problems.
+5. **Safe error surfaces.** Errors are stored as a code and a sentence Solas
+   wrote, never the raw message, which may contain a connection string.
+   The full error stays in the worker's log on your machine.
+6. **A watermark instead of replay.** Turning a notification kind back on
+   stores the moment (`changed_at`), and the sync only looks after it. The
+   muted period isn't replayed, and nothing else (dedupe, restart safety)
+   had to change.
+7. **Supervision by the operating system.** launchd restarts the worker
+   only after an unexpected exit (`KeepAlive.SuccessfulExit = false`). A
+   graceful stop exits 0 and stays stopped. Running node directly (with the
+   tsx loader) means launchd watches the worker itself, not a wrapper that
+   could leave an orphan behind.
+8. **Ties at clock precision.** A failure and a success in the same
+   millisecond can't be ordered once they reach JavaScript; a test that
+   failed one time in five showed it. The rule now assumes the worse
+   (failing) on a tie.
+
+**Honest limitations**
+- A LaunchAgent starts at login, not at boot, and a sleeping or switched-off
+  Mac runs nothing (missed runs are recorded, not caught up).
+- The worker needs PostgreSQL: Docker Desktop must start at login. Until the
+  database is up, the worker retries and Settings shows it as degraded or
+  unavailable.
+- After changing Node.js versions (nvm), run `install` again.
+- A hung worker and a sleeping Mac both look "not responding".
+- `npm audit` reports a moderate advisory for Next.js 16.4.2 (fixed in
+  16.4.6) and two for `hono` (a transitive dependency); `next build`
+  sometimes stops on that advisory. Not upgraded here: dependency upgrades
+  need your approval.
+- No real Claude run in this milestone.
+
+**Files**
+- New: `src/server/workers/` (`health.ts`, `status.ts`, `queries.ts`,
+  `limits.ts`, tests), `src/components/workers/` (header indicator,
+  Settings panel), `src/server/notifications/preferences.ts` (+ test),
+  `src/components/notifications/notification-preferences.tsx`,
+  `scripts/launchd/solas-worker.sh`, `docs/worker-launchd.md`,
+  `e2e/settings.spec.ts`, `drizzle/0010_worker_health_notification_preferences.sql`.
+- Changed: schema; worker loop and entry (health reporting); notification
+  sync (preference filter in the same INSERT); notification queries and
+  actions; Settings page; header; `toActionError` (Zod messages become
+  validation errors); e2e helpers; `package.json` (`worker:service`).
+- Database: migration 0010 adds `worker_instances`, `worker_failures`, and
+  `notification_preferences`. It changes and deletes nothing. 0009 and 0010
+  were applied to the development database.
+
+**How it was verified** (in `~/Developer/Solas`, the project's new home)
+- `lint`, `typecheck`, `build` pass (two build attempts stopped on the
+  Next.js advisory check, one on a type error in a new test; the retries
+  passed).
+- Vitest: 417 tests pass (35 new): idle heartbeat, stale detection, overdue
+  steps, graceful vs unexpected stop, scheduler / sync / recovery / claim
+  failures, safe failure messages, several workers, database outage and
+  recovery (nothing throws; failures saved later), retention, the
+  "unavailable" status, a crashed and a replacement worker starting a due
+  automation once; preferences (defaults, persistence, validation, muting,
+  no replay, no duplicates, read state kept, approvals unchanged).
+- Playwright: 81 tests pass (8 new): every worker state in Settings and the
+  header, safe failure messages, keyboard-only preference changes that
+  survive a reload, the approval switch's explanation, phone / tablet /
+  desktop in both themes.
+- launchd, for real, under a test label against an isolated empty database
+  (`solas_launchd_test`), so no agent could run: install → heartbeat and all
+  three steps recorded; `kill -9` → restarted, the old row left without
+  `stopped_at`; a second quick crash → restart held back until 30 s after
+  the previous start; `stop` → SIGTERM, `stopped_at` set, not restarted;
+  `start`, `restart`, `uninstall` → plist gone, no process left. The plist
+  contained no `DATABASE_URL`.
+- Not tested: autostart at a real login or reboot, sleep and wake, Docker
+  Desktop starting after the worker, and a real Claude run under launchd.
+
+**Exercise**
+- Stop PostgreSQL (`npm run db:down`) while the worker runs, watch
+  Settings (it should say "Status unavailable"), start it again, and find
+  the stored failures under "Recent problems". Then explain, from
+  `health.ts`, why they appear only after the database is back.
+
+**Questions to revisit**
+- Should the header dot stay visible when everything is fine, or only when
+  something needs attention?
+- On the VPS (M10), systemd replaces launchd: which parts of this carry
+  over unchanged?

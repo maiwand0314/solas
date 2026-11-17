@@ -351,7 +351,7 @@ Shell stays disabled.
   created in the isolated e2e database.
 - No new dependencies.
 
-**M6B — Notifications, automation limits, and team automations** *(done 2026-11-16, not committed yet)*
+**M6B — Notifications, automation limits, and team automations** *(done 2026-11-16, committed and pushed 2026-11-17)*
 - **Notification Center:** a bell with the unread count in the header and
   an inbox at `/notifications` (mark read/unread, mark all read, links to
   the task, automation, conversation, or approval). Stored in a
@@ -383,10 +383,35 @@ Shell stays disabled.
 - Not done: delivery outside the app (email, SMS, push), see
   ARCHITECTURE §5.12 for what a VPS would need.
 
-**M6C — Operating the worker** *(proposed)*
-Run the worker under a process manager so schedules survive reboots, show
-the worker's health in the app (last heartbeat, last scheduler tick), and
-let the owner choose which notification kinds they want. Before any VPS.
+**M6C — Worker operations, health, and notification preferences** *(done 2026-11-17)*
+- **Worker health:** every worker writes its own row in `worker_instances`
+  (heartbeat every 10 s on a timer, also when idle; start time; graceful
+  stop; when its scheduler, notification sync, and recovery check last
+  succeeded) and its failures in `worker_failures` (safe codes and Solas's
+  own messages, never the raw error). Several workers never share a row.
+  Retention: a worker's rows go 7 days after its last heartbeat, at most 50
+  failures per worker.
+- **Status in the app:** a dot in the header and a Worker section in
+  Settings: not seen yet, running, degraded (alive but a step fails or is
+  overdue), stopped normally, not responding (heartbeat stale), and status
+  unavailable (database unreadable). A heartbeat alone never counts as
+  running, and running tasks are never used as evidence. Read-only: no
+  endpoint starts or stops anything.
+- **Autostart (opt-in):** `scripts/launchd/solas-worker.sh` (also `npm run
+  worker:service -- …`) installs a macOS LaunchAgent for the current user:
+  install, start, stop, restart, status, logs, uninstall. Restarts only
+  after an unexpected exit, at most once every 30 s; SIGTERM stays a
+  graceful stop. The plist holds paths only; the worker reads `.env.local`
+  itself. Guide: `docs/worker-launchd.md`.
+- **Notification preferences:** a switch per notification kind in Settings,
+  all on by default, saved in `notification_preferences`. Off stops new
+  inbox entries of that kind; turning it back on never replays the muted
+  period. Approval cards, decisions, and permission checks are unchanged.
+- **Tests:** Vitest 417 (35 new), Playwright 81 (8 new). launchd verified
+  for real with a test label against an isolated, empty database
+  (crash → restart, throttled restart, graceful stop, uninstall). No real
+  Claude run in this milestone.
+- No new dependencies. Migration `0010` (additive).
 
 ### Phase 3 — Away from the laptop
 

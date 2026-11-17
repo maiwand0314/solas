@@ -1154,7 +1154,8 @@ child per task as before. A team used by an automation can't be deleted.
   the moment the last task fails.
 - Deleting an automation removes its occurrences; notifications about it
   stay, without a link.
-- Notification kinds can't be switched off individually yet.
+- Notification kinds can't be switched off individually yet (added in M6C,
+  §5.13).
 
 **External notifications on a VPS (not built).** Delivery outside the app
 needs, at least: a delivery channel with credentials held only in server
@@ -1181,6 +1182,103 @@ a service worker and VAPID keys. None of this is needed for local use.
 | `src/server/automations/scheduler.ts` | Pause after repeated failures |
 | `src/server/runs/executor.ts` | Per-task duration limit |
 | `src/lib/automations/limits.ts`, `validation.ts` | Limits and target rules shared by form and server |
+
+### 5.13 Worker health, local autostart, and notification preferences (built in M6C)
+
+**Worker health: each worker reports on itself.** The worker writes its
+own row in `worker_instances`, keyed by the worker id it already records on
+the runs it claims (`host:pid:random`), so two workers, or a restarted one,
+never write the same row. The row holds the start time, the last heartbeat,
+`stopped_at` (set only by a graceful shutdown), and when the scheduler, the
+notification sync, and the recovery check last succeeded. The heartbeat is
+a timer (every 10 s), separate from the run loop, so an idle worker still
+reports. It is an upsert, so a worker that started while PostgreSQL was down
+appears once it is back. `runWorkerLoop` reports each step through an
+optional `health` dependency (`succeeded` / `failed`); claiming runs reports
+only failures (step `queue`), because a success every second would be a
+write every second.
+
+Failures go to `worker_failures` as a code (`database_unavailable`,
+`query_failed`, `timeout`, `unexpected`) and a message Solas wrote itself,
+plus a PostgreSQL SQLSTATE when there is one. The raw error never reaches
+the database or the UI (it can hold a connection string or query values);
+it stays in the worker's JSON log. While the database is down, failures wait
+in memory (at most 20) and are saved with the first heartbeat that gets
+through. Every health write swallows its own errors: reporting can never
+stop or slow the work. Retention, applied by the worker at start and then
+hourly: a worker's row (and its failures, by cascade) is deleted 7 days
+after its last heartbeat, failures older than 7 days are deleted, and at
+most 50 are kept per worker. Thresholds live in `WORKER_HEALTH`
+(`src/server/workers/limits.ts`).
+
+**What the web app concludes** (`status.ts`, read-only, ages measured
+against the database clock):
+
+| Per worker | When |
+| --- | --- |
+| stopped | `stopped_at` is set (graceful shutdown) |
+| stale | no heartbeat for 60 s (crashed, killed, hung, or the Mac slept) |
+| degraded | alive, but a step's newest failure is at least as new as its last success, a step hasn't succeeded for 2 minutes (it may hang), or claiming runs failed in the last 2 minutes |
+| healthy | alive, and every step works (a step that hasn't completed yet within the grace period counts as starting) |
+
+Overall: `not_observed` without any row, `healthy` / `degraded` from the
+live workers (a stale or stopped one never hides a live one), `stopped`
+when none is live, and `unavailable` when the database can't be read (the
+owner-guarded query catches the error and says so instead of an error
+page). A heartbeat alone is never "running", and running tasks are never
+used as evidence of a worker. No endpoint starts, stops, or signals a
+process; the web app only reads.
+
+**Local autostart (opt-in, macOS).** `scripts/launchd/solas-worker.sh`
+generates a LaunchAgent (`~/Library/LaunchAgents/local.solas.worker.plist`)
+for the current user, in the `gui/<uid>` domain, never with sudo. It runs
+`node --import tsx --conditions=react-server --env-file=<project>/.env.local
+src/worker/index.mts` with absolute paths resolved at install time: one
+process, so launchd supervises the worker itself rather than a wrapper.
+The plist holds only paths (node, project, env file, logs) and a minimal
+`PATH`; secrets stay in `.env.local`, read by Node when the worker starts.
+`KeepAlive.SuccessfulExit = false` restarts it only after an unexpected
+exit; a graceful stop (SIGTERM → runs stopped and recorded → exit 0) stays
+stopped. `ThrottleInterval` 30 s bounds restarts; `ExitTimeOut` 30 s gives
+the shutdown time before SIGKILL. Claude Code's own sign-in is used as it is
+from a terminal; nothing is extracted. Logs: `~/Library/Logs/Solas/`.
+Limits: a LaunchAgent starts at login (not at boot), a sleeping or
+powered-off Mac runs nothing (missed runs are recorded, §5.11), and
+PostgreSQL must be running (Docker Desktop at login + the container's
+`restart: unless-stopped`); until it is, the worker keeps retrying and shows
+as degraded or unavailable. Guide: `docs/worker-launchd.md`.
+
+**Notification preferences.** `notification_preferences` (kind, enabled,
+changed_at); no row means on. The sync's single INSERT now selects into a
+subquery and skips any event whose kind is off, or whose time is not after
+`changed_at` of a kind that was turned back on. So muting creates nothing,
+re-enabling never replays the muted period, and dedupe keys and restart
+safety are unchanged. Saving the same value again doesn't move
+`changed_at`. Muting changes only the inbox: existing notifications and
+their read state stay, and approval cards, decisions, expiry, and
+permission checks don't read preferences at all. An approval that started
+waiting while its kind was muted stays out of the inbox after re-enabling;
+it is still on its task or conversation.
+
+**Known limitations.**
+- launchd is macOS only and verified for this Mac; a VPS needs systemd (M10).
+- After a Node.js version change (nvm), `install` must be run again: the
+  plist holds the absolute path of the node it was installed with.
+- An event that happens shortly before a kind is muted, and isn't synced
+  yet (up to 15 s), is not announced.
+- The web app can't tell a hung worker from a slept Mac: both look stale.
+
+**Files.**
+
+| File | Responsibility |
+| --- | --- |
+| `src/server/workers/health.ts` | Worker side: heartbeat, step results, safe failure codes, retention |
+| `src/server/workers/status.ts`, `queries.ts` | Web side: what the reports mean; owner-guarded read |
+| `src/server/workers/limits.ts` | `WORKER_HEALTH` thresholds and retention |
+| `src/components/workers/` | Header indicator and the Settings panel |
+| `src/server/notifications/preferences.ts` | Preferences (owner-guarded reads and Server Action) |
+| `src/server/notifications/sync.ts` | Preference filter in the existing sync |
+| `scripts/launchd/solas-worker.sh`, `docs/worker-launchd.md` | Opt-in LaunchAgent and its guide |
 
 ## 6. Request flows
 
@@ -1230,6 +1328,16 @@ Browser (page open) → bell and inbox re-read the database every 15 s → unrea
 Owner opens the link → task / automation / conversation; approvals are decided there, not in the inbox
 ```
 
+### 6.5 Worker health (built in M6C)
+
+```
+Worker start → upsert worker_instances (heartbeat) → timer: heartbeat every 10 s
+Worker loop → recovery · scheduler · notification sync → last_*_ok_at, or a worker_failures row
+SIGTERM → runs stopped and recorded → stopped_at → exit 0 (launchd doesn't restart)
+Crash / kill → no stopped_at → heartbeat goes stale after 60 s (launchd restarts, at most every 30 s)
+Browser (Settings, header) → owner-guarded read → healthy / degraded / stopped / not seen / unavailable
+```
+
 ## 7. Security model
 
 | Concern | Approach |
@@ -1247,6 +1355,7 @@ Owner opens the link → task / automation / conversation; approvals are decided
 | Mutations | Server Actions (origin-checked) and Route Handlers (validate `Origin` and body) |
 | Abuse and cost | Budgets per run, one concurrent run by default (at most 3), no automatic retry after a usage limit, bounded retries otherwise, rate limits (M9) |
 | Scheduled work (M6A) | Automations only create tasks, so permissions, approvals, workspaces, and timeouts apply unchanged; caps on active automations, runs per day, and concurrent automation tasks; minimum interval of an hour; no overlap; no catch-up after downtime; scheduled runs pause after a usage limit |
+| Process management (M6C) | Opt-in LaunchAgent for the current user, no sudo; the plist holds paths only, secrets stay in `.env.local`; no endpoint starts, stops, or signals a process; worker health shows only Solas-written messages, never raw errors |
 | Deployment | Security review checklist and owner approval before M10; private access preferred |
 
 ## 8. Folder structure (target)
