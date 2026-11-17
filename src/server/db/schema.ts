@@ -188,9 +188,15 @@ export const automations = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     name: text("name").notNull(),
     description: text("description").notNull().default(""),
-    agentId: uuid("agent_id")
-      .notNull()
-      .references(() => agents.id, { onDelete: "cascade" }),
+    /** The executing agent of an individual automation; null for a team automation (M6B). */
+    agentId: uuid("agent_id").references(() => agents.id, { onDelete: "cascade" }),
+    /**
+     * The team of a team automation (M6B). Each run goes to the team's
+     * coordinator, looked up when the run starts, so changing the coordinator
+     * takes effect without editing the automation. Exactly one of agent_id and
+     * team_id is set. A team with automations can't be deleted until they are.
+     */
+    teamId: uuid("team_id").references(() => teams.id, { onDelete: "restrict" }),
     /** What the agent is asked to do each run: becomes the task's instructions. */
     instructions: text("instructions").notNull(),
     /** When it runs (see src/lib/automations/schedule.ts), validated in code like providers and tools. */
@@ -208,6 +214,19 @@ export const automations = pgTable(
     nextRunAt: timestamp("next_run_at", { withTimezone: true }),
     /** The scheduled time of the last run that started a task. */
     lastRunAt: timestamp("last_run_at", { withTimezone: true }),
+    /**
+     * Per-automation limits (M6B). Null means "only the global limit". They
+     * may only be as strict as the global AUTOMATION_LIMITS or stricter
+     * (checked on save, and again when a run starts).
+     */
+    maxRunsPerDay: integer("max_runs_per_day"),
+    maxDurationMs: integer("max_duration_ms"),
+    /** False by default: a run is skipped while the previous one is still queued or running. */
+    allowOverlap: boolean("allow_overlap").notNull().default(false),
+    /** Pause the automation after this many failed runs in a row; null = never. */
+    pauseAfterFailures: integer("pause_after_failures"),
+    /** Why Solas (not the owner) paused it, in Solas's words; cleared on resume. */
+    pausedReason: text("paused_reason"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
@@ -218,6 +237,11 @@ export const automations = pgTable(
     uniqueIndex("automations_name_lower_unique").on(sql`lower(${table.name})`),
     check("automations_name_not_blank", sql`length(trim(${table.name})) > 0`),
     check("automations_paused_has_no_next_run", sql`${table.enabled} or ${table.nextRunAt} is null`),
+    check("automations_agent_xor_team", sql`(${table.agentId} is null) <> (${table.teamId} is null)`),
+    check("automations_max_runs_per_day_valid", sql`${table.maxRunsPerDay} is null or ${table.maxRunsPerDay} >= 1`),
+    check("automations_max_duration_valid", sql`${table.maxDurationMs} is null or ${table.maxDurationMs} >= 60000`),
+    check("automations_pause_after_failures_valid", sql`${table.pauseAfterFailures} is null or ${table.pauseAfterFailures} >= 1`),
+    index("automations_team_id_idx").on(table.teamId),
     // The scheduler asks "which active automations are due?"
     index("automations_due_idx").on(table.nextRunAt).where(sql`${table.enabled} and ${table.nextRunAt} is not null`),
     index("automations_agent_id_idx").on(table.agentId),
@@ -272,6 +296,11 @@ export const tasks = pgTable(
      * automation keeps the task and its history.
      */
     automationId: uuid("automation_id").references(() => automations.id, { onDelete: "set null" }),
+    /**
+     * A shorter time limit for one attempt than the global one (M6B), copied
+     * from the automation when the task is created. Null = the global limit.
+     */
+    maxDurationMs: integer("max_duration_ms"),
     /** The agent's final answer, saved when an attempt completes. */
     result: text("result"),
     /** Stable code and owner-safe message; set when the task failed or was interrupted. */
@@ -326,6 +355,10 @@ export const OCCURRENCE_SKIP_REASONS = [
   "usage_limit",
   "concurrency_limit",
   "daily_limit",
+  // M6B
+  "automation_daily_limit",
+  "team_unavailable",
+  "paused_after_failures",
 ] as const;
 export type OccurrenceSkipReason = (typeof OCCURRENCE_SKIP_REASONS)[number];
 
@@ -368,7 +401,7 @@ export const automationOccurrences = pgTable(
     ),
     check(
       "automation_occurrences_reason_valid",
-      sql`${table.reason} is null or ${table.reason} in ('overlap', 'agent_unavailable', 'usage_limit', 'concurrency_limit', 'daily_limit')`,
+      sql`${table.reason} is null or ${table.reason} in ('overlap', 'agent_unavailable', 'usage_limit', 'concurrency_limit', 'daily_limit', 'automation_daily_limit', 'team_unavailable', 'paused_after_failures')`,
     ),
   ],
 );
@@ -657,6 +690,57 @@ export const toolCalls = pgTable(
   ],
 );
 
+export const NOTIFICATION_KINDS = [
+  "task_failed",
+  "task_interrupted",
+  "automation_missed",
+  "automation_skipped",
+  "automation_paused",
+  "approval_requested",
+  "approval_expired",
+  "approval_rejected",
+] as const;
+export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
+
+/**
+ * The in-app Notification Center (M6B). Each row is derived from something
+ * that already happened in another table (a failed task, a missed run, a
+ * tool call waiting for approval) by the worker's notification sync, which
+ * is the only writer. dedupe_key names the event ("task_failed:<task id>:
+ * <attempt>") and is unique, so syncing twice, or two workers at once,
+ * can't make two notifications. Title and body are written by Solas from
+ * stored facts, never from tool input or model output, so they hold no
+ * credentials. The links are set null if the target is deleted: the
+ * notification stays, without a destination.
+ */
+export const notifications = pgTable(
+  "notifications",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    kind: text("kind", { enum: NOTIFICATION_KINDS }).notNull(),
+    dedupeKey: text("dedupe_key").notNull(),
+    title: text("title").notNull(),
+    body: text("body").notNull().default(""),
+    taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
+    automationId: uuid("automation_id").references(() => automations.id, { onDelete: "set null" }),
+    toolCallId: uuid("tool_call_id").references(() => toolCalls.id, { onDelete: "set null" }),
+    /** For an approval asked in a conversation (not a task). */
+    conversationId: uuid("conversation_id").references(() => conversations.id, { onDelete: "set null" }),
+    /** When the underlying event happened (not when Solas noticed it). */
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+    /** Null while unread. */
+    readAt: timestamp("read_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("notifications_dedupe_key_unique").on(table.dedupeKey),
+    index("notifications_inbox_idx").on(table.occurredAt),
+    index("notifications_unread_idx").on(table.occurredAt).where(sql`${table.readAt} is null`),
+    check("notifications_kind_valid", sql`${table.kind} in ('task_failed', 'task_interrupted', 'automation_missed', 'automation_skipped', 'automation_paused', 'approval_requested', 'approval_expired', 'approval_rejected')`),
+  ],
+);
+
+export type NotificationRow = typeof notifications.$inferSelect;
 export type AgentToolPermissionRow = typeof agentToolPermissions.$inferSelect;
 export type ToolCallRow = typeof toolCalls.$inferSelect;
 export type ConversationRow = typeof conversations.$inferSelect;

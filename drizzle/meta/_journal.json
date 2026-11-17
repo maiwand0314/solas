@@ -64,6 +64,13 @@
       "when": 1793805834910,
       "tag": "0008_automations",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1794867362315,
+      "tag": "0009_notifications_limits_team_automations",
+      "breakpoints": true
     }
   ]
 }
