@@ -10,6 +10,11 @@ type LoopOptions = {
    * tasks (pending runs), which this same loop then claims like any other.
    */
   scheduler?: { tick(): Promise<{ started: number; skipped: number; missed: number }> };
+  /**
+   * Notifications (M6B): derived from the database on the same interval as
+   * the scheduler. A failure here is logged and never stops the loop.
+   */
+  notifications?: { sync(): Promise<{ created: number }> };
   /** Runs executed at once. Claims stop while every slot is busy. */
   concurrency: number;
   limits: { pollIntervalMs: number; recoveryIntervalMs: number; schedulerIntervalMs?: number };
@@ -25,7 +30,7 @@ type LoopOptions = {
  * tries again. When asked to stop, it claims nothing new and waits for the
  * runs in progress to finish (the caller aborts them first).
  */
-export async function runWorkerLoop({ executor, scheduler, concurrency, limits, log, shouldStop }: LoopOptions): Promise<void> {
+export async function runWorkerLoop({ executor, scheduler, notifications, concurrency, limits, log, shouldStop }: LoopOptions): Promise<void> {
   const inFlight = new Set<Promise<void>>();
 
   async function recover() {
@@ -47,10 +52,21 @@ export async function runWorkerLoop({ executor, scheduler, concurrency, limits, 
     }
   }
 
+  async function notify() {
+    if (!notifications) return;
+    try {
+      const { created } = await notifications.sync();
+      if (created > 0) log("info", "worker.notified", { created });
+    } catch (error) {
+      log("error", "worker.notifications_failed", { error: message(error) });
+    }
+  }
+
   await recover();
   let lastRecovery = Date.now();
   // After recovery, so a restarted worker first settles what the old one left.
   await schedule();
+  await notify();
   let lastSchedule = Date.now();
 
   while (!shouldStop()) {
@@ -58,8 +74,9 @@ export async function runWorkerLoop({ executor, scheduler, concurrency, limits, 
       await recover();
       lastRecovery = Date.now();
     }
-    if (scheduler && Date.now() - lastSchedule > (limits.schedulerIntervalMs ?? 15_000)) {
+    if ((scheduler || notifications) && Date.now() - lastSchedule > (limits.schedulerIntervalMs ?? 15_000)) {
       await schedule();
+      await notify();
       lastSchedule = Date.now();
     }
 

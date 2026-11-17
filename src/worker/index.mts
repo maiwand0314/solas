@@ -20,6 +20,7 @@ import os from "node:os";
 import { closeDatabase, createDatabase } from "@/server/db/client";
 import { AUTOMATION_LIMITS } from "@/lib/automations/limits";
 import { createScheduler } from "@/server/automations/scheduler";
+import { createNotificationSync } from "@/server/notifications/sync";
 import { jsonLogger as log } from "@/server/logger";
 import { providerRegistry } from "@/server/providers/registry";
 import { RUN_LIMITS, prepareRuntimeDirectory, workerConcurrency } from "@/server/runs/config";
@@ -62,6 +63,9 @@ const executor = createRunExecutor({
 // Automations (M6A): turns due schedules into ordinary tasks for the loop below.
 const scheduler = createScheduler({ db, providers: providerRegistry, log });
 
+// Notifications (M6B): the in-app inbox, derived from rows the engine already writes.
+const notifications = createNotificationSync(db);
+
 let stopping = false;
 function shutdown(signal: string) {
   if (stopping) return;
@@ -82,6 +86,7 @@ log("info", "worker.started", {
 await runWorkerLoop({
   executor,
   scheduler,
+  notifications,
   concurrency,
   limits: { ...RUN_LIMITS, schedulerIntervalMs: AUTOMATION_LIMITS.checkIntervalMs },
   log,
