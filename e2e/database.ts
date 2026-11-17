@@ -28,9 +28,14 @@ export const {
   automations,
   automationOccurrences,
   notifications,
+  notificationPreferences,
+  workerInstances,
+  workerFailures,
 } = schema;
 
 export async function resetDatabase() {
+  await db.delete(workerInstances); // cascades to worker failures
+  await db.delete(notificationPreferences);
   await db.delete(notifications);
   await db.delete(automations); // team automations survive an agent delete, and block a team delete
   await db.delete(teams); // cascades to team membership
@@ -249,4 +254,34 @@ export async function createNotification(overrides: Partial<typeof notifications
     })
     .returning();
   return notification;
+}
+
+/**
+ * A worker's health report as a worker would have written it (M6C), with times
+ * relative to the database clock: `heartbeatSecondsAgo` 0 is a live worker.
+ */
+export async function createWorkerInstance({
+  pid = 4242,
+  heartbeatSecondsAgo = 0,
+  stopped = false,
+  stepsOk = true,
+}: { pid?: number; heartbeatSecondsAgo?: number; stopped?: boolean; stepsOk?: boolean } = {}) {
+  const id = `e2e-host:${pid}:${crypto.randomUUID().slice(0, 8)}`;
+  const at = sql`now() - make_interval(secs => ${heartbeatSecondsAgo})`;
+  await db.insert(workerInstances).values({
+    id,
+    hostname: "e2e-host",
+    pid,
+    startedAt: sql`now() - make_interval(secs => ${heartbeatSecondsAgo + 3600})`,
+    lastHeartbeatAt: at,
+    stoppedAt: stopped ? at : null,
+    lastSchedulerOkAt: stepsOk ? at : null,
+    lastNotificationsOkAt: stepsOk ? at : null,
+    lastRecoveryOkAt: stepsOk ? at : null,
+  });
+  return id;
+}
+
+export async function addWorkerFailure(workerId: string, step: schema.WorkerStep, message = "A database query failed. (PostgreSQL 42P01)") {
+  await db.insert(workerFailures).values({ workerId, step, code: "query_failed", message, occurredAt: sql`now()` });
 }
