@@ -95,7 +95,7 @@ the background.
 ### Out of scope for the MVP (planned later)
 
 - Tools beyond plain conversation, and the approval flow (M6–M7; foundation in M4A)
-- Schedules (done in M6A; one-off tasks arrived in M4B)
+- Schedules (done in M6A; one-off tasks arrived in M4B); in-app notifications (M6B)
 - Authentication (M9) — required before any network exposure
 - Deployment / phone access (M10)
 - Integrations, notifications, multi-agent collaboration (M11+)
@@ -351,12 +351,42 @@ Shell stays disabled.
   created in the isolated e2e database.
 - No new dependencies.
 
-**M6B — Automation follow-through** *(proposed)*
-Knowing what happened without watching the page: an in-app inbox (or
-local notification) for failed and missed runs and for approvals waiting
-on a scheduled task; per-automation run limits; optionally giving an
-automation's tasks to a team. Before any VPS: run the worker under a
-process manager so schedules survive reboots.
+**M6B — Notifications, automation limits, and team automations** *(done 2026-11-16, not committed yet)*
+- **Notification Center:** a bell with the unread count in the header and
+  an inbox at `/notifications` (mark read/unread, mark all read, links to
+  the task, automation, conversation, or approval). Stored in a
+  `notifications` table that the worker's sync fills from rows the engine
+  already writes; one unique key per event, so nothing repeats and a
+  restarted worker catches up. In-app only: nothing is delivered while
+  the browser is closed.
+- **Events covered:** failed and interrupted tasks (which includes a lost
+  worker that wasn't safe to repeat), missed runs, runs skipped because no
+  agent or coordinator could work, automations paused after repeated
+  failures, approvals waiting, expired, or rejected. Approving needs no
+  notification, and the approve/reject controls stay where they were (the
+  task and conversation pages), with the same backend checks.
+- **Per-automation limits:** runs per day, minutes per run, overlapping
+  runs (default off), and pause after N failures in a row. The global
+  `AUTOMATION_LIMITS` stay hard upper bounds: the form, the server schema,
+  the scheduler, and the executor each apply the stricter of the two, and
+  the database refuses nonsense. Every skip or pause is recorded with its
+  reason.
+- **Team automations:** an automation runs one agent or a team. A team's
+  coordinator is looked up when each run starts (so changing it works
+  without editing the automation); the task keeps the team link. Disabled
+  or missing coordinators skip the run and record why. Membership grants
+  nothing: delegation stays M5A's explicit targets, one child per task.
+  A team used by an automation can't be deleted.
+- **Tests:** Vitest 382 (51 new), Playwright 73 (12 new). No real Claude
+  run was made in this milestone.
+- No new dependencies. Migration `0009` (additive).
+- Not done: delivery outside the app (email, SMS, push), see
+  ARCHITECTURE §5.12 for what a VPS would need.
+
+**M6C — Operating the worker** *(proposed)*
+Run the worker under a process manager so schedules survive reboots, show
+the worker's health in the app (last heartbeat, last scheduler tick), and
+let the owner choose which notification kinds they want. Before any VPS.
 
 ### Phase 3 — Away from the laptop
 

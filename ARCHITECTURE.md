@@ -1065,6 +1065,123 @@ nobody gives expires after 5 minutes and the tool never runs.
 | `src/server/runs/worker-loop.ts`, `src/worker/index.mts` | The scheduler's place in the worker loop |
 | `src/components/automations/` | List, form with preview, detail with history, controls |
 
+### 5.12 Notifications, automation limits, and team automations (built in M6B)
+
+**Notifications are derived, never the source of truth.** The tables that
+already record what happened (`tasks`, `automation_occurrences`,
+`tool_calls`) stay authoritative. `src/server/notifications/sync.ts` runs in
+the worker loop on the scheduler's interval and, for each kind of event,
+runs one `INSERT ... SELECT ... ON CONFLICT (dedupe_key) DO NOTHING` into
+`notifications`:
+
+| Kind | From | Dedupe key |
+| --- | --- | --- |
+| `task_failed`, `task_interrupted` | `tasks` in a failed or interrupted state | `task:<id>:<status>:<finished_at>` (a retry that fails again is a new event) |
+| `automation_missed` | `automation_occurrences` with status `missed` | `occurrence:<id>` |
+| `automation_skipped`, `automation_paused` | `skipped` occurrences with reason `agent_unavailable`, `team_unavailable`, or `paused_after_failures` | `occurrence:<id>` |
+| `approval_requested` | `tool_calls` awaiting approval whose window is still open | `approval_requested:<tool call id>` |
+| `approval_expired`, `approval_rejected` | `tool_calls` that ended that way | `approval_expired:<id>`, `approval_rejected:<id>` |
+
+Overlap, usage limit, and run-cap skips are the safeguards working as
+designed, so they stay in the automation's history without a notification.
+
+- **Idempotent and restart-safe.** The unique index on `dedupe_key` makes a
+  second sync, or several workers syncing at once, create nothing new.
+  Nothing waits in memory: a worker that was down catches up on the next
+  pass. Only events from the last 48 hours are considered, so the first
+  pass after an upgrade doesn't bury the owner in old history.
+- **No sensitive content.** Titles and bodies are built from names, codes,
+  and Solas's own messages. Tool input, tool output, and model text are
+  never copied. The links (`task_id`, `automation_id`, `tool_call_id`,
+  `conversation_id`) are `ON DELETE SET NULL`: a notification outlives its
+  target, without a destination.
+- **Read state** is `read_at` (null = unread) and only changes through
+  Server Actions that call `requireOwner()`. Opening a notification's
+  target also marks it read.
+- **The web app only reads.** The bell (a Server Component in the header)
+  and the inbox poll the database every 15 seconds while a page is open.
+  There is no push channel.
+
+**Approval notification lifecycle.** The worker creates a request
+notification while the tool call is `awaiting_approval` and not past
+`approval_expires_at`. The inbox joins the live tool call, so the same
+notification later reads "Waiting for your decision", "Approved",
+"Rejected", or "Expired" by the database clock, even before the worker has
+recorded the expiry. "Review" opens the task or conversation, where the
+existing approve/reject controls and their backend checks (owner guard,
+status still `awaiting_approval`, not expired) are the only way to decide.
+Notifications never approve, reject, or run anything.
+
+**Per-automation limits.** Columns on `automations`: `max_runs_per_day`,
+`max_duration_ms`, `allow_overlap` (default false), `pause_after_failures`,
+and `paused_reason`; `tasks.max_duration_ms` carries the duration to the
+worker. Each is enforced where it can really act:
+
+| Limit | Enforced by |
+| --- | --- |
+| Runs per day | `checkCanStart` counts the automation's tasks in 24 h against `min(automation, global)` |
+| Overlap | `checkCanStart` skips the overlap check only if `allow_overlap`; global concurrency still applies |
+| Minutes per run | Copied to the task; the executor's deadline is `min(global task timeout, task limit)` |
+| Pause after N failures | The scheduler pauses the automation instead of starting a run when the last N finished tasks all failed or were interrupted (cancelled or completed breaks the streak); Run now is still allowed |
+
+The global limits are upper bounds at every layer: the Zod schema (shared
+with the form) rejects looser values, the database has `CHECK` constraints,
+the runtime takes the minimum, and a test pins
+`AUTOMATION_LIMITS.maxDurationMs` to the worker's task timeout. Skips use
+new reasons (`automation_daily_limit`, `team_unavailable`,
+`paused_after_failures`) in `automation_occurrences`; an automatic pause
+also sets `paused_reason`, shown on the detail page and cleared on resume.
+
+**Team automations.** `automations.team_id` (restrict) or `agent_id`, never
+both (`CHECK`). `resolveAgent` in `start.ts` picks the executing agent for
+every run: the automation's agent, or the team's current coordinator. A
+missing team, no coordinator, or a disabled coordinator skips the run with a
+recorded reason. The created task gets `team_id` (fixed at creation, like
+M5B), so history stays with the team even if the coordinator changes. The
+automation grants no tools and no delegation: the coordinator uses only its
+own M4A tool permissions and M5A delegation targets, with depth 1 and one
+child per task as before. A team used by an automation can't be deleted.
+
+**Known limitations.**
+- Notifications reach only a page that is open. Nothing is sent when the
+  browser is closed.
+- A notification is created at most one sync interval (15 s) after the
+  event; an approval decided inside that interval is never announced.
+- Failures of crash recovery itself are logged, not stored, so they have no
+  notification. A task that recovery could not retry shows up as
+  interrupted.
+- The "paused after failures" check runs when the next run is due, not at
+  the moment the last task fails.
+- Deleting an automation removes its occurrences; notifications about it
+  stay, without a link.
+- Notification kinds can't be switched off individually yet.
+
+**External notifications on a VPS (not built).** Delivery outside the app
+needs, at least: a delivery channel with credentials held only in server
+environment variables (an SMTP or transactional-email provider, a push
+service, or a chat webhook); a `notification_deliveries` table
+(notification, channel, status, attempts) so each event is sent once and
+retries are bounded, with the same dedupe-key idea; a worker step that sends
+pending deliveries and never retries a send whose outcome is unknown;
+owner-controlled settings (channels, kinds, quiet hours); links that point
+at the real public address (so M9 authentication and M10 HTTPS must exist
+first); and contents limited to what notifications already hold, because
+email and push pass through third parties. Web Push would additionally need
+a service worker and VAPID keys. None of this is needed for local use.
+
+**Files.**
+
+| File | Responsibility |
+| --- | --- |
+| `src/server/notifications/sync.ts` | Worker-side derivation of notifications, idempotent |
+| `src/server/notifications/service.ts`, `queries.ts` | Inbox, unread count, read state (owner-guarded reads) |
+| `src/app/(app)/notifications/` | Inbox page and Server Actions |
+| `src/components/notifications/` | Header bell and inbox list |
+| `src/server/automations/start.ts` | Executor resolution (agent or coordinator) and every start check |
+| `src/server/automations/scheduler.ts` | Pause after repeated failures |
+| `src/server/runs/executor.ts` | Per-task duration limit |
+| `src/lib/automations/limits.ts`, `validation.ts` | Limits and target rules shared by form and server |
+
 ## 6. Request flows
 
 ### 6.1 Sending a message
@@ -1102,6 +1219,15 @@ Worker, every 15 s → due automations, each locked with FOR UPDATE SKIP LOCKED
   → next_run_at moves on
 Worker run loop → claims the task's run like any other → normal task flow (§5.8)
 Browser → the automation's history links each run to its task
+```
+
+### 6.4 A failure or an approval reaches the inbox (built in M6B)
+
+```
+Engine writes the event as before (task failed · run skipped · tool call awaiting approval)
+Worker, every 15 s → notification sync: INSERT ... ON CONFLICT (dedupe_key) DO NOTHING
+Browser (page open) → bell and inbox re-read the database every 15 s → unread count, new row
+Owner opens the link → task / automation / conversation; approvals are decided there, not in the inbox
 ```
 
 ## 7. Security model

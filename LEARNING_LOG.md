@@ -1578,3 +1578,88 @@ each started run opens its task.
   instead of waiting for the next time?
 - Where should notifications for missed runs and waiting approvals live:
   in the app, or on the phone?
+
+## M6B — Notifications, automation limits, and team automations (2026-11-16)
+
+**Built:** A bell in the header and an inbox for what needs you (failed
+tasks, missed or paused automations, approvals waiting, expired, or
+rejected); per-automation limits (runs per day, minutes per run, overlap,
+pause after repeated failures); and automations that run through a team's
+coordinator instead of one agent.
+
+**Concepts**
+1. **Derived data.** A notification is a summary of something another table
+   already says. The worker's sync reads those tables and inserts what's
+   missing, so nothing has to remember to notify at the right moment, and
+   a worker that was off catches up when it starts again.
+2. **Idempotence with a unique key.** Every event gets a name (the
+   `dedupe_key`), and the database refuses a second row with that name.
+   `ON CONFLICT DO NOTHING` turns "did I already do this?" into a question
+   PostgreSQL answers atomically, which is why six syncs at once still make
+   one notification.
+3. **Show the live state, not the state at the time.** An approval
+   notification joins the tool call, so it says "Expired" by itself when
+   the time runs out. Stored text says what happened; the current status
+   comes from the source.
+4. **Limits as layers.** A looser limit than the global one is stopped in
+   the form, the server schema, the database, and the runtime (each takes
+   the smaller value), so no single check is the only thing keeping the
+   rule.
+5. **Resolve late.** A team automation stores the team, not the
+   coordinator. The coordinator is looked up when a run starts, so edits
+   to the team take effect and a missing coordinator is a recorded skip,
+   not a broken schedule.
+6. **Permissions aren't inherited.** Being in a team still grants no
+   tools and no delegation; a test counts the permission rows before and
+   after.
+
+**Honest limitations**
+- The inbox only reaches a page that is open (15 s polling). Nothing is
+  sent while the browser is closed; ARCHITECTURE §5.12 lists what real
+  delivery on a VPS would need.
+- Recovery that fails inside the worker is logged, not stored, so it has
+  no notification of its own.
+- Pausing after failures is checked when the next run is due.
+- No real Claude run was made; every test uses the fake runtime.
+
+**Files**
+- New: `src/server/notifications/` (`sync.ts`, `service.ts`, `queries.ts`,
+  tests), `src/app/(app)/notifications/`, `src/components/notifications/`,
+  `src/server/automations/limits-and-teams.test.ts`,
+  `e2e/notifications.spec.ts`, `drizzle/0009_notifications_limits_team_automations.sql`.
+- Changed: schema; `start.ts`, `scheduler.ts`, `service.ts` (automations);
+  executor and task execution (duration); worker loop and entry; team
+  service (delete guard); the automation form, detail, list, and pages;
+  validation and limits; header; icons; load errors; e2e helpers.
+- Database: migration 0009 adds `notifications`, columns on `automations`
+  and `tasks`, new `CHECK` values, and a nullable `agent_id`. It deletes
+  nothing.
+
+**How it was verified** (in a copy of the project with its own
+`node_modules`, because many of this folder's own `node_modules` files are
+iCloud placeholders that block when read)
+- `typecheck`, `lint`, and `build` pass.
+- Vitest: 382 tests pass (51 new): notification sync (failed, interrupted,
+  retried, old, deleted target; missed and skipped runs; approvals open,
+  decided, expired, rejected, in a conversation; no tool input in the
+  text; restart; catching up; concurrent syncs; read state); limits
+  (validation, never looser than global, daily cap, overlap, global caps
+  still apply, duration stops a run, pause after failures, Run now after a
+  pause); team automations (create, coordinator selection and change,
+  disabled or removed coordinator, no permissions granted, team delete
+  guard, racing schedulers, restart).
+- Playwright: 73 tests pass (12 new): bell and inbox, read state after
+  reload, opening a task, approval review and expiry, keyboard, empty
+  state, phone and tablet in both themes, a team automation with limits,
+  rejected limits.
+- Not done: a real Claude run, and manual checks in your own browser.
+
+**Exercise**
+- Add a notification when a task has been `awaiting_approval` for more than
+  two minutes without the page being open. Decide where the sync should
+  look, what the key is, and write a test that two syncs make one row.
+
+**Questions to revisit**
+- Which kinds of notification do you want to switch off?
+- Should the bell also show a count in the browser tab title?
+- Where should delivery outside the app go once the worker runs on a VPS?
