@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { AUTOMATION_LIMITS } from "@/lib/automations/limits";
 import type { ReactNode } from "react";
 import { Markdown } from "@/components/conversations/markdown";
 import { PencilIcon } from "@/components/icons";
@@ -21,9 +22,12 @@ const RESULT_PREVIEW_CHARS = 4_000;
  * opens its task). Refreshes itself while a run is in progress.
  */
 export function AutomationDetail({ detail }: { detail: AutomationDetailData }) {
-  const { automation, state, scheduleText, agent, upcoming, history, latestResult, hasActiveRun, counts } = detail;
+  const { automation, state, scheduleText, agent, team, upcoming, history, latestResult, hasActiveRun, counts } = detail;
   const zone = automation.timeZone;
   const target = { id: automation.id, name: automation.name };
+  // Who does the work: the agent, or the team's current coordinator.
+  const worker = agent ?? team?.coordinator ?? null;
+  const workerName = worker?.name ?? "the team";
   const missedOnce = state === "missed" ? history.find((occurrence) => occurrence.status === "missed") : undefined;
 
   return (
@@ -39,7 +43,7 @@ export function AutomationDetail({ detail }: { detail: AutomationDetailData }) {
               Edit
             </Link>
             {state !== "finished" && state !== "missed" && <PauseResumeButton automation={target} enabled={automation.enabled} />}
-            <RunNowButton automation={target} agentName={agent.name} />
+            <RunNowButton automation={target} agentName={workerName} />
           </div>
         }
       />
@@ -50,7 +54,7 @@ export function AutomationDetail({ detail }: { detail: AutomationDetailData }) {
             title="The one-time run was missed"
             actions={
               <>
-                <RunNowButton automation={target} agentName={agent.name} variant="primary" />
+                <RunNowButton automation={target} agentName={workerName} variant="primary" />
                 <Link href={`/automations/${automation.id}/edit`} className={buttonClassName({ size: "sm" })}>
                   Choose a new time
                 </Link>
@@ -61,11 +65,22 @@ export function AutomationDetail({ detail }: { detail: AutomationDetailData }) {
             run never starts late on its own: run it now, or choose a new time.
           </Callout>
         )}
-        {agent.readiness !== "ready" && automation.enabled && (
-          <Callout title={`${agent.name} can’t run tasks right now`}>
-            {agent.readiness === "disabled" ? "The agent is disabled" : "The agent has no available model"}, so
+        {automation.pausedReason && !automation.enabled && (
+          <Callout title="Solas paused this automation">{automation.pausedReason}</Callout>
+        )}
+        {team && !team.coordinator && automation.enabled && (
+          <Callout title={`${team.name} has no coordinator`}>
+            Scheduled runs are skipped (and recorded below) until the team has one.{" "}
+            <Link href={`/teams/${team.id}`} className="text-foreground underline underline-offset-2">
+              Open the team
+            </Link>
+          </Callout>
+        )}
+        {worker && "readiness" in worker && worker.readiness !== "ready" && automation.enabled && (
+          <Callout title={`${worker.name} can’t run tasks right now`}>
+            {worker.readiness === "disabled" ? "The agent is disabled" : "The agent has no available model"}, so
             scheduled runs are skipped (and recorded below) until that’s fixed.{" "}
-            <Link href={`/agents/${agent.id}/edit`} className="text-foreground underline underline-offset-2">
+            <Link href={`/agents/${worker.id}/edit`} className="text-foreground underline underline-offset-2">
               Open the agent
             </Link>
           </Callout>
@@ -78,11 +93,31 @@ export function AutomationDetail({ detail }: { detail: AutomationDetailData }) {
             <Item label="State">
               <AutomationStateBadge state={state} />
             </Item>
-            <Item label="Agent">
-              <Link href={`/agents/${agent.id}`} className="underline-offset-2 hover:underline">
-                {agent.name}
-              </Link>
-            </Item>
+            {agent && (
+              <Item label="Agent">
+                <Link href={`/agents/${agent.id}`} className="underline-offset-2 hover:underline">
+                  {agent.name}
+                </Link>
+              </Item>
+            )}
+            {team && (
+              <>
+                <Item label="Team">
+                  <Link href={`/teams/${team.id}`} className="underline-offset-2 hover:underline">
+                    {team.name}
+                  </Link>
+                </Item>
+                <Item label="Coordinator">
+                  {team.coordinator ? (
+                    <Link href={`/agents/${team.coordinator.id}`} className="underline-offset-2 hover:underline">
+                      {team.coordinator.name}
+                    </Link>
+                  ) : (
+                    "None: runs are skipped"
+                  )}
+                </Item>
+              </>
+            )}
             <Item label="Repeats">{scheduleText}</Item>
             <Item label="Time zone">{zone.replaceAll("_", " ")}</Item>
             <Item label="Next run">
@@ -114,6 +149,22 @@ export function AutomationDetail({ detail }: { detail: AutomationDetailData }) {
               </ol>
             </div>
           )}
+        </Section>
+
+        <Section
+          title="Limits"
+          description="Checked by the scheduler before each run and by the worker while it runs. Solas’s own limits always apply on top."
+        >
+          <dl className="grid gap-x-6 gap-y-3 text-sm sm:grid-cols-2">
+            <Item label="Runs per day">{automation.maxRunsPerDay ?? `Solas’s limit (${AUTOMATION_LIMITS.maxRunsPerDay} across all)`}</Item>
+            <Item label="Time per run">
+              {automation.maxDurationMs ? `${automation.maxDurationMs / 60_000} minutes` : `Solas’s limit (${AUTOMATION_LIMITS.maxDurationMs / 60_000} minutes)`}
+            </Item>
+            <Item label="Overlapping runs">{automation.allowOverlap ? "Allowed" : "Not allowed"}</Item>
+            <Item label="Pause after failures">
+              {automation.pauseAfterFailures ? `${automation.pauseAfterFailures} in a row` : "Never"}
+            </Item>
+          </dl>
         </Section>
 
         <Section title="Task instructions" description="What the agent is asked to do on every run.">

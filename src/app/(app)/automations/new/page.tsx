@@ -6,7 +6,7 @@ import { AutomationForm, AutomationFormSkeleton } from "@/components/automations
 import { LoadError } from "@/components/load-error";
 import { PageHeader } from "@/components/ui/page-header";
 import { timeZoneNames } from "@/lib/automations/schedule";
-import { automationAgentOptions } from "../agent-options";
+import { automationAgentOptions, automationTeamOptions } from "../agent-options";
 
 export const metadata: Metadata = {
   title: "New automation",
@@ -18,7 +18,7 @@ export default function NewAutomationPage() {
       <BackLink href="/automations">Automations</BackLink>
       <PageHeader
         title="New automation"
-        description="Choose an agent, what it should do, and when. Each run becomes a task in the normal queue."
+        description="Choose an agent or a team, what it should do, and when. Each run becomes a task in the normal queue."
       />
       <Suspense fallback={<AutomationFormSkeleton />}>
         <NewAutomationForm />
@@ -28,12 +28,13 @@ export default function NewAutomationPage() {
 }
 
 async function NewAutomationForm() {
-  let agents;
+  let agents, teams;
   try {
     agents = await automationAgentOptions();
+    teams = await automationTeamOptions(agents);
   } catch (error) {
     unstable_rethrow(error);
     return <LoadError error={error} />;
   }
-  return <AutomationForm mode="create" agents={agents} timeZones={timeZoneNames()} />;
+  return <AutomationForm mode="create" agents={agents} teams={teams} timeZones={timeZoneNames()} />;
 }

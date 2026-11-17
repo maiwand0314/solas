@@ -17,7 +17,7 @@ import { toast } from "@/components/ui/toast";
 import { useNow } from "@/components/use-now";
 import type { FieldErrors } from "@/lib/agents/validation";
 import { AUTOMATION_LIMITS, DEFAULT_TIME_ZONE } from "@/lib/automations/limits";
-import { scheduleFromValues, valuesFromSchedule, type AutomationFormValues } from "@/lib/automations/form-values";
+import { optionalNumber, scheduleFromValues, valuesFromSchedule, type AutomationFormValues } from "@/lib/automations/form-values";
 import { WEEKDAYS, formatInTimeZone, maxRunsPerDay, upcomingRuns, type ScheduleKind, type Weekday } from "@/lib/automations/schedule";
 import { automationSchema, scheduleSchema } from "@/lib/automations/validation";
 import { TASK_LIMITS } from "@/lib/tasks/validation";
@@ -25,10 +25,14 @@ import { TASK_LIMITS } from "@/lib/tasks/validation";
 /** An agent the automation can use. Only ready agents can be chosen (plus the current one when editing). */
 export type AutomationAgentOption = { id: string; name: string; role: string; ready: boolean };
 
+/** A team the automation can use: its coordinator does the work, so a team without a ready one can't be chosen. */
+export type AutomationTeamOption = { id: string; name: string; coordinatorName: string | null; ready: boolean };
+
 type Values = AutomationFormValues;
 
 type AutomationFormProps = {
   agents: AutomationAgentOption[];
+  teams: AutomationTeamOption[];
   /** Time zone names, from the server so both sides list the same ones. */
   timeZones: string[];
 } & ({ mode: "create"; automation?: undefined } | { mode: "edit"; automation: { id: string } & Values });
@@ -41,7 +45,7 @@ const KINDS: { id: ScheduleKind; label: string }[] = [
   { id: "once", label: "Once" },
 ];
 
-const FIELD_ORDER = ["name", "description", "agentId", "instructions", "schedule", "timeZone"] as const;
+const FIELD_ORDER = ["name", "description", "agentId", "teamId", "instructions", "schedule", "timeZone"] as const;
 
 /**
  * Create or edit an automation: what the agent should do and when. Checks
@@ -49,7 +53,7 @@ const FIELD_ORDER = ["name", "description", "agentId", "instructions", "schedule
  * that need the clock and the database). The preview shows the next runs
  * if it were saved now, computed with the same code the worker uses.
  */
-export function AutomationForm({ mode, automation, agents, timeZones }: AutomationFormProps) {
+export function AutomationForm({ mode, automation, agents, teams, timeZones }: AutomationFormProps) {
   const router = useRouter();
   const idPrefix = useId();
   const fieldId = (field: string) => `${idPrefix}-${field}`;
@@ -58,8 +62,14 @@ export function AutomationForm({ mode, automation, agents, timeZones }: Automati
       automation ?? {
         name: "",
         description: "",
+        targetKind: "agent",
         agentId: agents.find((agent) => agent.ready)?.id ?? "",
+        teamId: teams.find((team) => team.ready)?.id ?? "",
         instructions: "",
+        maxRunsPerDay: "",
+        maxDurationMinutes: "",
+        allowOverlap: false,
+        pauseAfterFailures: "",
         ...valuesFromSchedule({ kind: "daily", time: "08:00" }),
         timeZone: DEFAULT_TIME_ZONE,
         enabled: true,
@@ -76,11 +86,17 @@ export function AutomationForm({ mode, automation, agents, timeZones }: Automati
   const toInput = (from: Values) => ({
     name: from.name,
     description: from.description,
-    agentId: from.agentId,
+    targetKind: from.targetKind,
+    agentId: from.targetKind === "agent" ? from.agentId : null,
+    teamId: from.targetKind === "team" ? from.teamId : null,
     instructions: from.instructions,
     schedule: scheduleFromValues(from),
     timeZone: from.timeZone,
     enabled: from.enabled,
+    maxRunsPerDay: optionalNumber(from.maxRunsPerDay),
+    maxDurationMinutes: optionalNumber(from.maxDurationMinutes),
+    allowOverlap: from.allowOverlap,
+    pauseAfterFailures: optionalNumber(from.pauseAfterFailures),
   });
   const dirty = JSON.stringify(toInput(values)) !== JSON.stringify(toInput(initial));
   useUnsavedChangesGuard(dirty && !saved);
@@ -142,6 +158,8 @@ export function AutomationForm({ mode, automation, agents, timeZones }: Automati
     now !== null && validSchedule ? upcomingRuns(schedule, values.timeZone, new Date(now), new Date(now), 3) : [];
   const perDay = validSchedule ? maxRunsPerDay(schedule) : null;
   const selectable = agents.filter((agent) => agent.ready || agent.id === initial.agentId);
+  const selectableTeams = teams.filter((team) => team.ready || team.id === initial.teamId);
+  const chosenTeam = teams.find((team) => team.id === values.teamId);
 
   return (
     <form onSubmit={onSubmit} noValidate aria-busy={pending} className="flex max-w-2xl flex-col gap-6">
@@ -181,29 +199,79 @@ export function AutomationForm({ mode, automation, agents, timeZones }: Automati
       </Field>
 
       <Field
-        id={fieldId("agentId")}
-        label="Agent"
+        id={fieldId("targetKind")}
+        label="Run with"
         required
-        hint="Each run is a task for this agent, with its own tools and approvals."
-        error={errorFor("agentId")}
+        hint="A team’s coordinator does the work. Being in a team grants no extra tools or delegation: those stay as set on each agent."
       >
         <Select
-          name="agentId"
-          {...fieldAria(fieldId("agentId"), { hint: true, error: errorFor("agentId") })}
-          value={values.agentId}
-          onChange={(event) => setField("agentId", event.target.value)}
-          disabled={selectable.length === 0}
+          name="targetKind"
+          id={fieldId("targetKind")}
+          value={values.targetKind}
+          onChange={(event) => setField("targetKind", event.target.value as Values["targetKind"])}
         >
-          {selectable.length === 0 && <option value="">No agent can run tasks yet</option>}
-          {selectable.map((agent) => (
-            <option key={agent.id} value={agent.id}>
-              {agent.name}
-              {agent.role ? ` — ${agent.role}` : ""}
-              {agent.ready ? "" : " (can’t run now)"}
-            </option>
-          ))}
+          <option value="agent">Individual agent</option>
+          <option value="team" disabled={teams.length === 0 && initial.targetKind !== "team"}>
+            AI team{teams.length === 0 ? " (no teams yet)" : ""}
+          </option>
         </Select>
       </Field>
+
+      {values.targetKind === "agent" ? (
+        <Field
+          id={fieldId("agentId")}
+          label="Agent"
+          required
+          hint="Each run is a task for this agent, with its own tools and approvals."
+          error={errorFor("agentId")}
+        >
+          <Select
+            name="agentId"
+            {...fieldAria(fieldId("agentId"), { hint: true, error: errorFor("agentId") })}
+            value={values.agentId}
+            onChange={(event) => setField("agentId", event.target.value)}
+            disabled={selectable.length === 0}
+          >
+            {selectable.length === 0 && <option value="">No agent can run tasks yet</option>}
+            {selectable.map((agent) => (
+              <option key={agent.id} value={agent.id}>
+                {agent.name}
+                {agent.role ? ` — ${agent.role}` : ""}
+                {agent.ready ? "" : " (can’t run now)"}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      ) : (
+        <Field
+          id={fieldId("teamId")}
+          label="Team"
+          required
+          hint={
+            chosenTeam?.coordinatorName
+              ? `Each run starts with the coordinator, ${chosenTeam.coordinatorName}. It can hand work on only to agents it is already allowed to delegate to.`
+              : "Each run starts with the team’s coordinator."
+          }
+          error={errorFor("teamId")}
+        >
+          <Select
+            name="teamId"
+            {...fieldAria(fieldId("teamId"), { hint: true, error: errorFor("teamId") })}
+            value={values.teamId}
+            onChange={(event) => setField("teamId", event.target.value)}
+            disabled={selectableTeams.length === 0}
+          >
+            {selectableTeams.length === 0 && <option value="">No team has a coordinator that can run tasks</option>}
+            {selectableTeams.map((team) => (
+              <option key={team.id} value={team.id}>
+                {team.name}
+                {team.coordinatorName ? ` — coordinator ${team.coordinatorName}` : " — no coordinator"}
+                {team.ready ? "" : " (can’t run now)"}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      )}
 
       <Field
         id={fieldId("instructions")}
@@ -386,6 +454,71 @@ export function AutomationForm({ mode, automation, agents, timeZones }: Automati
           ) : (
             <p className="text-muted">Complete the schedule to see when it runs.</p>
           )}
+        </div>
+      </fieldset>
+
+      <fieldset className="flex flex-col gap-4 rounded-lg border border-border bg-surface p-4">
+        <legend className="px-1 text-sm font-medium">Limits</legend>
+        <p className="text-sm text-muted">
+          Optional. They can only be stricter than Solas’s own limits (at most {AUTOMATION_LIMITS.maxRunsPerDay} runs a day across all
+          automations, {AUTOMATION_LIMITS.maxDurationMs / 60_000} minutes per run), never looser. Leave a box empty to use only those.
+        </p>
+        <div className="grid gap-4 sm:grid-cols-3">
+          <Field id={fieldId("maxRunsPerDay")} label="Runs per day" error={errorFor("maxRunsPerDay")}>
+            <Input
+              name="maxRunsPerDay"
+              {...fieldAria(fieldId("maxRunsPerDay"), { error: errorFor("maxRunsPerDay") })}
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={AUTOMATION_LIMITS.maxRunsPerDay}
+              value={values.maxRunsPerDay}
+              onChange={(event) => setField("maxRunsPerDay", event.target.value)}
+            />
+          </Field>
+          <Field id={fieldId("maxDurationMinutes")} label="Minutes per run" error={errorFor("maxDurationMinutes")}>
+            <Input
+              name="maxDurationMinutes"
+              {...fieldAria(fieldId("maxDurationMinutes"), { error: errorFor("maxDurationMinutes") })}
+              type="number"
+              inputMode="numeric"
+              min={AUTOMATION_LIMITS.minDurationMs / 60_000}
+              max={AUTOMATION_LIMITS.maxDurationMs / 60_000}
+              value={values.maxDurationMinutes}
+              onChange={(event) => setField("maxDurationMinutes", event.target.value)}
+            />
+          </Field>
+          <Field id={fieldId("pauseAfterFailures")} label="Pause after failures" error={errorFor("pauseAfterFailures")}>
+            <Input
+              name="pauseAfterFailures"
+              {...fieldAria(fieldId("pauseAfterFailures"), { error: errorFor("pauseAfterFailures") })}
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={AUTOMATION_LIMITS.maxPauseAfterFailures}
+              value={values.pauseAfterFailures}
+              onChange={(event) => setField("pauseAfterFailures", event.target.value)}
+            />
+          </Field>
+        </div>
+        <div className="flex items-start gap-3">
+          <Switch
+            id={fieldId("allowOverlap")}
+            checked={values.allowOverlap}
+            onCheckedChange={(checked) => setField("allowOverlap", checked)}
+            aria-labelledby={`${fieldId("allowOverlap")}-label`}
+            aria-describedby={`${fieldId("allowOverlap")}-hint`}
+          />
+          <div>
+            <p id={`${fieldId("allowOverlap")}-label`} className="text-sm font-medium">
+              {values.allowOverlap ? "Overlapping runs allowed" : "No overlapping runs"}
+            </p>
+            <p id={`${fieldId("allowOverlap")}-hint`} className="text-sm text-muted">
+              {values.allowOverlap
+                ? "A new run may start while the previous one is still queued or running. The global concurrency limit still applies."
+                : "A run is skipped, and recorded in the history, if the previous one hasn’t finished."}
+            </p>
+          </div>
         </div>
       </fieldset>
 

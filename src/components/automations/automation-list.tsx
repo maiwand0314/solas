@@ -37,7 +37,11 @@ export function AutomationList({ automations }: { automations: AutomationSummary
               <p className="mt-0.5 line-clamp-2 text-sm text-muted md:line-clamp-1">{automation.description}</p>
             )}
             <p className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-xs text-subtle">
-              <span>{automation.agent.name}</span>
+              <span>
+                {automation.team
+                  ? `Team ${automation.team.name} · ${automation.team.coordinator ? `coordinator ${automation.team.coordinator.name}` : "no coordinator"}`
+                  : automation.agent?.name}
+              </span>
               <span>
                 {automation.scheduleText} · {automation.timeZone.replaceAll("_", " ")}
               </span>
