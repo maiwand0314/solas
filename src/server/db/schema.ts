@@ -741,6 +741,88 @@ export const notifications = pgTable(
 );
 
 export type NotificationRow = typeof notifications.$inferSelect;
+
+/**
+ * The owner's choice per notification kind (M6C). No row means the default:
+ * enabled. changed_at is when `enabled` last changed: while enabled, the sync
+ * only creates notifications for events after it, so turning a kind back on
+ * never replays what happened while it was muted. Muting only stops new inbox
+ * rows; it never touches existing notifications, approvals, or permissions.
+ */
+export const notificationPreferences = pgTable(
+  "notification_preferences",
+  {
+    kind: text("kind", { enum: NOTIFICATION_KINDS }).primaryKey(),
+    enabled: boolean("enabled").notNull(),
+    changedAt: timestamp("changed_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("notification_preferences_kind_valid", sql`${table.kind} in ('task_failed', 'task_interrupted', 'automation_missed', 'automation_skipped', 'automation_paused', 'approval_requested', 'approval_expired', 'approval_rejected')`),
+  ],
+);
+
+export type NotificationPreferenceRow = typeof notificationPreferences.$inferSelect;
+
+/**
+ * One row per worker process (M6C), written only by that process: its
+ * heartbeat (sent on a timer, whether or not it has work), and when each
+ * operational step last succeeded. The web app reads these to show whether a
+ * worker is alive and whether its scheduler, notification sync, and recovery
+ * are actually working. The id is the worker id recorded on the runs it
+ * claims, so two workers never write the same row. Rows of workers that
+ * stopped more than WORKER_HEALTH.retentionMs ago are deleted by the worker.
+ */
+export const workerInstances = pgTable(
+  "worker_instances",
+  {
+    id: text("id").primaryKey(),
+    hostname: text("hostname").notNull(),
+    pid: integer("pid").notNull(),
+    startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+    lastHeartbeatAt: timestamp("last_heartbeat_at", { withTimezone: true }).notNull(),
+    /** Set when the worker shut down gracefully (SIGTERM / Ctrl+C). Null after a crash. */
+    stoppedAt: timestamp("stopped_at", { withTimezone: true }),
+    lastSchedulerOkAt: timestamp("last_scheduler_ok_at", { withTimezone: true }),
+    lastNotificationsOkAt: timestamp("last_notifications_ok_at", { withTimezone: true }),
+    lastRecoveryOkAt: timestamp("last_recovery_ok_at", { withTimezone: true }),
+  },
+  (table) => [index("worker_instances_heartbeat_idx").on(table.lastHeartbeatAt)],
+);
+
+export const WORKER_STEPS = ["scheduler", "notifications", "recovery", "queue"] as const;
+export type WorkerStep = (typeof WORKER_STEPS)[number];
+
+export const WORKER_FAILURE_CODES = ["database_unavailable", "query_failed", "timeout", "unexpected"] as const;
+export type WorkerFailureCode = (typeof WORKER_FAILURE_CODES)[number];
+
+/**
+ * A step of a worker that failed (M6C): a code and a fixed message written by
+ * Solas (plus a PostgreSQL error code when there is one), never the raw error,
+ * so nothing from a connection string or a query can leak into the UI. The
+ * full error stays in the worker's own log. Bounded per worker (see
+ * WORKER_HEALTH) and deleted with its worker row.
+ */
+export const workerFailures = pgTable(
+  "worker_failures",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workerId: text("worker_id")
+      .notNull()
+      .references(() => workerInstances.id, { onDelete: "cascade" }),
+    step: text("step", { enum: WORKER_STEPS }).notNull(),
+    code: text("code", { enum: WORKER_FAILURE_CODES }).notNull(),
+    message: text("message").notNull(),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    index("worker_failures_worker_idx").on(table.workerId, table.occurredAt),
+    check("worker_failures_step_valid", sql`${table.step} in ('scheduler', 'notifications', 'recovery', 'queue')`),
+    check("worker_failures_code_valid", sql`${table.code} in ('database_unavailable', 'query_failed', 'timeout', 'unexpected')`),
+  ],
+);
+
+export type WorkerInstanceRow = typeof workerInstances.$inferSelect;
+export type WorkerFailureRow = typeof workerFailures.$inferSelect;
 export type AgentToolPermissionRow = typeof agentToolPermissions.$inferSelect;
 export type ToolCallRow = typeof toolCalls.$inferSelect;
 export type ConversationRow = typeof conversations.$inferSelect;
